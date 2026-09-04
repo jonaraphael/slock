@@ -247,6 +247,7 @@ struct PTTConsent {
 }
 
 protocol Preferences {
+    func object(forKey defaultName: String) -> Any?
     func data(forKey key: String) -> Data?
     func string(forKey key: String) -> String?
     func set(_ value: Any?, forKey key: String)
@@ -850,6 +851,7 @@ final class MQTTClient: NSObject, URLSessionWebSocketDelegate {
 private var globalCapsEventTap: CFMachPort?
 private var globalCapsIsDown = false
 private var globalCapsHandler: ((Bool) -> Void)?
+private var globalCapsClearLock: (() -> Void)?
 private var cleanupPath: UnsafeMutablePointer<CChar>?
 private var cleanupArg0: UnsafeMutablePointer<CChar>?
 private var cleanupArg1: UnsafeMutablePointer<CChar>?
@@ -892,6 +894,15 @@ private func emergencyRestoreMapping() {
     }
 }
 
+// Return false for native Caps Lock events that must never reach applications.
+func suppressCapsLock(in event: CGEvent, clearLock: () -> Void) -> Bool {
+    if event.flags.contains(.maskAlphaShift) {
+        clearLock()
+        event.flags = event.flags.subtracting(.maskAlphaShift)
+    }
+    return event.getIntegerValueField(.keyboardEventKeycode) != 57
+}
+
 private func capsEventTapCallback(
     proxy: CGEventTapProxy,
     type: CGEventType,
@@ -909,6 +920,7 @@ private func capsEventTapCallback(
         return Unmanaged.passUnretained(event)
     }
 
+    guard suppressCapsLock(in: event, clearLock: { globalCapsClearLock?() }) else { return nil }
     let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
     if keyCode == SlockConfig.f18CGKeyCode {
         if type == .keyDown {
@@ -929,9 +941,6 @@ private func capsEventTapCallback(
         if type == .flagsChanged { return nil }
     }
 
-    if event.flags.contains(.maskAlphaShift) {
-        event.flags = event.flags.subtracting(.maskAlphaShift)
-    }
     return Unmanaged.passUnretained(event)
 }
 
@@ -954,7 +963,16 @@ final class CapsInterceptor {
     private let defaults: Preferences
     private let process: (String, [String]) throws -> (Int32, String, String)
     private var trustCheck: () -> Bool = { AXIsProcessTrusted() }
+    private var permissionPrompt: () -> Void = {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+    }
+    private let permissionPromptKey = "CapsLink.didRequestAccessibility"
     private var createsEventTap = true
+    private var readLock: () -> Bool = {
+        CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift)
+    }
+    private var writeLock: (Bool) -> Bool = CapsLockState.set
     private let staleMappingKey = "CapsLink.staleOriginalMapping"
     private var recoveryFailed = false
 
@@ -962,15 +980,30 @@ final class CapsInterceptor {
          process: @escaping (String, [String]) throws -> (Int32, String, String) = runProcess) {
         self.defaults = defaults
         self.process = process
+        // Older installs already requested permission before this marker existed.
+        // Keep upgrades quiet, including when macOS no longer trusts a new build.
+        if defaults.object(forKey: permissionPromptKey) == nil,
+           defaults.object(forKey: "CapsLink.captureEnabled") != nil
+            || defaults.object(forKey: "CapsLink.didConfigureLaunchAtLogin") != nil {
+            defaults.set(true, forKey: permissionPromptKey)
+            defaults.synchronize()
+        }
         restoreStaleMappingIfNeeded()
     }
 
     #if CAPSLINK_TESTING
     convenience init(testDefaults: Preferences,
-                     process: @escaping (String, [String]) throws -> (Int32, String, String)) {
+                     process: @escaping (String, [String]) throws -> (Int32, String, String),
+                     readLock: @escaping () -> Bool = { false },
+                     writeLock: @escaping (Bool) -> Bool = { _ in true },
+                     trustCheck: @escaping () -> Bool = { true },
+                     permissionPrompt: @escaping () -> Void = {}) {
         self.init(defaults: testDefaults, process: process)
-        trustCheck = { true }
+        self.trustCheck = trustCheck
+        self.permissionPrompt = permissionPrompt
         createsEventTap = false
+        self.readLock = readLock
+        self.writeLock = writeLock
     }
     #endif
 
@@ -978,11 +1011,14 @@ final class CapsInterceptor {
         isRequested = true
         guard !isActive else { return }
         permissionGranted = trustCheck()
+        if defaults.object(forKey: permissionPromptKey) == nil {
+            // Persist before asking so denial, relaunches, and repeated activation
+            // cannot bring the system permission UI back automatically.
+            defaults.set(true, forKey: permissionPromptKey)
+            defaults.synchronize()
+            if !permissionGranted { permissionPrompt() }
+        }
         if !permissionGranted {
-            let options = [
-                kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
-            ] as CFDictionary
-            _ = AXIsProcessTrustedWithOptions(options)
             permissionTimer?.invalidate()
             permissionTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] timer in
                 guard let self else { return }
@@ -1012,7 +1048,10 @@ final class CapsInterceptor {
             requestPermissionAndStart()
             return
         }
+        permissionTimer?.invalidate()
+        permissionTimer = nil
 
+        var attemptedLockReset = false
         do {
             let mappings = try readMappings()
             if mappings.contains(where: {
@@ -1024,8 +1063,8 @@ final class CapsInterceptor {
                 )
             }
 
+            priorCapsLockOn = readLock()
             try installEventTap()
-            priorCapsLockOn = CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift)
             originalMappings = mappings
             let originalJSON = mappingJSON(mappings)
             defaults.set(originalJSON, forKey: staleMappingKey)
@@ -1035,10 +1074,15 @@ final class CapsInterceptor {
             var activeMappings = mappings.filter { $0.src != SlockConfig.capsHIDUsage }
             activeMappings.append((SlockConfig.capsHIDUsage, SlockConfig.f18HIDUsage))
             try applyMappings(activeMappings)
+            attemptedLockReset = true
+            guard writeLock(false) else {
+                throw appError("slock.Keyboard", "Could not turn off the system Caps Lock state. Capture is inactive.")
+            }
             lastError = nil
             isActive = true
         } catch {
             removeEventTap()
+            if attemptedLockReset { _ = writeLock(priorCapsLockOn) }
             if let json = defaults.string(forKey: staleMappingKey) {
                 do {
                     try applyMappingJSON(json)
@@ -1057,6 +1101,7 @@ final class CapsInterceptor {
     }
 
     func stop() {
+        let wasActive = isActive
         isRequested = false
         permissionTimer?.invalidate()
         permissionTimer = nil
@@ -1081,6 +1126,9 @@ final class CapsInterceptor {
         }
         removeEventTap()
         isActive = false
+        if wasActive, !writeLock(priorCapsLockOn) {
+            lastError = "Capture stopped, but the previous Caps Lock state could not be restored."
+        }
         onStatusChange?()
     }
 
@@ -1111,6 +1159,15 @@ final class CapsInterceptor {
         runLoopSource = source
         globalCapsEventTap = tap
         globalCapsHandler = { [weak self] down in self?.onKeyState?(down) }
+        globalCapsClearLock = { [weak self] in
+            guard let self else { return }
+            if !self.writeLock(false) {
+                DispatchQueue.main.async { [weak self] in
+                    self?.lastError = "Could not clear the system Caps Lock state."
+                    self?.onStatusChange?()
+                }
+            }
+        }
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
     }
@@ -1127,6 +1184,7 @@ final class CapsInterceptor {
         runLoopSource = nil
         globalCapsEventTap = nil
         globalCapsHandler = nil
+        globalCapsClearLock = nil
     }
 
     private func restoreStaleMappingIfNeeded() {
@@ -1219,6 +1277,22 @@ final class CapsInterceptor {
                 result.2.isEmpty ? "hidutil failed to apply the key mapping." : result.2
             )
         }
+        // hidutil can exit successfully without installing a mapping. Never
+        // claim ownership (or discard the recovery journal) on exit status alone.
+        let object = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        guard let entries = object?["UserKeyMapping"] as? [[String: NSNumber]] else {
+            throw appError("slock.Keyboard", "Invalid keyboard mapping journal.")
+        }
+        let expected = entries.compactMap { entry -> HIDMap? in
+            guard let src = entry["HIDKeyboardModifierMappingSrc"],
+                  let dst = entry["HIDKeyboardModifierMappingDst"] else { return nil }
+            return (src.uint64Value, dst.uint64Value)
+        }
+        let actual = try readMappings()
+        guard expected.count == entries.count, actual.count == expected.count,
+              actual.allSatisfy({ value in expected.contains { $0.src == value.src && $0.dst == value.dst } }) else {
+            throw appError("slock.Keyboard", "macOS did not apply the keyboard mapping. Check slock's Accessibility permission and try enabling capture again.")
+        }
     }
 }
 
@@ -1228,35 +1302,37 @@ final class CapsLED {
     enum Mode: String {
         case unknown = "Not tested"
         case directHID = "Direct HID LED"
-        case logicalFallback = "Logical-lock fallback"
         case unavailable = "Unavailable"
     }
 
-    private let manager: IOHIDManager
+    private let manager: IOHIDManager?
+    private var directWriter: ((Bool) -> Bool)?
     private(set) var mode: Mode = .unknown
     private(set) var isOn = false
 
     init() {
-        manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        self.manager = manager
         IOHIDManagerSetDeviceMatching(manager, nil)
         _ = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
     }
 
     deinit {
-        _ = IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        if let manager { _ = IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone)) }
     }
+
+    #if CAPSLINK_TESTING
+    init(directWriter: @escaping (Bool) -> Bool) {
+        manager = nil
+        self.directWriter = directWriter
+    }
+    #endif
 
     @discardableResult
     func set(_ on: Bool) -> Bool {
-        let direct = setDirect(on)
-        if !on { _ = setLogicalLock(false) }
+        let direct = directWriter?(on) ?? setDirect(on)
         if direct {
             mode = .directHID
-            isOn = on
-            return true
-        }
-        if setLogicalLock(on) {
-            mode = .logicalFallback
             isOn = on
             return true
         }
@@ -1266,7 +1342,7 @@ final class CapsLED {
     }
 
     private func setDirect(_ on: Bool) -> Bool {
-        guard let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else { return false }
+        guard let manager, let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else { return false }
         var changed = false
         for device in devices {
             guard IOHIDDeviceConformsTo(
@@ -1296,7 +1372,12 @@ final class CapsLED {
         return changed
     }
 
-    private func setLogicalLock(_ on: Bool) -> Bool {
+}
+
+// Only capture ownership changes may restore Caps Lock. LED output must never
+// enable this state: macOS also uses it for capitalization and the cursor badge.
+enum CapsLockState {
+    static func set(_ on: Bool) -> Bool {
         let service = IOServiceGetMatchingService(
             kIOMainPortDefault,
             IOServiceMatching(kIOHIDSystemClass)
@@ -1316,8 +1397,10 @@ final class CapsLED {
             Int32(kIOHIDCapsLockState),
             on
         )
+        var actual = !on
+        let readResult = IOHIDGetModifierLockState(connection, Int32(kIOHIDCapsLockState), &actual)
         IOServiceClose(connection)
-        return result == KERN_SUCCESS
+        return result == KERN_SUCCESS && readResult == KERN_SUCCESS && actual == on
     }
 }
 
@@ -1856,9 +1939,12 @@ final class SlockController {
         }
         capsInterceptor.onStatusChange = { [weak self] in
             guard let self else { return }
+            NSLog("Caps capture: requested=%d active=%d trusted=%d error=%@",
+                  self.capsInterceptor.isRequested, self.capsInterceptor.isActive,
+                  self.capsInterceptor.permissionGranted, self.capsInterceptor.lastError ?? "none")
             if self.capsInterceptor.isActive != self.captureWasActive {
                 self.captureWasActive = self.capsInterceptor.isActive
-                self.led.set(self.captureWasActive ? false : self.capsInterceptor.priorCapsLockOn)
+                if self.captureWasActive { self.led.set(false) }
             }
             self.changed()
         }
@@ -2053,7 +2139,9 @@ final class SlockController {
             changed()
             return
         }
-        led.set(true)
+        if !led.set(true) {
+            lastError = "This keyboard does not support independent Caps Lock light control. System Caps Lock remains off."
+        }
         changed()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
             guard let self, self.capsInterceptor.isActive else { return }
@@ -2107,7 +2195,9 @@ final class SlockController {
             "Peer online: \(peerOnline)",
             "PTT enabled: \(pttEnabled)",
             "Accessibility trusted: \(capsInterceptor.permissionGranted)",
+            "Caps capture requested: \(capsInterceptor.isRequested)",
             "Caps capture active: \(capsInterceptor.isActive)",
+            "System Caps Lock on: \(CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift))",
             "Caps error: \(capsInterceptor.lastError ?? "none")",
             "LED mode: \(led.mode.rawValue)",
             "OS: \(ProcessInfo.processInfo.operatingSystemVersionString)",
@@ -2525,11 +2615,69 @@ final class SlockController {
 
 // MARK: - Menu-bar interface
 
+enum FireflyIcon {
+    static let idle = makeImage(illuminated: false, attention: false)
+    static let lit = makeImage(illuminated: true, attention: false)
+    static let waiting = makeImage(illuminated: false, attention: true)
+    static let litWaiting = makeImage(illuminated: true, attention: true)
+
+    static func image(illuminated: Bool, attention: Bool) -> NSImage {
+        attention ? (illuminated ? litWaiting : waiting) : (illuminated ? lit : idle)
+    }
+
+    private static func makeImage(illuminated: Bool, attention: Bool) -> NSImage {
+        // Vector template artwork stays crisp at both Retina and standard scale.
+        // The four shapes match docs/images/firefly.svg; AppKit supplies the tint.
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
+            NSGraphicsContext.saveGraphicsState()
+            defer { NSGraphicsContext.restoreGraphicsState() }
+            let transform = NSAffineTransform()
+            transform.translateX(by: 1.8, yBy: 0)
+            transform.scale(by: 0.12)
+            transform.concat()
+            NSColor.black.setFill()
+            NSColor.black.setStroke()
+            NSBezierPath(ovalIn: NSRect(x: 45, y: 5, width: 30, height: 30)).fill()
+
+            let left = NSBezierPath()
+            left.move(to: NSPoint(x: 54, y: 42))
+            left.curve(to: NSPoint(x: 9, y: 79), controlPoint1: NSPoint(x: 48, y: 34), controlPoint2: NSPoint(x: 17, y: 60))
+            left.curve(to: NSPoint(x: 32, y: 97), controlPoint1: NSPoint(x: 2, y: 96), controlPoint2: NSPoint(x: 18, y: 108))
+            left.curve(to: NSPoint(x: 54, y: 42), controlPoint1: NSPoint(x: 47, y: 85), controlPoint2: NSPoint(x: 58, y: 53))
+            left.close()
+            left.fill()
+            let right = left.copy() as! NSBezierPath
+            let mirror = NSAffineTransform()
+            mirror.translateX(by: 120, yBy: 0)
+            mirror.scaleX(by: -1, yBy: 1)
+            right.transform(using: mirror as AffineTransform)
+            right.fill()
+
+            if illuminated {
+                NSBezierPath(ovalIn: NSRect(x: 37, y: 98, width: 46, height: 46)).fill()
+            } else {
+                let tail = NSBezierPath(ovalIn: NSRect(x: 41, y: 102, width: 38, height: 38))
+                tail.lineWidth = 8
+                tail.stroke()
+            }
+            if attention {
+                NSBezierPath(ovalIn: NSRect(x: 111, y: 8, width: 20, height: 20)).fill()
+            }
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = "Dit, the slock firefly"
+        return image
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var menu: NSMenu!
     private var controller: SlockController!
     private var instanceLock: SingleInstanceLock?
+    private var optionOnlyItems: [NSMenuItem] = []
+    private var menuModifierTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -2553,6 +2701,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        menuModifierTimer?.invalidate()
         controller?.shutdown()
     }
 
@@ -2560,40 +2709,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
     }
 
+    func menuWillOpen(_ menu: NSMenu) {
+        updateOptionOnlyItems()
+        menuModifierTimer?.invalidate()
+        // Menus track events in their own run-loop mode. Poll only while open
+        // so Option can reveal these items without reopening the menu.
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+            self?.updateOptionOnlyItems()
+        }
+        menuModifierTimer = timer
+        RunLoop.main.add(timer, forMode: .eventTracking)
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuModifierTimer?.invalidate()
+        menuModifierTimer = nil
+    }
+
+    private func updateOptionOnlyItems() {
+        let hidden = !NSEvent.modifierFlags.contains(.option)
+        for item in optionOnlyItems where item.isHidden != hidden {
+            item.isHidden = hidden
+        }
+    }
+
     private func updateStatusItem() {
         guard let button = statusItem?.button, let controller else { return }
-        let symbol: String
+        let needsAttention: Bool
         switch controller.attention {
         case .pairing, .ptt:
-            symbol = "bell.badge.fill"
+            needsAttention = true
         case .none:
-            if controller.localTalking || controller.remoteTalking {
-                symbol = "mic.fill"
-            } else if controller.remoteKeyDown {
-                symbol = "capslock.fill"
-            } else if controller.peerPublicKey == nil {
-                symbol = "link.badge.plus"
-            } else if controller.transportState != .connected || !controller.peerOnline {
-                symbol = "capslock"
-            } else {
-                symbol = "capslock.fill"
-            }
+            needsAttention = false
         }
-        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "slock") {
-            image.isTemplate = true
-            button.image = image
-            button.title = ""
-        } else {
-            button.image = nil
-            button.title = "sl"
-        }
+        button.image = FireflyIcon.image(
+            illuminated: controller.remoteKeyDown || controller.localTalking || controller.remoteTalking,
+            attention: needsAttention
+        )
+        button.title = ""
         button.toolTip = "slock — \(controller.statusText)"
     }
 
     private func rebuildMenu() {
         menu.removeAllItems()
+        optionOnlyItems.removeAll()
         addDisabled("slock — \(controller.statusText)")
-        addDisabled("This Mac: \(controller.identity.shortID)")
+        optionOnlyItems.append(addDisabled("This Mac: \(controller.identity.shortID)"))
         menu.addItem(.separator())
 
         add("Copy Pairing Code", #selector(copyPairingCode))
@@ -2627,20 +2788,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
-        let capture = add("Capture Caps Lock", #selector(toggleCapture))
-        capture.state = controller.capsInterceptor.isRequested ? .on : .off
+        let capturePending = controller.capsInterceptor.isRequested && !controller.capsInterceptor.isActive
+        let capture = add(capturePending ? "Capture Caps Lock (not active)" : "Capture Caps Lock", #selector(toggleCapture))
+        capture.state = controller.capsInterceptor.isActive ? .on : (capturePending ? .mixed : .off)
         let login = add("Launch at Login", #selector(toggleLaunchAtLogin))
         login.state = launchAtLoginEnabled ? .on : .off
         if SMAppService.mainApp.status == .requiresApproval {
             addDisabled("Login launch requires approval in System Settings")
         }
-        add("Test Caps Lock Light", #selector(testLED))
-        add("Diagnostics…", #selector(showDiagnostics))
+        optionOnlyItems.append(add("Test Caps Lock Light", #selector(testLED)))
+        optionOnlyItems.append(add("Diagnostics…", #selector(showDiagnostics)))
         if controller.lastError != nil {
             add("Clear Error", #selector(clearError))
         }
         menu.addItem(.separator())
         add("Quit slock", #selector(quit))
+        updateOptionOnlyItems()
     }
 
     @discardableResult
@@ -2651,10 +2814,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
-    private func addDisabled(_ title: String) {
+    @discardableResult
+    private func addDisabled(_ title: String) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.isEnabled = false
         menu.addItem(item)
+        return item
     }
 
     @objc private func copyPairingCode() {

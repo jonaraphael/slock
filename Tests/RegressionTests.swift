@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import CoreGraphics
 
 private struct Failure: Error { let message: String }
 private func check(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {
@@ -12,6 +13,7 @@ private func mustThrow(_ body: () throws -> Void) throws {
 
 private final class MemoryPreferences: Preferences {
     var values: [String: Any] = [:]
+    func object(forKey key: String) -> Any? { values[key] }
     func data(forKey key: String) -> Data? { values[key] as? Data }
     func string(forKey key: String) -> String? { values[key] as? String }
     func set(_ value: Any?, forKey key: String) { values[key] = value }
@@ -23,9 +25,18 @@ private final class FakeHID {
     var output = "(null)"
     var writes: [String] = []
     var failWrites = false
+    var ignoreWrites = false
     func run(_ command: String, _ arguments: [String]) -> (Int32, String, String) {
         if arguments.contains("--get") { return (0, output, "") }
         writes.append(arguments.last!)
+        if !failWrites, !ignoreWrites,
+           let data = arguments.last?.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let entries = object["UserKeyMapping"] as? [[String: NSNumber]] {
+            output = "(" + entries.map {
+                "{ HIDKeyboardModifierMappingSrc = \($0["HIDKeyboardModifierMappingSrc"]!); HIDKeyboardModifierMappingDst = \($0["HIDKeyboardModifierMappingDst"]!); }"
+            }.joined(separator: ",") + ")"
+        }
         return failWrites ? (1, "", "Simulated hidutil failure") : (0, "", "")
     }
 }
@@ -173,6 +184,111 @@ enum RegressionTests {
             let mappings = try CapsInterceptor.parseMappings("({ HIDKeyboardModifierMappingSrc = 0x700000004; HIDKeyboardModifierMappingDst = 30064771077; })")
             try check(mappings.count == 1 && mappings[0].src == 0x700000004, "existing mapping")
             try mustThrow { _ = try CapsInterceptor.parseMappings("{ unknown = 1; }") }
+        }
+        test("Accessibility prompts only once across activation attempts and relaunches") {
+            let prefs = MemoryPreferences(), hid = FakeHID()
+            var prompts = 0
+            let capture = CapsInterceptor(testDefaults: prefs, process: hid.run,
+                                          trustCheck: { false }, permissionPrompt: { prompts += 1 })
+            capture.requestPermissionAndStart()
+            capture.requestPermissionAndStart()
+            capture.stop()
+            capture.requestPermissionAndStart()
+            capture.stop()
+            let relaunched = CapsInterceptor(testDefaults: prefs, process: hid.run,
+                                             trustCheck: { false }, permissionPrompt: { prompts += 1 })
+            relaunched.requestPermissionAndStart()
+            relaunched.stop()
+            try check(prompts == 1, "permission UI reopened after the first request")
+            try check(hid.writes.isEmpty, "untrusted capture changed the keyboard mapping")
+        }
+        test("existing installs do not prompt again when upgraded") {
+            for legacyKey in ["CapsLink.captureEnabled", "CapsLink.didConfigureLaunchAtLogin"] {
+                let prefs = MemoryPreferences(), hid = FakeHID()
+                prefs.set(false, forKey: legacyKey)
+                var prompts = 0
+                let capture = CapsInterceptor(testDefaults: prefs, process: hid.run,
+                                              trustCheck: { false }, permissionPrompt: { prompts += 1 })
+                capture.requestPermissionAndStart()
+                capture.stop()
+                try check(prompts == 0, "upgrade prompted again for \(legacyKey)")
+            }
+        }
+        test("permission granted later enables capture without another prompt") {
+            let prefs = MemoryPreferences(), hid = FakeHID()
+            var trusted = true
+            var prompts = 0
+            let capture = CapsInterceptor(testDefaults: prefs, process: hid.run,
+                                          trustCheck: { trusted }, permissionPrompt: { prompts += 1 })
+            capture.requestPermissionAndStart()
+            try check(capture.isActive, "trusted capture did not start")
+            capture.stop()
+            trusted = false
+            capture.requestPermissionAndStart()
+            try check(!capture.isActive && prompts == 0, "revoked permission reopened the prompt")
+            trusted = true
+            capture.requestPermissionAndStart()
+            try check(capture.isActive && prompts == 0, "capture did not resume quietly")
+            capture.stop()
+        }
+        test("capture rejects a successful hidutil command that did not install the mapping") {
+            let prefs = MemoryPreferences(), hid = FakeHID()
+            hid.ignoreWrites = true
+            let capture = CapsInterceptor(testDefaults: prefs, process: hid.run)
+            capture.start()
+            try check(!capture.isActive && capture.lastError != nil, "claimed capture without a mapping")
+            try check(prefs.string(forKey: "CapsLink.staleOriginalMapping") == nil, "empty original mapping was not recovered")
+        }
+        test("capture clears a preexisting Caps Lock latch and restores it only after stopping") {
+            let prefs = MemoryPreferences(), hid = FakeHID()
+            var writes: [Bool] = []
+            let capture = CapsInterceptor(testDefaults: prefs, process: hid.run,
+                                          readLock: { true }, writeLock: { writes.append($0); return true })
+            capture.start()
+            try check(capture.isActive && writes == [false], "capture kept Caps Lock enabled")
+            capture.stop()
+            try check(!capture.isActive && writes == [false, true], "prior lock state was not restored")
+            capture.stop()
+            try check(writes == [false, true], "second stop changed normal Caps Lock")
+        }
+        test("a silently ignored restoration keeps capture and its recovery journal") {
+            let prefs = MemoryPreferences(), hid = FakeHID()
+            let capture = CapsInterceptor(testDefaults: prefs, process: hid.run)
+            capture.start()
+            hid.ignoreWrites = true
+            capture.stop()
+            try check(capture.isActive, "capture released before mapping restoration")
+            try check(prefs.string(forKey: "CapsLink.staleOriginalMapping") != nil, "lost recovery journal")
+            hid.ignoreWrites = false
+            capture.stop()
+            try check(!capture.isActive, "capture did not recover")
+        }
+        test("capture rolls its mapping back when the system lock cannot be cleared") {
+            let prefs = MemoryPreferences(), hid = FakeHID()
+            let capture = CapsInterceptor(testDefaults: prefs, process: hid.run, writeLock: { _ in false })
+            capture.start()
+            try check(!capture.isActive && capture.lastError != nil, "capture ignored lock reset failure")
+            try check(try CapsInterceptor.parseMappings(hid.output).isEmpty, "capture left its mapping behind")
+        }
+        test("native Caps Lock events are consumed and other modifiers survive filtering") {
+            let event = CGEvent(keyboardEventSource: nil, virtualKey: 57, keyDown: true)!
+            event.flags = [.maskAlphaShift, .maskShift, .maskCommand]
+            var resets = 0
+            try check(!suppressCapsLock(in: event, clearLock: { resets += 1 }), "native Caps Lock leaked")
+            try check(resets == 1 && !event.flags.contains(.maskAlphaShift), "logical lock was not cleared")
+            try check(event.flags.contains([.maskShift, .maskCommand]), "other modifiers were removed")
+            event.setIntegerValueField(.keyboardEventKeycode, value: 0)
+            try check(suppressCapsLock(in: event, clearLock: { resets += 1 }), "ordinary key was swallowed")
+            try check(resets == 1, "ordinary key unnecessarily reset the LED")
+        }
+        test("LED failure is reported instead of enabling logical Caps Lock") {
+            var requests: [Bool] = []
+            let led = CapsLED(directWriter: { requests.append($0); return false })
+            try check(!led.set(true) && led.mode == .unavailable && !led.isOn, "unsupported LED claimed success")
+            try check(!led.set(false) && requests == [true, false], "LED output did not stay independent")
+            let working = CapsLED(directWriter: { _ in true })
+            try check(working.set(true) && working.isOn && working.mode == .directHID, "direct LED failed")
+            try check(working.set(false) && !working.isOn, "direct LED latched on")
         }
         test("a second stop never overwrites mappings changed after capture stopped") {
             let prefs = MemoryPreferences(), hid = FakeHID()

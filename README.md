@@ -1,186 +1,179 @@
-# slock test kit
+<p align="center">
+  <img src="docs/images/firefly.svg" width="160" height="160" alt="Dit, the slock firefly, with a lime light">
+</p>
 
-This repository contains the slock prototype source and design documents.
+# slock
 
-slock was previously called CapsLink. The app retains its existing bundle
-identifier, preference keys, identity directory, and wire identifiers so renaming
-does not reset settings or pairing. The app and executable are now named `slock`.
+Meet **Dit**, slock’s little firefly.
 
-slock is a menu-bar-only macOS prototype intended to link two Caps Lock keys and LEDs over the Internet. Holding Caps Lock lights the paired Mac's Caps Lock LED. After an explicit PTT invitation is accepted, the same hold also sends end-to-end encrypted, 12 kbit/s Opus voice.
+[![Download slock for macOS](https://img.shields.io/badge/Download_slock-macOS_13%2B-111111?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/jonaraphael/slock/releases/latest/download/slock.app.zip)
 
-## What is included
+**Hold a key. Light up someone else’s Mac.**
 
-- `slock.swift` — the complete application in one source file.
-- `build.command`, `scripts/swiftc.command`, and `Resources/Info.plist` — compile, package, and ad-hoc sign the app.
-- `test.command` and `Tests/RegressionTests.swift` — regression tests without keyboard capture or microphone access.
-- `ARCHITECTURE.md` — plan, state machine, protocol, pseudocode, and test plan.
-- `VALIDATION.md` — verification results and remaining hardware checks.
-- `REVIEW.md` — findings and implemented fixes.
-- `LICENSE` — the repository's MIT license.
-- `THIRD_PARTY_NOTICES.md` — attribution for the imported Opus conversion pattern.
+slock connects two Macs through their Caps Lock keys. Hold yours to light up your
+partner’s keyboard; release it to turn their light off. Enable push-to-talk
+together, and that same key becomes an encrypted voice connection.
 
-There is no Xcode project and no package dependency.
+A small macOS menu-bar app. No account required. Built for Apple Silicon and Intel.
 
-## Build on a Mac
+> **Prototype:** Download the app above or [build from source](#build-from-source).
+> Independent Caps Lock light control depends on the keyboard; test both Macs
+> before relying on it. See [validation results](VALIDATION.md).
 
-Requirements:
+## Get started
 
-- macOS 13 or newer;
-- Xcode or Xcode Command Line Tools;
-- Internet access during operation, not during compilation.
+1. Download and unzip **slock.app.zip** on each Mac.
+2. Move **slock.app** to **Applications**, then open it. Keep it there so permissions
+   and the login item use a stable path.
+3. Allow **Accessibility** access when asked. Look for slock’s firefly icon in
+   the menu bar.
+4. Make sure **Capture Caps Lock** is active. Hold **Option** while the menu is
+   open and choose **Test Caps Lock Light** to check your keyboard.
 
-In Terminal:
+Requires **macOS 13 or later** and an internet connection. The prototype is
+ad-hoc signed and **not notarized**, so macOS may block its first launch. Follow
+[Apple’s instructions for opening an app from an unidentified developer](https://support.apple.com/en-us/102445).
 
-```bash
-cd /path/to/slock
-chmod +x build.command
+slock asks for Accessibility access **at most once**. Later activation attempts,
+restarts, and updates check quietly. If access is missing, enable slock under
+**System Settings → Privacy & Security → Accessibility**; requested capture starts
+when permission is granted. **Capture Caps Lock (not active)** means slock is
+waiting for permission or could not take control of the key.
+
+## Connect two Macs
+
+1. On **Mac A**, choose **Copy Pairing Code** and send it to your partner through
+   a channel you trust.
+2. On **Mac B**, choose **Pair Using Code…** and paste the code.
+3. On Mac B, hold **Option** in the menu to reveal **This Mac**. Compare that ID
+   with the incoming request on Mac A over your trusted channel.
+4. On Mac A, choose **Accept Pair Request from …** only if the IDs match.
+5. Wait for both Macs to show a connection, then hold Caps Lock on either Mac.
+   The other Mac’s light should stay on for the duration of the hold.
+
+Choose **Unpair…** to disconnect the pairing. Upgrade both Macs together:
+version 0.2 uses protocol 2 and cannot communicate with version 0.1.
+
+## Talk with Caps Lock
+
+1. One person chooses **Invite Peer to Enable PTT**.
+2. The other chooses **Accept PTT Invitation**.
+3. Grant microphone access on both Macs. When both menus show **PTT Enabled**,
+   hold Caps Lock to talk and release it to stop.
+
+Voice requires both people’s consent. Only one person transmits at a time; if
+both press together, the apps choose one sender consistently. Select **PTT
+Enabled** to disable voice for both peers. Audio uses end-to-end encrypted Opus.
+
+## Everyday controls
+
+| Menu item | What it does |
+| --- | --- |
+| **Capture Caps Lock** | Gives slock control of the key, or restores normal Caps Lock behavior. |
+| **Launch at Login** | Starts slock when you sign in. Enabled on first launch when macOS allows it. |
+| **Unpair…** | Removes the peer and stops key mirroring and voice. |
+| **Quit slock** | Stops capture, restores the previous keyboard mapping, and exits. |
+
+Hold **Option** while the menu is open to reveal **This Mac**, **Test Caps Lock
+Light**, and **Diagnostics…**. Release Option to hide them again.
+
+Dit’s tail fills while a peer holds their key or voice is active. A small
+dot beside the firefly means a pairing request or PTT invitation needs attention.
+The menu-bar mark adapts to light and dark backgrounds automatically.
+
+While capture is **active**, Caps Lock must not capitalize text, display the
+macOS Caps Lock cursor indicator, or latch the local light on. Your local light
+follows your **partner’s** held key, except during the brief light test.
+Disabling capture restores the Caps Lock state that preceded it.
+
+slock preserves existing keyboard mappings and restores them when capture stops
+or the app quits. A recovery journal allows the next launch to restore mappings
+after a crash. Force-quitting or losing power cannot run immediate cleanup.
+Physical **F18** is also consumed while capture is active.
+
+## Compatibility and privacy
+
+- **Keyboard lights vary.** slock uses independent HID light control; it never
+  enables system Caps Lock just to illuminate the LED. Unsupported lights are
+  reported as unavailable. Key relay and voice can still work.
+- **External keyboards are best-effort.** The primary target is a MacBook’s
+  built-in keyboard. Compilation for Intel and Apple Silicon does not establish
+  that every keyboard or macOS version has been tested.
+- **The relay is experimental.** This build uses the public testing broker at
+  `wss://test.mosquitto.org:8081/mqtt`. Availability is not guaranteed.
+- **Contents are encrypted; metadata is visible.** Key-state messages and voice
+  use X25519, HKDF-SHA256, and ChaCha20-Poly1305. Broker observers can see topic
+  names, timing, and ciphertext sizes. Verify pairing IDs through a trusted
+  channel.
+
+For a production deployment, configure a broker you operate and add broker
+authentication. See [the architecture](ARCHITECTURE.md) for protocol details and
+[the validation report](VALIDATION.md) for tested behavior and remaining checks.
+
+## Troubleshooting
+
+Hold **Option** in slock’s menu to open **Diagnostics…**.
+
+| Problem | Check |
+| --- | --- |
+| Caps Lock still capitalizes, shows a blue indicator, or leaves the light on | Diagnostics must show **Accessibility trusted: true** and **Caps capture active: true**. If capture is active and the issue persists, record the diagnostics and keyboard model. |
+| Accessibility appears enabled, but capture is inactive after an update | Remove the old slock entry in Accessibility settings and add the current app from Applications. Ad-hoc signed rebuilds can require renewed permission. |
+| Permission is granted, but key presses are not captured | Check **Privacy & Security → Input Monitoring** and any Caps Lock reassignment under **Keyboard → Keyboard Shortcuts → Modifier Keys**. |
+| The light test fails | Check **LED mode**. Some keyboards cannot control their light independently; slock will not fall back to enabling system Caps Lock. |
+| The peer stays offline | Confirm both Macs use the same protocol version and can reach `test.mosquitto.org` on TCP port `8081`. A firewall or broker outage can prevent connection. |
+| Voice is silent | Both menus must show **PTT Enabled**. Check microphone permission and the system input/output devices, then inspect the first audio error in Diagnostics. |
+| Launch at Login needs approval | Open **System Settings → General → Login Items** and allow slock. |
+
+For a useful bug report, include both Macs’ models, macOS versions, keyboard types,
+app versions, the relevant diagnostic error, and whether key capture, the light
+test, and voice each work. State whether **Capture Caps Lock** was actually active.
+
+## Build from source
+
+Install Xcode or the Xcode Command Line Tools, then run:
+
+```sh
+git clone https://github.com/jonaraphael/slock.git
+cd slock
 ./build.command
 ```
 
-The script builds both `arm64` and `x86_64`, combines the slices, ad-hoc signs the app, and creates:
+The build creates a universal, ad-hoc signed app and a distributable ZIP:
 
 ```text
 dist/slock.app
 dist/slock.app.zip
 ```
 
-Both slices must compile successfully. To build only one architecture, use
-`CAPSLINK_ARCHS=arm64 ./build.command` (or `x86_64`). Build artifacts are ignored by Git.
-Run `./test.command` for the regression suite. Both scripts accept additional
-`swiftc` arguments, such as a custom SDK or module-cache path.
+There is no Xcode project or third-party package dependency. Compilation does not
+need internet access. Generated artifacts are ignored by Git.
 
-Version 0.2 uses wire protocol 2. Upgrade both Macs together; version 0.1 cannot
-communicate with version 0.2. Existing pairing keys remain usable, but PTT must be
-enabled again after upgrading from 0.1.
+To build one architecture or run the regression suite:
 
-## Install and first launch
-
-On each Mac:
-
-1. Unzip `slock.app.zip`.
-2. Move `slock.app` to `/Applications` before opening it. This keeps the Accessibility grant and login item tied to a stable path.
-3. Control-click the app and choose **Open**. The build is ad-hoc signed, not notarized.
-4. Approve the macOS Accessibility request. slock does not install the Caps→F18 mapping until the event tap is trusted.
-5. Look for the Caps Lock-shaped item in the menu bar.
-
-slock attempts to register itself as a login item on first launch. macOS may require approval under **System Settings → General → Login Items**. The menu has a **Launch at Login** toggle and reports when approval is pending.
-
-## Pair two Macs
-
-1. On Mac A, choose **Copy Pairing Code**.
-2. Send that code to Mac B over your existing trusted channel.
-3. On Mac B, choose **Pair Using Code…** and paste it.
-4. Compare the request's ID with **This Mac** in Mac B's menu over your trusted channel. On Mac A, choose **Accept Pair Request from …** only if the IDs match.
-5. Both menus should report the peer as connected within a few seconds.
-
-Now press and hold Caps Lock on A. B's Caps Lock LED should follow the hold duration, shifted by network latency, then turn off. Repeat in the other direction.
-
-## Enable push-to-talk
-
-1. One tester chooses **Invite Peer to Enable PTT** and grants microphone permission.
-2. The other tester chooses **Accept PTT Invitation** and grants microphone permission.
-3. Hold Caps Lock to talk; release to stop.
-
-PTT is half-duplex. If both people press at almost exactly the same time, both apps use the same public-key tie-break, so one side becomes transmitter and the other receiver.
-
-Audio is native Opus at 16 kHz mono, 20 ms frames, 12 kbit/s. Three packets are batched per encrypted relay message, and the receiver prebuffers about 120 ms.
-
-## Network and privacy model
-
-The test build connects to:
-
-```text
-wss://test.mosquitto.org:8081/mqtt
+```sh
+CAPSLINK_ARCHS=arm64 ./build.command  # use x86_64 for Intel only
+./test.command
 ```
 
-That is a public testing broker. It is not an account system and should not be treated as production infrastructure. Anyone can observe topic names, timing, and ciphertext sizes. Message contents and audio are encrypted end to end with X25519, HKDF-SHA256, and ChaCha20-Poly1305.
+Both scripts accept extra `swiftc` arguments. The tests use temporary identities,
+fake keyboard commands, and synthetic audio; they do not capture the keyboard,
+use the microphone, or contact the broker.
 
-For a production build, change `SlockConfig.brokerURL` to a broker you operate, then add authentication. The rest of the client protocol can remain unchanged.
+### Project guide
 
-## Keyboard behavior and cleanup
+| File | Purpose |
+| --- | --- |
+| [slock.swift](slock.swift) | Application, keyboard capture, pairing, relay, and audio. |
+| [build.command](build.command) | Builds, packages, and signs the app. |
+| [test.command](test.command) | Runs the [regression suite](Tests/RegressionTests.swift). |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Design, protocol, state machines, and manual test plan. |
+| [VALIDATION.md](VALIDATION.md) | Verified results and remaining hardware checks. |
+| [REVIEW.md](REVIEW.md) | Review findings and implemented fixes. |
 
-While **Capture Caps Lock** is enabled:
+slock was previously called **CapsLink**. Internal preference keys, the identity
+storage directory, bundle identifier, and wire identifiers retain the old name
+to preserve settings and pairing.
 
-- Caps Lock is remapped to F18;
-- F18 down/up is consumed by a Core Graphics event tap;
-- the normal Caps Lock function is unavailable;
-- preexisting `hidutil` mappings are kept and restored on quit.
+## License
 
-slock stores the prior mapping before applying its own. It restores on normal termination, SIGINT/SIGTERM when possible, and at the next launch after a crash. Failed restoration keeps the recovery journal for retry. Only one instance can own the keyboard mapping at a time. `SIGKILL` and power loss cannot run process cleanup, but logging out/restarting also clears session-scoped `hidutil` mappings.
-
-Use **Capture Caps Lock** to release the key without quitting. The preference is
-remembered, and successful cleanup restores the logical Caps Lock state that
-preceded capture. Physical F18 is also consumed while capture is active. A disabled
-event tap releases the current hold; release and press Caps Lock again to resume.
-
-## Hardware and OS compatibility
-
-The build target is macOS 13+ with Apple Silicon and Intel slices. The intended
-primary path is the built-in keyboard in a MacBook. See `VALIDATION.md` for the
-actual build and test results; successful compilation does not validate keyboard,
-LED, permission, login-item, or two-Mac audio behavior.
-
-External USB/Bluetooth keyboards are best-effort. This prototype uses
-`hidutil` and an event tap; it does not implement exclusive HID capture or event
-reinjection for devices that need a different interception path.
-
-## LED compatibility
-
-Choose **Test Caps Lock Light** before pairing.
-
-slock tries:
-
-1. direct writes to keyboard HID Caps Lock LED elements;
-2. `IOHIDSetModifierLockState` as a fallback.
-
-The second path reaches more internal keyboards but changes the logical lock bit internally. slock removes the alpha-shift flag from downstream key events while active, so normal typing should remain unaffected. Applications that query the global lock bit directly may still notice the fallback state.
-
-Open **Diagnostics…** to see which LED path succeeded.
-
-## Troubleshooting
-
-### Caps Lock still behaves normally
-
-Open **Diagnostics…**. Accessibility must be trusted and **Caps capture active** must be true. Toggle **Capture Caps Lock** off and on after granting permission, or relaunch the app.
-
-Also check whether macOS has Caps Lock assigned to another modifier in **System Settings → Keyboard → Keyboard Shortcuts → Modifier Keys**. Remove that assignment for the first test.
-
-### The app has Accessibility permission but receives no key events
-
-Some macOS/hardware combinations may additionally require **Input Monitoring** permission under **Privacy & Security**. Add slock there, relaunch, and toggle capture.
-
-### Light self-test fails
-
-This is the most hardware-dependent part. Record the Mac model, keyboard type, macOS version, architecture, and the **LED mode** from Diagnostics. The network/key/PTT path can work even where direct LED output does not; the fallback is the next thing to inspect.
-
-### The peer remains offline
-
-The public broker may be down, slow, or WebSocket/TLS service may be temporarily unavailable. Both Macs must be able to reach TCP port `8081` on `test.mosquitto.org`. A corporate firewall may block non-443 ports.
-
-### PTT is silent
-
-Verify both menus say **PTT Enabled**, then check macOS microphone permission and the selected system input/output devices. Use Diagnostics to capture the first audio error.
-
-### Gatekeeper blocks the app
-
-Move it to `/Applications`, then Control-click → **Open**. For wider distribution, sign and notarize with an Apple Developer ID rather than asking users to bypass Gatekeeper.
-
-## Suggested two-person test report
-
-Capture this for each Mac:
-
-```text
-Mac model:
-macOS version:
-CPU architecture:
-Built-in or external keyboard:
-Caps interception works:
-Normal Caps behavior suppressed:
-LED self-test works:
-Diagnostics LED mode:
-Pairing works:
-Tap latency:
-Held-light reliability:
-PTT send/receive:
-First error text:
-```
+[MIT](LICENSE). See [third-party notices](THIRD_PARTY_NOTICES.md) for attribution.

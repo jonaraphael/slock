@@ -19,7 +19,7 @@ The prototype intentionally supports exactly one peer. That keeps the interactio
 2. The build script requires both Apple Silicon and Intel slices by default. The built-in MacBook keyboard is the primary target; external keyboards are best-effort.
 3. A test build may be ad-hoc signed and manually opened; a public release would need a Developer ID signature and notarization.
 4. Internet communication needs a rendezvous/relay. The test build uses the public `test.mosquitto.org` MQTT-over-WSS endpoint, with end-to-end encryption. It is replaceable with a private Mosquitto broker by changing one constant.
-5. Direct independent control of a built-in keyboard LED is not uniform across MacBook generations. slock tries a direct HID LED element first, then falls back to the OS lock-state API while deleting the alpha-shift flag from downstream keyboard events.
+5. Direct independent control of a built-in keyboard LED is not uniform across MacBook generations. slock uses direct HID LED elements only; unsupported lights are reported as unavailable. LED output never enables the OS Caps Lock state.
 6. The app owns Caps Lock while capture is enabled. Existing `hidutil` mappings are preserved and restored on normal exit; crash recovery runs at the next launch.
 
 ## Why this is the lightest practical shape
@@ -71,7 +71,7 @@ REMOTE OUTPUT                                        │
               ┌──────────────────────────────────────┴─────────┐
               ▼                                                ▼
        Caps LED driver                                  Opus decoder
- direct HID, then fallback                         AVAudioPlayerNode
+ direct HID only                                   AVAudioPlayerNode
 ```
 
 Control and audio use the same WebSocket, MQTT connection, encrypted envelope, and recipient inbox topic.
@@ -198,17 +198,20 @@ consume event; do not forward to applications
 Startup order matters:
 
 1. Acquire the single-instance lock and recover any stale mapping journal.
-2. Request Accessibility permission if capture is enabled.
+2. Check Accessibility permission if capture is enabled. Request it at most once,
+   persisting the attempt before showing system UI. Existing installs skip the
+   request on upgrade; subsequent activations and permission polling are silent.
 3. Read the current `UserKeyMapping` and install the consuming event tap.
-4. Persist the original mapping before replacing its Caps entry with Caps→F18.
-5. Restore the journal before removing the tap; clear the journal only on success.
+4. Persist the original mapping before replacing its Caps entry with Caps→F18; read it back to verify success.
+5. Clear and verify the system Caps Lock state before reporting capture as active.
+6. On stop, restore and verify the journal before removing the tap; clear the journal only on success, then restore the preceding system Caps Lock state.
 
 A failed stale recovery blocks new capture. Empty `hidutil` arrays are accepted,
 and repeated cleanup after a successful stop performs no further mapping writes.
 SIGINT/SIGTERM are delivered through dispatch signal sources, allowing ordinary
 application cleanup without allocating Swift objects inside a signal handler.
 
-The event tap also removes `.maskAlphaShift` from downstream events. That makes the LED fallback usable without restoring default capitalization behavior.
+The event tap consumes native Caps Lock events as well as the remapped F18 events. If an event carries `.maskAlphaShift`, it clears the system lock state and strips that flag while preserving other modifiers. LED output never sets the logical lock bit, preventing capitalization and the macOS Caps Lock cursor indicator.
 
 ## Compatibility boundary
 
@@ -216,7 +219,7 @@ The Caps→F18 plus `CGEventTap` path is intended for built-in MacBook keyboards
 Exclusive device capture and reinjection are not implemented. The test matrix
 must record built-in versus external keyboard explicitly.
 
-The LED itself is a second, independent compatibility surface: writable HID LED elements vary by keyboard firmware, and the logical-lock fallback may expose the global lock bit to software that queries it directly.
+The LED itself is a second, independent compatibility surface: writable HID LED elements vary by keyboard firmware. Unsupported lights remain unavailable rather than changing the system Caps Lock state.
 
 ## LED strategy
 
@@ -229,11 +232,10 @@ setRemoteLED(on):
     if at least one write succeeds:
         driver = direct HID
     else:
-        IOHIDSetModifierLockState(caps, on)
-        driver = logical fallback
+        driver = unavailable
 ```
 
-Direct HID is semantically ideal because it controls the indicator rather than the lock state. The fallback is more likely to reach protected/internal keyboards, but it temporarily changes the OS lock bit internally; the event tap strips that bit from keyboard events.
+Direct HID controls the indicator independently of the lock state. `IOHIDSetModifierLockState` is reserved for clearing the lock during capture and restoring the prior state after capture stops; it is never used to light the LED during capture.
 
 ## PTT audio
 
@@ -263,7 +265,7 @@ SecureWire             HKDF, ChaChaPoly, replay filter
 MQTTClient              CONNECT/SUBSCRIBE/PUBLISH/PING over WebSocket
 MQTTPacketDecoder      bounded incremental MQTT framing
 CapsInterceptor         AX permission, event tap, hidutil preservation
-CapsLED                 direct HID LED + logical fallback
+CapsLED                 independent direct HID LED output
 OpusEncoder             Int16 PCM → native Opus
 OpusDecoder             native Opus → Float32 PCM
 AudioCapture            microphone, resampling, framing, batching

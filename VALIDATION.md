@@ -5,7 +5,7 @@ with a macOS 13 deployment target.
 
 ## Automated checks
 
-- **20/20 regression tests passed**, including actual native Opus encoding and
+- **29/29 regression tests passed**, including actual native Opus encoding and
   decoding of synthetic silent PCM. The first decoded frame can be shorter due to
   codec priming; subsequent frames retained the expected 320-sample cadence.
 - Tests cover sliced byte buffers, fragmented/coalesced MQTT input, input size
@@ -13,6 +13,13 @@ with a macOS 13 deployment target.
   PTT consent/revocation, simultaneous invitations, pairing persistence, keyboard
   recovery failures, empty mappings, repeated cleanup, identity protection,
   single-instance locking, and subprocess pipe draining.
+- Caps Lock regressions cover silently ignored remap/restore commands, clearing
+  and restoring a preexisting lock state, rollback when clearing fails, native
+  Caps Lock event suppression with other modifiers preserved, and independent
+  LED success/failure without a logical-lock fallback.
+- Permission regressions cover one prompt across repeated activation and
+  relaunch, silent migration of existing installs, and quiet capture restart
+  after permission is restored.
 - Test keyboard commands and preferences are in-memory doubles. Tests do not
   install an event tap, remap keys, change LEDs, register a login item, contact the
   broker, or request microphone access.
@@ -23,7 +30,9 @@ with a macOS 13 deployment target.
 - `codesign --verify --strict` passed, and the ZIP contains the executable,
   Info.plist, signature resources, MIT license, and third-party notice.
 - Outputs: `dist/slock.app` and `dist/slock.app.zip` (ignored by Git).
-- The final test transcript is saved locally at `.build/test-results.txt`.
+- Dit's native menu-bar artwork was rendered and visually inspected at 18 pt
+  and enlarged size, covering idle, signal, and pending-request states. The mark
+  is an AppKit template image so macOS handles light/dark menu-bar tinting.
 
 ## Local environment considerations
 
@@ -35,7 +44,7 @@ straight through to `xcrun`'s Swift compiler.
 
 The agent's restricted execution sandbox cannot create the native Opus encoder.
 The full regression executable was therefore also run with normal macOS service
-access and passed all 20 tests. No microphone or speakers were used. A sandbox
+access and passed all 29 tests. No microphone or speakers were used. A sandbox
 codec failure must not be represented as a passing audio test.
 
 ## Still requires manual validation
@@ -52,8 +61,32 @@ unchanged. Capture is disabled and the current mapping is empty (`()`), equivale
 to the original `(null)` baseline. Quitting the legacy app had reinstated a stale
 Caps-to-F18 entry; that single entry was verified and removed before relaunch.
 
+During the subsequent Caps Lock bug investigation, capture was requested but the
+live mapping was empty. The fix removes the logical-lock LED fallback, verifies
+mapping writes and the initial lock reset, and distinguishes requested capture
+from active capture in the menu. The cursor badge and physical LED behavior need
+a fresh typing check with this build; automated event tests do not verify those
+visible hardware effects.
+
+The fixed universal build was installed and relaunched successfully. Its runtime
+log reports `requested=1 active=0 trusted=0`; macOS currently denies the rebuilt
+app Accessibility access, and `hidutil` confirms the mapping remains empty.
+Accessibility settings were opened for the user to renew the grant before the
+physical key test. Capture is not represented as active in this state.
+
+The subsequent one-time permission prompt update was also installed and
+relaunched. The existing installation persisted `CapsLink.didRequestAccessibility=1`
+without issuing another prompt. Runtime status still reports missing
+Accessibility access; activation waits quietly for the user to grant it.
+
+The Dit mascot update was built for both architectures, signature-verified,
+installed, and relaunched from `~/Applications/slock.app`. The app and repository
+are still named slock; only the firefly is called Dit. The current keyboard
+mapping remains empty.
+
 - Accessibility/Input Monitoring prompts and the signed app's permission identity.
-- Built-in and external keyboard interception, LED self-test, and logical-lock fallback.
+- Built-in and external keyboard interception, absence of the Caps Lock cursor
+  indicator, independent LED self-test, and no local LED latch after a press.
 - Normal quit, SIGINT/SIGTERM, crash recovery, and restoring mappings on real hardware.
 - Pairing and reconnecting two Macs through the relay, including network loss during a hold.
 - Real microphone/speaker audio, simultaneous PTT holds, device changes, and sleep/wake.
