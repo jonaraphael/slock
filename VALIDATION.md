@@ -1,0 +1,63 @@
+# Validation — 2026-09-04
+
+Environment: Intel macOS 14.8.9 (23J631), Apple Swift 6.0.3, macOS 15.2 SDK,
+with a macOS 13 deployment target.
+
+## Automated checks
+
+- **20/20 regression tests passed**, including actual native Opus encoding and
+  decoding of synthetic silent PCM. The first decoded frame can be shorter due to
+  codec priming; subsequent frames retained the expected 320-sample cadence.
+- Tests cover sliced byte buffers, fragmented/coalesced MQTT input, input size
+  limits, authenticated encryption, both sides restarting, replay and tampering,
+  PTT consent/revocation, simultaneous invitations, pairing persistence, keyboard
+  recovery failures, empty mappings, repeated cleanup, identity protection,
+  single-instance locking, and subprocess pipe draining.
+- Test keyboard commands and preferences are in-memory doubles. Tests do not
+  install an event tap, remap keys, change LEDs, register a login item, contact the
+  broker, or request microphone access.
+- Shell syntax and bundle property-list validation passed.
+
+- **Universal release build passed** for `arm64` and `x86_64`.
+- Mach-O inspection confirms macOS **13.0** minimum deployment for both slices.
+- `codesign --verify --strict` passed, and the ZIP contains the executable,
+  Info.plist, signature resources, MIT license, and third-party notice.
+- Outputs: `dist/slock.app` and `dist/slock.app.zip` (ignored by Git).
+- The final test transcript is saved locally at `.build/test-results.txt`.
+
+## Local environment considerations
+
+This machine's Command Line Tools installation contains duplicate `SwiftBridging`
+module definitions left by an upgrade. `scripts/swiftc.command` detects that exact
+condition and creates an ignored compiler VFS overlay under `.build/toolchain`.
+It does not alter the installed SDK or toolchain. Standard installations pass
+straight through to `xcrun`'s Swift compiler.
+
+The agent's restricted execution sandbox cannot create the native Opus encoder.
+The full regression executable was therefore also run with normal macOS service
+access and passed all 20 tests. No microphone or speakers were used. A sandbox
+codec failure must not be represented as a passing audio test.
+
+## Still requires manual validation
+
+The user completed the local typing, LED, and capture-disable smoke checks on
+this Mac. Afterward, `hidutil` reported `(null)`, matching the saved mapping
+baseline. The specific keyboard type and LED observations were not recorded.
+The checks below still describe the broader validation matrix.
+
+After the rename to slock, the installed app was rebuilt, signature-checked,
+and relaunched from `~/Applications/slock.app`. All 20 regression tests passed
+again. The identity file's inode, modification time, size, and permissions were
+unchanged. Capture is disabled and the current mapping is empty (`()`), equivalent
+to the original `(null)` baseline. Quitting the legacy app had reinstated a stale
+Caps-to-F18 entry; that single entry was verified and removed before relaunch.
+
+- Accessibility/Input Monitoring prompts and the signed app's permission identity.
+- Built-in and external keyboard interception, LED self-test, and logical-lock fallback.
+- Normal quit, SIGINT/SIGTERM, crash recovery, and restoring mappings on real hardware.
+- Pairing and reconnecting two Macs through the relay, including network loss during a hold.
+- Real microphone/speaker audio, simultaneous PTT holds, device changes, and sleep/wake.
+- Login-item registration and launch from `/Applications`.
+- Execution on Apple Silicon and on the other supported macOS versions.
+
+The app is ad-hoc signed and has not been notarized.
