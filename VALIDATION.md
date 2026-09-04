@@ -84,6 +84,12 @@ installed, and relaunched from `~/Applications/slock.app`. The app and repositor
 are still named slock; only the firefly is called Dit. The current keyboard
 mapping remains empty.
 
+Version 0.2.1 rotates Dit 45 degrees clockwise and adds explicit permission
+recovery actions without repeating the automatic system prompt. No persistent
+code-signing identity is installed on this Mac, so ad-hoc rebuilds have cdhash
+designated requirements and can invalidate prior Accessibility entries. The
+final build needs one renewed user grant before its physical capture test.
+
 - Accessibility/Input Monitoring prompts and the signed app's permission identity.
 - Built-in and external keyboard interception, absence of the Caps Lock cursor
   indicator, independent LED self-test, and no local LED latch after a press.

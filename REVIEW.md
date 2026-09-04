@@ -28,6 +28,7 @@ tests; physical keyboard and two-Mac operation still need hardware validation.
 | **Unreadable/corrupt identity keys were silently replaced, and permission failures were ignored.** | Existing invalid keys fail with an error. New keys use private permissions, and loaded keys have permissions checked/set. |
 | **Waiting for subprocess exit before draining pipes could deadlock the UI.** | Drain stdout and stderr concurrently with child execution. |
 | **A failed first login-item registration was never retried.** | Persist the first-run completion flag only after successful registration. |
+| **Ad-hoc rebuilds invalidate Accessibility trust and left capture with no clear recovery path.** | Keep automatic permission prompting one-time, expose separate **Retry Capture** and **Open Accessibility Settings…** actions, distinguish pending capture with a mixed check, and log only state changes. Stable trust across arbitrary local rebuilds still requires a persistent signing identity. |
 
 ## Validation boundaries
 

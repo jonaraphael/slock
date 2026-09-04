@@ -2,7 +2,7 @@
   <title id="title">Dit, the slock firefly</title>
   <desc id="desc">Two dark teardrop wings, a round head, and a bright lime light.</desc>
   <rect width="256" height="256" rx="48" fill="#f6f6ef"/>
-  <g transform="translate(62 45) scale(1.1)">
+  <g transform="translate(62 45) scale(1.1) rotate(45 60 75)">
     <circle cx="60" cy="20" r="15" fill="#151715"/>
     <path d="M54 42 C48 34 17 60 9 79 C2 96 18 108 32 97 C47 85 58 53 54 42Z" fill="#151715"/>
     <path d="M66 42 C72 34 103 60 111 79 C118 96 102 108 88 97 C73 85 62 53 66 42Z" fill="#151715"/>

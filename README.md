@@ -35,10 +35,11 @@ ad-hoc signed and **not notarized**, so macOS may block its first launch. Follow
 [Apple’s instructions for opening an app from an unidentified developer](https://support.apple.com/en-us/102445).
 
 slock asks for Accessibility access **at most once**. Later activation attempts,
-restarts, and updates check quietly. If access is missing, enable slock under
-**System Settings → Privacy & Security → Accessibility**; requested capture starts
-when permission is granted. **Capture Caps Lock (not active)** means slock is
-waiting for permission or could not take control of the key.
+restarts, and updates check quietly. If access is missing, use **Open Accessibility
+Settings…**, remove any stale slock entry, and add the copy in Applications. Then
+choose **Retry Capture**; requested capture also starts automatically when access
+is granted. A mixed check beside **Capture Caps Lock** means slock is waiting for
+permission or could not take control of the key.
 
 ## Connect two Macs
 
@@ -117,7 +118,7 @@ Hold **Option** in slock’s menu to open **Diagnostics…**.
 | Problem | Check |
 | --- | --- |
 | Caps Lock still capitalizes, shows a blue indicator, or leaves the light on | Diagnostics must show **Accessibility trusted: true** and **Caps capture active: true**. If capture is active and the issue persists, record the diagnostics and keyboard model. |
-| Accessibility appears enabled, but capture is inactive after an update | Remove the old slock entry in Accessibility settings and add the current app from Applications. Ad-hoc signed rebuilds can require renewed permission. |
+| Accessibility appears enabled, but capture is inactive after an update | Choose **Open Accessibility Settings…**, remove the old slock entry, and add the current app from Applications. Return to slock and choose **Retry Capture**. Ad-hoc signed rebuilds can require renewed permission. |
 | Permission is granted, but key presses are not captured | Check **Privacy & Security → Input Monitoring** and any Caps Lock reassignment under **Keyboard → Keyboard Shortcuts → Modifier Keys**. |
 | The light test fails | Check **LED mode**. Some keyboards cannot control their light independently; slock will not fall back to enabling system Caps Lock. |
 | The peer stays offline | Confirm both Macs use the same protocol version and can reach `test.mosquitto.org` on TCP port `8081`. A firewall or broker outage can prevent connection. |

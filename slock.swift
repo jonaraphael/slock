@@ -18,7 +18,7 @@ enum SlockConfig {
     static let appName = "slock"
     // Keep identity keys and the single-instance lock in their existing location.
     static let storageName = "CapsLink"
-    static let appVersion = "0.2.0"
+    static let appVersion = "0.2.1"
     static let protocolVersion: UInt8 = 2
     static let brokerURL = URL(string: "wss://test.mosquitto.org:8081/mqtt")!
     static let topicPrefix = "capslink/v2/inbox/"
@@ -1890,6 +1890,7 @@ final class SlockController {
     var outgoingPTTInvite: Bool { peerStore.ptt.outgoing != nil }
     private var consentGeneration = UUID()
     private var captureWasActive = false
+    private var lastLoggedCaptureStatus: String?
     private var lastHandshakeReply: [Data: TimeInterval] = [:]
     fileprivate(set) var lastError: String?
 
@@ -1939,9 +1940,14 @@ final class SlockController {
         }
         capsInterceptor.onStatusChange = { [weak self] in
             guard let self else { return }
-            NSLog("Caps capture: requested=%d active=%d trusted=%d error=%@",
-                  self.capsInterceptor.isRequested, self.capsInterceptor.isActive,
-                  self.capsInterceptor.permissionGranted, self.capsInterceptor.lastError ?? "none")
+            let logStatus = "requested=\(self.capsInterceptor.isRequested) "
+                + "active=\(self.capsInterceptor.isActive) "
+                + "trusted=\(self.capsInterceptor.permissionGranted) "
+                + "error=\(self.capsInterceptor.lastError ?? "none")"
+            if logStatus != self.lastLoggedCaptureStatus {
+                self.lastLoggedCaptureStatus = logStatus
+                NSLog("Caps capture: %@", logStatus)
+            }
             if self.capsInterceptor.isActive != self.captureWasActive {
                 self.captureWasActive = self.capsInterceptor.isActive
                 if self.captureWasActive { self.led.set(false) }
@@ -2130,6 +2136,12 @@ final class SlockController {
             if capsInterceptor.isActive { led.set(false) }
             capsInterceptor.stop()
         }
+        changed()
+    }
+
+    func retryCapture() {
+        guard capsInterceptor.isRequested, !capsInterceptor.isActive else { return }
+        capsInterceptor.requestPermissionAndStart()
         changed()
     }
 
@@ -2630,10 +2642,11 @@ enum FireflyIcon {
         // The four shapes match docs/images/firefly.svg; AppKit supplies the tint.
         let image = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
             NSGraphicsContext.saveGraphicsState()
-            defer { NSGraphicsContext.restoreGraphicsState() }
             let transform = NSAffineTransform()
-            transform.translateX(by: 1.8, yBy: 0)
-            transform.scale(by: 0.12)
+            transform.translateX(by: 9, yBy: 9)
+            transform.rotate(byDegrees: 45)
+            transform.scale(by: 0.083)
+            transform.translateX(by: -60, yBy: -75)
             transform.concat()
             NSColor.black.setFill()
             NSColor.black.setStroke()
@@ -2660,9 +2673,8 @@ enum FireflyIcon {
                 tail.lineWidth = 8
                 tail.stroke()
             }
-            if attention {
-                NSBezierPath(ovalIn: NSRect(x: 111, y: 8, width: 20, height: 20)).fill()
-            }
+            NSGraphicsContext.restoreGraphicsState()
+            if attention { NSBezierPath(ovalIn: NSRect(x: 14, y: 1, width: 3, height: 3)).fill() }
             return true
         }
         image.isTemplate = true
@@ -2789,8 +2801,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
         let capturePending = controller.capsInterceptor.isRequested && !controller.capsInterceptor.isActive
-        let capture = add(capturePending ? "Capture Caps Lock (not active)" : "Capture Caps Lock", #selector(toggleCapture))
+        let capture = add("Capture Caps Lock", #selector(toggleCapture))
         capture.state = controller.capsInterceptor.isActive ? .on : (capturePending ? .mixed : .off)
+        if capturePending {
+            add("Retry Capture", #selector(retryCapture))
+            add("Open Accessibility Settings…", #selector(openAccessibilitySettings))
+        }
         let login = add("Launch at Login", #selector(toggleLaunchAtLogin))
         login.state = launchAtLoginEnabled ? .on : .off
         if SMAppService.mainApp.status == .requiresApproval {
@@ -2894,6 +2910,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleCapture() {
         controller.setCaptureEnabled(!controller.capsInterceptor.isRequested)
+    }
+
+    @objc private func retryCapture() {
+        controller.retryCapture()
+    }
+
+    @objc private func openAccessibilitySettings() {
+        guard let settings = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else { return }
+        NSWorkspace.shared.open(settings)
     }
 
     @objc private func toggleLaunchAtLogin() {
