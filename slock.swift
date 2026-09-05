@@ -203,11 +203,13 @@ struct PTTConsent {
 
     mutating func receiveInvitation(_ id: UInt64) -> UInt64? {
         guard id != 0, id != revoked else { return nil }
-        if active == id { return id }
+        if let active { return active }
         if let outgoing {
             // Concurrent invitations are consent from both users; choose one ID.
             active = min(outgoing, id)
-            self.outgoing = nil
+            // Retry the chosen agreement until the peer acknowledges it. The
+            // other invitation or our acceptance may have been lost in transit.
+            self.outgoing = active
             incoming = nil
             return active
         }
@@ -240,6 +242,12 @@ struct PTTConsent {
         incoming = nil
     }
 
+    mutating func reject(_ id: UInt64) {
+        guard incoming == id else { return }
+        incoming = nil
+        revoked = id
+    }
+
     mutating func receiveRevocation(_ id: UInt64) {
         guard id != 0 else { return }
         if active == id || outgoing == id || incoming == id { disable() }
@@ -257,9 +265,66 @@ protocol Preferences {
 
 extension UserDefaults: Preferences {}
 
+struct PeerProfile: Codable {
+    let nickname: String
+
+    static func clean(_ value: String) -> String {
+        String(value.components(separatedBy: .controlCharacters).joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines).prefix(48))
+    }
+
+    static func payload(_ nickname: String) -> Data {
+        (try? JSONEncoder().encode(PeerProfile(nickname: clean(nickname)))) ?? Data()
+    }
+
+    static func read(_ data: Data) -> String? {
+        guard data.count <= 1024, let value = try? JSONDecoder().decode(Self.self, from: data) else { return nil }
+        return clean(value.nickname)
+    }
+}
+
+struct RecentPeer: Codable {
+    let publicKey: Data
+    var ownNickname: String
+    var localNickname: String
+    var pairingCode: String { "CL1." + publicKey.base64URL }
+    var displayName: String {
+        if !ownNickname.isEmpty { return ownNickname }
+        if !localNickname.isEmpty { return localNickname }
+        return String(pairingCode.suffix(6))
+    }
+}
+
 final class PeerStore {
     private let defaults: Preferences
     private let peerKey = "CapsLink.peerPublicKey"
+    private(set) var recent: [RecentPeer] = []
+    var ownNickname: String {
+        get { PeerProfile.clean(defaults.string(forKey: "slock.nickname") ?? "") }
+        set { defaults.set(PeerProfile.clean(newValue), forKey: "slock.nickname") }
+    }
+
+    func entry(for key: Data) -> RecentPeer? { recent.first { $0.publicKey == key } }
+
+    func establish(_ key: Data, ownNickname: String?, localNickname: String? = nil) {
+        var entry = self.entry(for: key) ?? RecentPeer(publicKey: key, ownNickname: "", localNickname: "")
+        if let ownNickname { entry.ownNickname = PeerProfile.clean(ownNickname) }
+        if let localNickname { entry.localNickname = PeerProfile.clean(localNickname) }
+        recent.removeAll { $0.publicKey == key }
+        recent.insert(entry, at: 0)
+        persistRecent()
+    }
+
+    func rename(_ key: Data, ownNickname: String? = nil, localNickname: String? = nil) {
+        guard let index = recent.firstIndex(where: { $0.publicKey == key }) else { return }
+        if let ownNickname { recent[index].ownNickname = PeerProfile.clean(ownNickname) }
+        if let localNickname { recent[index].localNickname = PeerProfile.clean(localNickname) }
+        persistRecent()
+    }
+
+    private func persistRecent() {
+        defaults.set(try? JSONEncoder().encode(recent), forKey: "slock.recentPeers")
+    }
 
     var peerPublicKey: Data? {
         didSet {
@@ -271,6 +336,7 @@ final class PeerStore {
     var ptt: PTTConsent {
         didSet {
             defaults.set(ptt.active.map(String.init), forKey: "CapsLink.pttAgreement")
+            defaults.set(ptt.outgoing.map(String.init), forKey: "CapsLink.pttOutgoing")
             defaults.set(ptt.revoked.map(String.init), forKey: "CapsLink.pttRevocation")
         }
     }
@@ -282,9 +348,19 @@ final class PeerStore {
         peerPublicKey = defaults.data(forKey: peerKey)
         ptt = PTTConsent(
             active: defaults.string(forKey: "CapsLink.pttAgreement").flatMap(UInt64.init),
+            outgoing: defaults.string(forKey: "CapsLink.pttOutgoing").flatMap(UInt64.init),
             revoked: defaults.string(forKey: "CapsLink.pttRevocation").flatMap(UInt64.init)
         )
         if peerPublicKey == nil { ptt = PTTConsent() }
+        if let data = defaults.data(forKey: "slock.recentPeers"),
+           let saved = try? JSONDecoder().decode([RecentPeer].self, from: data) {
+            var seen = Set<Data>()
+            recent = saved.filter { $0.publicKey.count == 32 && seen.insert($0.publicKey).inserted }.map {
+                RecentPeer(publicKey: $0.publicKey, ownNickname: PeerProfile.clean($0.ownNickname),
+                           localNickname: PeerProfile.clean($0.localNickname))
+            }
+        }
+        if let key = peerPublicKey, entry(for: key) == nil { establish(key, ownNickname: nil) }
     }
 }
 
@@ -296,6 +372,7 @@ enum WireKind: UInt8 {
     case pairReject = 3
     case hello = 10
     case keyState = 11
+    case profile = 12
     case pttInvite = 20
     case pttAccept = 21
     case pttReject = 22
@@ -317,10 +394,10 @@ struct OpenedMessage {
 
 final class SecureWire {
     private let identity: IdentityStore
-    private let bootID = randomUInt64()
     private var sequence: UInt64 = 0
     private struct Session {
-        var hint: UInt64
+        let localBoot = randomUInt64()
+        var hint: UInt64 = 0
         var boot: UInt64?
         var sequence: UInt64 = 0
         var retired: Set<UInt64> = []
@@ -337,6 +414,8 @@ final class SecureWire {
                 .min(by: { $0.value.lastSeen < $1.value.lastSeen })?.key else { return false }
             sessions.removeValue(forKey: oldest)
         }
+        // A forgotten replay window must also forget its receiver challenge.
+        sessions[sender] = Session()
         return true
     }
 
@@ -363,24 +442,30 @@ final class SecureWire {
         )
     }
 
-    func seal(kind: WireKind, payload: Data, to peerPublicKey: Data) throws -> Data {
-        sequence &+= 1
-        var plaintext = Data([kind.rawValue])
-        plaintext.appendUInt64(bootID)
-        plaintext.appendUInt64(sequence)
-        // Commands target this particular receiver process. HELLO exchanges boot
-        // challenges first; recordings from an earlier receiver cannot authorize work.
+    func seal(kind: WireKind, payload: Data, to peerPublicKey: Data,
+              protecting protected: Set<Data> = []) throws -> Data {
         guard kind == .hello || hasSession(with: peerPublicKey) else {
             throw appError("slock.Wire", "Waiting for a fresh peer session.")
         }
-        plaintext.appendUInt64((kind == .hello ? sessions[peerPublicKey]?.hint : sessions[peerPublicKey]?.boot) ?? 0)
+        let symmetricKey = try key(for: peerPublicKey)
+        guard reserveSession(for: peerPublicKey, protecting: protected),
+              let session = sessions[peerPublicKey] else {
+            throw appError("slock.Wire", "No room for a fresh peer session.")
+        }
+        sequence &+= 1
+        var plaintext = Data([kind.rawValue])
+        plaintext.appendUInt64(session.localBoot)
+        plaintext.appendUInt64(sequence)
+        // Commands target the current receiver session, including after cache
+        // eviction. HELLO exchanges fresh challenges before authorizing work.
+        plaintext.appendUInt64((kind == .hello ? session.hint : session.boot) ?? 0)
         plaintext.append(payload)
 
         var header = Data([SlockConfig.protocolVersion])
         header.append(identity.publicKey)
         let sealed = try ChaChaPoly.seal(
             plaintext,
-            using: key(for: peerPublicKey),
+            using: symmetricKey,
             authenticating: header
         )
         header.append(sealed.combined)
@@ -411,12 +496,13 @@ final class SecureWire {
                   let recipientBoot = plaintext.uint64(at: 17),
                   boot != 0, messageSequence != 0 else { return nil }
 
-            guard reserveSession(for: sender, protecting: protected) else { return nil }
-            var session = sessions[sender] ?? Session(hint: boot)
+            guard kind == .hello || sessions[sender] != nil,
+                  reserveSession(for: sender, protecting: protected),
+                  var session = sessions[sender] else { return nil }
             guard !session.retired.contains(boot) else { return nil }
             let newSession = session.boot != boot
             if kind == .hello {
-                if recipientBoot != bootID {
+                if recipientBoot != session.localBoot {
                     // An unconfirmed hello is only a reply address, never presence,
                     // consent, key state, or permission to change the active session.
                     session.hint = boot
@@ -432,7 +518,7 @@ final class SecureWire {
                     session.sequence = 0
                 }
             } else {
-                guard session.boot == boot, recipientBoot == bootID else { return nil }
+                guard session.boot == boot, recipientBoot == session.localBoot else { return nil }
             }
             guard messageSequence > session.sequence else { return nil }
             session.sequence = messageSequence
@@ -493,7 +579,15 @@ struct MQTTPacketDecoder {
     }
 }
 
-final class MQTTClient: NSObject, URLSessionWebSocketDelegate {
+protocol RelayTransport: AnyObject {
+    var onStateChange: ((MQTTClient.State) -> Void)? { get set }
+    var onMessage: ((String, Data) -> Void)? { get set }
+    func start()
+    func stop()
+    func publish(topic: String, payload: Data)
+}
+
+final class MQTTClient: NSObject, URLSessionWebSocketDelegate, RelayTransport {
     enum State: Equatable {
         case stopped
         case connecting
@@ -850,13 +944,38 @@ final class MQTTClient: NSObject, URLSessionWebSocketDelegate {
 
 private var globalCapsEventTap: CFMachPort?
 private var globalCapsIsDown = false
-private var globalCapsHandler: ((Bool) -> Void)?
+private let globalCapsDelivery = CapturedKeyDelivery()
 private var globalCapsClearLock: (() -> Void)?
 private var cleanupPath: UnsafeMutablePointer<CChar>?
 private var cleanupArg0: UnsafeMutablePointer<CChar>?
 private var cleanupArg1: UnsafeMutablePointer<CChar>?
 private var cleanupArg2: UnsafeMutablePointer<CChar>?
 private var cleanupArg3: UnsafeMutablePointer<CChar>?
+
+// Tap callbacks must defer expensive controller work, but queued presses must
+// never survive a disabled tap or be delivered to a later capture session.
+final class CapturedKeyDelivery {
+    var handler: ((Bool) -> Void)?
+    private var generation = UUID()
+
+    func enqueue(_ down: Bool) {
+        let generation = generation
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.generation == generation else { return }
+            self.handler?(down)
+        }
+    }
+
+    func release() {
+        generation = UUID()
+        handler?(false)
+    }
+
+    func reset() {
+        generation = UUID()
+        handler = nil
+    }
+}
 
 private func configureEmergencyRestore(_ json: String?) {
     [cleanupPath, cleanupArg0, cleanupArg1, cleanupArg2, cleanupArg3].forEach {
@@ -918,7 +1037,7 @@ private func capsEventTapCallback(
         // A key-up may have been lost while the tap was disabled. Fail closed:
         // release the remote light and microphone before resuming interception.
         globalCapsIsDown = false
-        globalCapsHandler?(false)
+        globalCapsDelivery.release()
         if let tap = globalCapsEventTap {
             CGEvent.tapEnable(tap: tap, enable: true)
         }
@@ -932,14 +1051,14 @@ private func capsEventTapCallback(
             let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
             if !isRepeat, !globalCapsIsDown {
                 globalCapsIsDown = true
-                DispatchQueue.main.async { globalCapsHandler?(true) }
+                globalCapsDelivery.enqueue(true)
             }
             return nil
         }
         if type == .keyUp {
             if globalCapsIsDown {
                 globalCapsIsDown = false
-                DispatchQueue.main.async { globalCapsHandler?(false) }
+                globalCapsDelivery.enqueue(false)
             }
             return nil
         }
@@ -1012,6 +1131,7 @@ final class CapsInterceptor {
     private var writeLock: (Bool) -> Bool = CapsLockState.set
     private let staleMappingKey = "CapsLink.staleOriginalMapping"
     private var recoveryFailed = false
+    private var needsLockRestore = false
 
     init(defaults: Preferences = UserDefaults.standard,
          process: @escaping (String, [String]) throws -> (Int32, String, String) = runProcess) {
@@ -1078,7 +1198,7 @@ final class CapsInterceptor {
 
     func start() {
         guard !isActive else { return }
-        if recoveryFailed {
+        if recoveryFailed || needsLockRestore {
             restoreStaleMappingIfNeeded()
             guard !recoveryFailed else { onStatusChange?(); return }
         }
@@ -1090,7 +1210,7 @@ final class CapsInterceptor {
         permissionTimer?.invalidate()
         permissionTimer = nil
 
-        var attemptedLockReset = false
+        var attemptedMapping = false
         do {
             let mappings = try readMappings()
             if mappings.contains(where: {
@@ -1110,22 +1230,26 @@ final class CapsInterceptor {
             originalMappings = mappings
             let originalJSON = mappingJSON(mappings)
             defaults.set(originalJSON, forKey: staleMappingKey)
-            defaults.synchronize()
+            guard defaults.synchronize() else {
+                defaults.removeObject(forKey: staleMappingKey)
+                throw appError("slock.Keyboard", "Could not save the keyboard recovery journal. Capture is inactive.")
+            }
             configureEmergencyRestore(originalJSON)
 
             var activeMappings = mappings.filter { $0.src != SlockConfig.capsHIDUsage }
             activeMappings.append((SlockConfig.capsHIDUsage, SlockConfig.f18HIDUsage))
+            attemptedMapping = true
+            // Even if verification fails, the retained tap can clear the lock
+            // while swallowing remapped events. Keep the original state owed.
+            needsLockRestore = true
             try applyMappings(activeMappings)
-            attemptedLockReset = true
             guard writeLock(false) else {
                 throw appError("slock.Keyboard", "Could not turn off the system Caps Lock state. Capture is inactive.")
             }
             lastError = nil
             isActive = true
         } catch {
-            removeEventTap()
-            if attemptedLockReset { _ = writeLock(priorCapsLockOn) }
-            if let json = defaults.string(forKey: staleMappingKey) {
+            if attemptedMapping, let json = defaults.string(forKey: staleMappingKey) {
                 do {
                     try applyMappingJSON(json)
                     defaults.removeObject(forKey: staleMappingKey)
@@ -1136,6 +1260,12 @@ final class CapsInterceptor {
                     recoveryFailed = true
                 }
             }
+            // Keep swallowing the remapped key if rollback failed. A later
+            // retry or stop still has the journal needed to restore ownership.
+            if !recoveryFailed {
+                removeEventTap()
+                _ = restorePendingLock()
+            }
             lastError = error.localizedDescription
             isActive = false
         }
@@ -1143,10 +1273,10 @@ final class CapsInterceptor {
     }
 
     func stop() {
-        let wasActive = isActive
         isRequested = false
         permissionTimer?.invalidate()
         permissionTimer = nil
+        globalCapsDelivery.release()
         if globalCapsIsDown {
             globalCapsIsDown = false
             onKeyState?(false)
@@ -1168,7 +1298,7 @@ final class CapsInterceptor {
         }
         removeEventTap()
         isActive = false
-        if wasActive, !writeLock(priorCapsLockOn) {
+        if !restorePendingLock() {
             lastError = "Capture stopped, but the previous Caps Lock state could not be restored."
         }
         onStatusChange?()
@@ -1198,7 +1328,7 @@ final class CapsInterceptor {
         eventTap = tap
         runLoopSource = source
         globalCapsEventTap = tap
-        globalCapsHandler = { [weak self] down in self?.onKeyState?(down) }
+        globalCapsDelivery.handler = { [weak self] down in self?.onKeyState?(down) }
         globalCapsClearLock = { [weak self] in
             guard let self else { return }
             if !self.writeLock(false) {
@@ -1223,24 +1353,48 @@ final class CapsInterceptor {
         eventTap = nil
         runLoopSource = nil
         globalCapsEventTap = nil
-        globalCapsHandler = nil
+        globalCapsIsDown = false
+        globalCapsDelivery.reset()
         globalCapsClearLock = nil
     }
 
     private func restoreStaleMappingIfNeeded() {
-        guard let json = defaults.string(forKey: staleMappingKey) else { return }
-        configureEmergencyRestore(json)
+        guard let json = defaults.string(forKey: staleMappingKey) else {
+            if needsLockRestore {
+                removeEventTap()
+                recoveryFailed = !restorePendingLock()
+            }
+            return
+        }
+        configureEmergencyRestore(nil)
         do {
-            try applyMappingJSON(json)
+            let canonical = mappingJSON(try decodeMappingJSON(json))
+            configureEmergencyRestore(canonical)
+            try applyMappingJSON(canonical)
             defaults.removeObject(forKey: staleMappingKey)
             defaults.synchronize()
             configureEmergencyRestore(nil)
             recoveryFailed = false
+            removeEventTap()
+            guard restorePendingLock() else {
+                throw appError("slock.Keyboard", "The previous Caps Lock state could not be restored.")
+            }
         } catch {
             recoveryFailed = true
             lastError = "A prior slock keyboard mapping could not be restored: \(error.localizedDescription)"
         }
     }
+
+    private func restorePendingLock() -> Bool {
+        guard needsLockRestore else { return true }
+        guard writeLock(priorCapsLockOn) else { return false }
+        needsLockRestore = false
+        return true
+    }
+
+    #if CAPSLINK_TESTING
+    static var emergencyMappingJSON: String? { cleanupArg3.map { String(cString: $0) } }
+    #endif
 
     private func readMappings() throws -> [HIDMap] {
         let result = try process("/usr/bin/hidutil", ["property", "--get", "UserKeyMapping"])
@@ -1260,14 +1414,19 @@ final class CapsInterceptor {
 
         let blockRegex = try NSRegularExpression(pattern: #"\{[^}]*\}"#, options: [.dotMatchesLineSeparators])
         let srcRegex = try NSRegularExpression(
-            pattern: #"HIDKeyboardModifierMappingSrc\s*=\s*(0x[0-9A-Fa-f]+|[0-9]+)"#
+            pattern: #"HIDKeyboardModifierMappingSrc\s*=\s*(0x[0-9A-Fa-f]+|[0-9]+)\s*;"#
         )
         let dstRegex = try NSRegularExpression(
-            pattern: #"HIDKeyboardModifierMappingDst\s*=\s*(0x[0-9A-Fa-f]+|[0-9]+)"#
+            pattern: #"HIDKeyboardModifierMappingDst\s*=\s*(0x[0-9A-Fa-f]+|[0-9]+)\s*;"#
         )
         let fullRange = NSRange(output.startIndex..<output.endIndex, in: output)
         let blocks = blockRegex.matches(in: output, range: fullRange)
         var mappings: [HIDMap] = []
+        let container = blockRegex.stringByReplacingMatches(in: output, range: fullRange, withTemplate: "#")
+        guard container.range(of: #"^\(\s*#(?:\s*,\s*#)*\s*,?\s*\)$"#,
+                              options: .regularExpression) != nil else {
+            throw appError("slock.Keyboard", "slock refused to overwrite an incomplete hidutil mapping.")
+        }
 
         for match in blocks {
             guard let range = Range(match.range, in: output) else { continue }
@@ -1279,6 +1438,12 @@ final class CapsInterceptor {
                   let dstRange = Range(dstMatch.range(at: 1), in: block),
                   let src = parseInteger(String(block[srcRange])),
                   let dst = parseInteger(String(block[dstRange])) else { continue }
+            let withoutSource = srcRegex.stringByReplacingMatches(in: block, range: blockRange, withTemplate: "")
+            let remainder = dstRegex.stringByReplacingMatches(in: withoutSource,
+                range: NSRange(withoutSource.startIndex..<withoutSource.endIndex, in: withoutSource), withTemplate: "")
+            guard srcRegex.numberOfMatches(in: block, range: blockRange) == 1,
+                  dstRegex.numberOfMatches(in: block, range: blockRange) == 1,
+                  remainder.range(of: #"^\{\s*\}$"#, options: .regularExpression) != nil else { continue }
             mappings.append((src, dst))
         }
 
@@ -1309,8 +1474,25 @@ final class CapsInterceptor {
         try applyMappingJSON(mappingJSON(mappings))
     }
 
+    private func decodeMappingJSON(_ json: String) throws -> [HIDMap] {
+        struct Journal: Decodable {
+            struct Entry: Decodable {
+                let HIDKeyboardModifierMappingSrc: UInt64
+                let HIDKeyboardModifierMappingDst: UInt64
+            }
+            let UserKeyMapping: [Entry]
+        }
+        let journal = try JSONDecoder().decode(Journal.self, from: Data(json.utf8))
+        return journal.UserKeyMapping.map {
+            (src: $0.HIDKeyboardModifierMappingSrc, dst: $0.HIDKeyboardModifierMappingDst)
+        }
+    }
+
     private func applyMappingJSON(_ json: String) throws {
-        let result = try process("/usr/bin/hidutil", ["property", "--set", json])
+        // Validate the entire journal before running a command, and only pass
+        // the supported mapping property through to hidutil.
+        let expected = try decodeMappingJSON(json)
+        let result = try process("/usr/bin/hidutil", ["property", "--set", mappingJSON(expected)])
         guard result.0 == 0 else {
             throw appError(
                 "slock.Keyboard",
@@ -1319,18 +1501,12 @@ final class CapsInterceptor {
         }
         // hidutil can exit successfully without installing a mapping. Never
         // claim ownership (or discard the recovery journal) on exit status alone.
-        let object = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
-        guard let entries = object?["UserKeyMapping"] as? [[String: NSNumber]] else {
-            throw appError("slock.Keyboard", "Invalid keyboard mapping journal.")
-        }
-        let expected = entries.compactMap { entry -> HIDMap? in
-            guard let src = entry["HIDKeyboardModifierMappingSrc"],
-                  let dst = entry["HIDKeyboardModifierMappingDst"] else { return nil }
-            return (src.uint64Value, dst.uint64Value)
-        }
         let actual = try readMappings()
-        guard expected.count == entries.count, actual.count == expected.count,
-              actual.allSatisfy({ value in expected.contains { $0.src == value.src && $0.dst == value.dst } }) else {
+        let ordered: (HIDMap, HIDMap) -> Bool = { $0.src == $1.src ? $0.dst < $1.dst : $0.src < $1.src }
+        guard actual.count == expected.count,
+              zip(actual.sorted(by: ordered), expected.sorted(by: ordered)).allSatisfy({
+                  $0.src == $1.src && $0.dst == $1.dst
+              }) else {
             throw appError("slock.Keyboard", "macOS did not apply the keyboard mapping. Check slock's Accessibility permission and try enabling capture again.")
         }
     }
@@ -1619,7 +1795,21 @@ final class OpusDecoder {
     }
 }
 
-final class AudioCapture {
+protocol VoiceCapture: AnyObject {
+    var onError: ((String) -> Void)? { get set }
+    func start(onBatch: @escaping (Data) -> Void) throws
+    func stop()
+}
+
+protocol VoicePlayback: AnyObject {
+    var onError: ((String) -> Void)? { get set }
+    func beginTalk()
+    func receiveBatch(_ batch: Data)
+    func endTalk(completion: @escaping () -> Void)
+    func stopImmediately()
+}
+
+final class AudioCapture: VoiceCapture {
     var onError: ((String) -> Void)?
 
     private let engine = AVAudioEngine()
@@ -1634,6 +1824,7 @@ final class AudioCapture {
     private var isRunning = false
     private var generation = UUID()
     private let pendingInput = DispatchSemaphore(value: 8)
+    private var configurationObserver: NSObjectProtocol?
 
     init() throws {
         guard let target = AVAudioFormat(
@@ -1644,6 +1835,20 @@ final class AudioCapture {
         ) else { throw audioError("Could not create the microphone conversion format.") }
         targetFormat = target
         encoder = try OpusEncoder()
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.queue.async {
+                guard self.isRunning else { return }
+                self.report("The microphone configuration changed. Release Caps Lock and press again to resume.",
+                            onlyIfEngineStopped: true)
+            }
+        }
+    }
+
+    deinit {
+        if let configurationObserver { NotificationCenter.default.removeObserver(configurationObserver) }
     }
 
     func start(onBatch: @escaping (Data) -> Void) throws {
@@ -1756,8 +1961,13 @@ final class AudioCapture {
         DispatchQueue.main.async { callback(batch) }
     }
 
-    private func report(_ message: String) {
-        DispatchQueue.main.async { [weak self] in self?.onError?(message) }
+    private func report(_ message: String, onlyIfEngineStopped: Bool = false) {
+        let generation = generation
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.queue.sync(execute: { self.generation == generation }) else { return }
+            guard !onlyIfEngineStopped || !self.engine.isRunning else { return }
+            self.onError?(message)
+        }
     }
 
     private static func copyPCMBuffer(_ source: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
@@ -1779,7 +1989,7 @@ final class AudioCapture {
     }
 }
 
-final class AudioPlayback {
+final class AudioPlayback: VoicePlayback {
     var onError: ((String) -> Void)?
 
     private let queue = DispatchQueue(label: "slock.AudioPlayback")
@@ -1866,6 +2076,9 @@ final class AudioPlayback {
     private func finishDrainIfNeeded() {
         guard queuedBuffers == 0, let completion = onDrain else { return }
         onDrain = nil
+        player.stop()
+        engine.stop()
+        started = false
         DispatchQueue.main.async(execute: completion)
     }
 
@@ -1874,6 +2087,7 @@ final class AudioPlayback {
             self.generation = UUID()
             self.onDrain = nil
             self.player.stop()
+            self.engine.stop()
             self.decoder.reset()
             self.queuedBuffers = 0
             self.started = false
@@ -1892,7 +2106,11 @@ final class AudioPlayback {
     }
 
     private func report(_ message: String) {
-        DispatchQueue.main.async { [weak self] in self?.onError?(message) }
+        let generation = generation
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.queue.sync(execute: { self.generation == generation }) else { return }
+            self.onError?(message)
+        }
     }
 }
 
@@ -1908,15 +2126,19 @@ final class SlockController {
     let identity: IdentityStore
     let peerStore: PeerStore
     let capsInterceptor: CapsInterceptor
-    let led = CapsLED()
+    let led: CapsLED
 
     var onStateChange: (() -> Void)?
 
     private let wire: SecureWire
-    private let transport: MQTTClient
+    private let transport: RelayTransport
+    private let makeCapture: () throws -> VoiceCapture
+    private let makePlayback: () throws -> VoicePlayback
+    private let checkAudio: () throws -> Void
+    private let requestMicrophone: (@escaping (Bool) -> Void) -> Void
     private var timer: Timer?
-    private var audioCapture: AudioCapture?
-    private var audioPlayback: AudioPlayback?
+    private var audioCapture: VoiceCapture?
+    private var audioPlayback: VoicePlayback?
 
     private(set) var transportState: MQTTClient.State = .stopped
     private(set) var localKeyDown = false
@@ -1926,6 +2148,10 @@ final class SlockController {
     private(set) var remoteTalking = false
     private(set) var incomingPairPublicKey: Data?
     private(set) var outgoingPairPublicKey: Data?
+    private(set) var incomingNickname: String?
+    private(set) var outgoingRemoteNickname: String?
+    private(set) var outgoingLocalNickname: String?
+    private(set) var incomingLocalNickname: String?
     var incomingPTTInvite: Bool { peerStore.ptt.incoming != nil }
     var outgoingPTTInvite: Bool { peerStore.ptt.outgoing != nil }
     private var consentGeneration = UUID()
@@ -1945,16 +2171,33 @@ final class SlockController {
     private var remoteTalkEnding = false
     private var restartTalkAfterStop = false
 
-    init() throws {
-        identity = try IdentityStore()
-        peerStore = PeerStore()
-        wire = SecureWire(identity: identity)
-        capsInterceptor = CapsInterceptor()
-        transport = MQTTClient(
+    convenience init() throws {
+        let identity = try IdentityStore()
+        let transport = MQTTClient(
             brokerURL: SlockConfig.brokerURL,
             clientID: "cl-" + String(identity.routeID.prefix(20)),
             subscriptionTopic: SlockConfig.topicPrefix + identity.routeID
         )
+        self.init(identity: identity, peerStore: PeerStore(), capsInterceptor: CapsInterceptor(),
+                  led: CapsLED(), transport: transport, startServices: true)
+    }
+
+    init(identity: IdentityStore, peerStore: PeerStore, capsInterceptor: CapsInterceptor,
+         led: CapsLED, transport: RelayTransport, startServices: Bool = false,
+         makeCapture: @escaping () throws -> VoiceCapture = { try AudioCapture() },
+         makePlayback: @escaping () throws -> VoicePlayback = { try AudioPlayback() },
+         checkAudio: @escaping () throws -> Void = { _ = try OpusEncoder(); _ = try OpusDecoder() },
+         requestMicrophone: @escaping (@escaping (Bool) -> Void) -> Void = SlockController.ensureMicrophonePermission) {
+        self.identity = identity
+        self.peerStore = peerStore
+        self.capsInterceptor = capsInterceptor
+        self.led = led
+        self.transport = transport
+        self.makeCapture = makeCapture
+        self.makePlayback = makePlayback
+        self.checkAudio = checkAudio
+        self.requestMicrophone = requestMicrophone
+        wire = SecureWire(identity: identity)
 
         transport.onStateChange = { [weak self] state in
             guard let self else { return }
@@ -1995,6 +2238,7 @@ final class SlockController {
             self.changed()
         }
 
+        guard startServices else { return }
         transport.start()
         if UserDefaults.standard.object(forKey: "CapsLink.captureEnabled") == nil
             || UserDefaults.standard.bool(forKey: "CapsLink.captureEnabled") {
@@ -2023,6 +2267,7 @@ final class SlockController {
         if !capsInterceptor.isActive { return capsInterceptor.lastError ?? "Caps Lock capture inactive" }
         if incomingPairPublicKey != nil { return "Pair request waiting" }
         if incomingPTTInvite { return "PTT invitation waiting" }
+        if let outgoingPairPublicKey { return "Pairing request sent to \(peerName(outgoingPairPublicKey))" }
         if peerStore.peerPublicKey == nil { return "Not paired" }
         if transportState != .connected { return transportState.text }
         if localTalking { return "Transmitting" }
@@ -2031,7 +2276,34 @@ final class SlockController {
         return peerStore.pttEnabled ? "Connected · PTT enabled" : "Connected"
     }
 
-    func pair(using code: String) throws {
+    func suppliedNickname(for key: Data) -> String {
+        if key == incomingPairPublicKey, let incomingNickname { return incomingNickname }
+        if key == outgoingPairPublicKey, let outgoingRemoteNickname { return outgoingRemoteNickname }
+        return peerStore.entry(for: key)?.ownNickname ?? ""
+    }
+
+    func peerName(_ key: Data) -> String {
+        let alias = key == incomingPairPublicKey ? incomingLocalNickname
+            : (key == outgoingPairPublicKey ? outgoingLocalNickname : nil)
+        return RecentPeer(publicKey: key, ownNickname: suppliedNickname(for: key),
+                          localNickname: alias ?? peerStore.entry(for: key)?.localNickname ?? "").displayName
+    }
+
+    func saveNicknames(own: String, peer: Data?, local: String) {
+        peerStore.ownNickname = own
+        if let peer {
+            peerStore.rename(peer, localNickname: local)
+            if peer == incomingPairPublicKey { incomingLocalNickname = PeerProfile.clean(local) }
+            if peer == outgoingPairPublicKey { outgoingLocalNickname = PeerProfile.clean(local) }
+        }
+        sendHello(force: true)
+        for key in [incomingPairPublicKey, outgoingPairPublicKey].compactMap({ $0 }) {
+            send(kind: .profile, payload: PeerProfile.payload(peerStore.ownNickname), to: key)
+        }
+        changed()
+    }
+
+    func pair(using code: String, localNickname: String? = nil) throws {
         let publicKey = try IdentityStore.publicKey(fromPairingCode: code)
         guard publicKey != identity.publicKey else {
             throw appError("slock.Pairing", "You cannot pair this Mac with itself.")
@@ -2040,13 +2312,16 @@ final class SlockController {
             throw appError("slock.Pairing", "Unpair the current peer before pairing another Mac.")
         }
         outgoingPairPublicKey = publicKey
+        outgoingLocalNickname = localNickname
+        outgoingRemoteNickname = nil
         incomingPairPublicKey = nil
+        incomingNickname = nil
         lastError = nil
         retryOutgoingPairRequest(force: true)
         changed()
     }
 
-    func acceptIncomingPair(expected: Data) {
+    func acceptIncomingPair(expected: Data, localNickname: String? = nil) {
         guard let incoming = incomingPairPublicKey, incoming == expected else {
             lastError = "The pair request changed. Reopen the menu to review the current request."
             changed()
@@ -2056,8 +2331,10 @@ final class SlockController {
             send(kind: .pairReject, payload: Data(), to: incoming)
         } else {
             peerStore.peerPublicKey = incoming
+            peerStore.establish(incoming, ownNickname: incomingNickname,
+                                localNickname: localNickname ?? incomingLocalNickname)
             peerStore.ptt.disable()
-            send(kind: .pairAccept, payload: Data(), to: incoming)
+            send(kind: .pairAccept, payload: PeerProfile.payload(peerStore.ownNickname), to: incoming)
             markPeerSeen()
             sendHello(force: true)
         }
@@ -2085,7 +2362,7 @@ final class SlockController {
         guard preparePTT() else { completion(false); return }
         consentGeneration = UUID()
         let generation = consentGeneration
-        ensureMicrophonePermission { [weak self] granted in
+        requestMicrophone { [weak self] granted in
             guard let self else { return }
             guard self.peerStore.peerPublicKey == peer, self.consentGeneration == generation else { return }
             if granted {
@@ -2101,15 +2378,18 @@ final class SlockController {
         }
     }
 
-    func acceptPTTInvite(completion: @escaping (Bool) -> Void) {
-        guard let invitation = peerStore.ptt.incoming, let peer = peerStore.peerPublicKey else {
+    func acceptPTTInvite(expected: UInt64, completion: @escaping (Bool) -> Void) {
+        guard let invitation = peerStore.ptt.incoming, invitation == expected,
+              let peer = peerStore.peerPublicKey else {
+            lastError = "The PTT invitation changed. Reopen the menu to review the current invitation."
+            changed()
             completion(false)
             return
         }
         guard preparePTT() else { completion(false); return }
         consentGeneration = UUID()
         let generation = consentGeneration
-        ensureMicrophonePermission { [weak self] granted in
+        requestMicrophone { [weak self] granted in
             guard let self else { return }
             guard self.peerStore.peerPublicKey == peer, self.consentGeneration == generation,
                   self.peerStore.ptt.incoming == invitation else { return }
@@ -2118,7 +2398,7 @@ final class SlockController {
                 self.sendPTT(.pttAccept, id: invitation, to: peer)
                 self.lastError = nil
             } else {
-                self.peerStore.ptt.incoming = nil
+                self.peerStore.ptt.reject(invitation)
                 self.sendPTT(.pttReject, id: invitation, to: peer)
                 self.lastError = "Microphone permission is required for PTT."
             }
@@ -2127,10 +2407,11 @@ final class SlockController {
         }
     }
 
-    func rejectPTTInvite() {
-        guard let peer = peerStore.peerPublicKey, let invitation = peerStore.ptt.incoming else { return }
+    func rejectPTTInvite(expected: UInt64) {
+        guard let peer = peerStore.peerPublicKey, let invitation = peerStore.ptt.incoming,
+              invitation == expected else { return }
         consentGeneration = UUID()
-        peerStore.ptt.incoming = nil
+        peerStore.ptt.reject(invitation)
         sendPTT(.pttReject, id: invitation, to: peer)
         changed()
     }
@@ -2155,8 +2436,7 @@ final class SlockController {
 
     private func preparePTT() -> Bool {
         do {
-            _ = try OpusEncoder()
-            _ = try OpusDecoder()
+            try checkAudio()
             return true
         } catch {
             lastError = "PTT is unavailable: \(error.localizedDescription)"
@@ -2253,6 +2533,7 @@ final class SlockController {
             "System Caps Lock on: \(CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift))",
             "Caps error: \(capsInterceptor.lastError ?? "none")",
             "LED mode: \(led.mode.rawValue)",
+            "App error: \(lastError ?? "none")",
             "OS: \(ProcessInfo.processInfo.operatingSystemVersionString)",
             "Architecture: \(architecture)",
             "Broker: \(SlockConfig.brokerURL.absoluteString)"
@@ -2287,7 +2568,20 @@ final class SlockController {
         }
 
         if message.kind == .pairRequest {
-            handlePairRequest(from: sender)
+            handlePairRequest(from: sender, nickname: PeerProfile.read(message.payload))
+            return
+        }
+
+        if message.kind == .profile {
+            guard let nickname = PeerProfile.read(message.payload) else { return }
+            if sender == peerStore.peerPublicKey {
+                peerStore.rename(sender, ownNickname: nickname)
+            } else if sender == outgoingPairPublicKey {
+                outgoingRemoteNickname = nickname
+            } else if sender == incomingPairPublicKey {
+                incomingNickname = nickname
+            } else { return }
+            changed()
             return
         }
 
@@ -2302,6 +2596,8 @@ final class SlockController {
             break
         case .pairAccept:
             peerStore.peerPublicKey = sender
+            peerStore.establish(sender, ownNickname: PeerProfile.read(message.payload) ?? outgoingRemoteNickname,
+                                localNickname: outgoingLocalNickname)
             peerStore.ptt.disable()
             incomingPairPublicKey = nil
             outgoingPairPublicKey = nil
@@ -2319,10 +2615,14 @@ final class SlockController {
         case .keyState:
             markPeerSeen()
             if let value = message.payload.first { updateRemoteKey(value != 0) }
+        case .profile:
+            break
         case .pttInvite:
             guard let invitation = message.payload.uint64(at: 0), message.payload.count == 8 else { return }
             markPeerSeen()
-            if let accepted = peerStore.ptt.receiveInvitation(invitation) {
+            if invitation == peerStore.ptt.revoked {
+                sendPTT(.pttReject, id: invitation, to: sender)
+            } else if let accepted = peerStore.ptt.receiveInvitation(invitation) {
                 sendPTT(.pttAccept, id: accepted, to: sender)
             }
         case .pttAccept:
@@ -2350,21 +2650,26 @@ final class SlockController {
         changed()
     }
 
-    private func handlePairRequest(from sender: Data) {
+    private func handlePairRequest(from sender: Data, nickname: String?) {
         if let peer = peerStore.peerPublicKey {
             if peer == sender {
-                send(kind: .pairAccept, payload: Data(), to: sender)
+                peerStore.rename(sender, ownNickname: nickname)
+                send(kind: .pairAccept, payload: PeerProfile.payload(peerStore.ownNickname), to: sender)
                 markPeerSeen()
             } else {
                 send(kind: .pairReject, payload: Data(), to: sender)
             }
             return
         }
+        if incomingPairPublicKey != sender { incomingLocalNickname = nil }
         incomingPairPublicKey = sender
+        incomingNickname = nickname
+        send(kind: .profile, payload: PeerProfile.payload(peerStore.ownNickname), to: sender)
         changed()
     }
 
     private func handleLocalKey(_ down: Bool) {
+        guard !down || capsInterceptor.isActive else { return }
         guard localKeyDown != down else { return }
         localKeyDown = down
         // A local press is an output for the peer, never for this keyboard.
@@ -2407,15 +2712,16 @@ final class SlockController {
               peerStore.pttEnabled,
               let peer = peerStore.peerPublicKey else { return }
         do {
-            let capture = try audioCapture ?? AudioCapture()
+            let capture = try audioCapture ?? makeCapture()
+            let talkID = randomUInt64()
             capture.onError = { [weak self] message in
-                self?.lastError = "Audio capture: \(message)"
-                self?.stopLocalTalk()
-                self?.changed()
+                guard let self, self.localTalkID == talkID else { return }
+                self.lastError = "Audio capture: \(message)"
+                self.stopLocalTalk()
+                self.changed()
             }
             audioCapture = capture
             audioPlayback?.stopImmediately()
-            let talkID = randomUInt64()
             let agreement = peerStore.ptt.active
             localTalkID = talkID
             localTalking = true
@@ -2478,11 +2784,12 @@ final class SlockController {
         }
 
         do {
-            let playback = try audioPlayback ?? AudioPlayback()
+            let playback = try audioPlayback ?? makePlayback()
             playback.onError = { [weak self] message in
-                self?.lastError = "Audio playback: \(message)"
-                self?.stopRemoteTalk(immediate: true)
-                self?.changed()
+                guard let self, self.remoteTalkID == talkID else { return }
+                self.lastError = "Audio playback: \(message)"
+                self.stopRemoteTalk(immediate: true)
+                self.changed()
             }
             audioPlayback = playback
             remoteTalkID = talkID
@@ -2540,7 +2847,7 @@ final class SlockController {
         let now = ProcessInfo.processInfo.systemUptime
         guard force || (now - lastPairRequestSent) >= 10 else { return }
         lastPairRequestSent = now
-        send(kind: .pairRequest, payload: Data(), to: target)
+        send(kind: .pairRequest, payload: PeerProfile.payload(peerStore.ownNickname), to: target)
     }
 
     private func retryOutgoingPTTInvite(force: Bool = false) {
@@ -2559,6 +2866,7 @@ final class SlockController {
         guard force || (now - lastHelloSent) >= SlockConfig.helloInterval else { return }
         lastHelloSent = now
         send(kind: .hello, payload: helloPayload(for: peer), to: peer)
+        send(kind: .profile, payload: PeerProfile.payload(peerStore.ownNickname), to: peer)
     }
 
     private func helloPayload(for peer: Data) -> Data {
@@ -2580,13 +2888,14 @@ final class SlockController {
 
     private func send(kind: WireKind, payload: Data, to peer: Data) {
         guard transportState == .connected else { return }
+        let protected = Set([peerStore.peerPublicKey, outgoingPairPublicKey, incomingPairPublicKey].compactMap { $0 })
         do {
             if kind != .hello, !wire.hasSession(with: peer) {
-                let hello = try wire.seal(kind: .hello, payload: helloPayload(for: peer), to: peer)
+                let hello = try wire.seal(kind: .hello, payload: helloPayload(for: peer), to: peer, protecting: protected)
                 transport.publish(topic: SlockConfig.topicPrefix + routeIdentifier(for: peer), payload: hello)
                 return
             }
-            let packet = try wire.seal(kind: kind, payload: payload, to: peer)
+            let packet = try wire.seal(kind: kind, payload: payload, to: peer, protecting: protected)
             transport.publish(
                 topic: SlockConfig.topicPrefix + routeIdentifier(for: peer),
                 payload: packet
@@ -2644,6 +2953,10 @@ final class SlockController {
         incomingPairPublicKey = nil
         outgoingPairPublicKey = nil
         consentGeneration = UUID()
+        incomingNickname = nil
+        outgoingRemoteNickname = nil
+        outgoingLocalNickname = nil
+        incomingLocalNickname = nil
         peerStore.ptt.incoming = nil
         peerStore.ptt.outgoing = nil
         lastPTTInviteSent = -.infinity
@@ -2652,7 +2965,7 @@ final class SlockController {
         changed()
     }
 
-    private func ensureMicrophonePermission(_ completion: @escaping (Bool) -> Void) {
+    private static func ensureMicrophonePermission(_ completion: @escaping (Bool) -> Void) {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
             completion(true)
@@ -2750,6 +3063,54 @@ enum FireflyIcon {
     }
 }
 
+final class PairingForm: NSView {
+    let ownNickname = NSTextField()
+    let peerCode = NSTextField()
+    let localNickname = NSTextField()
+
+    init(ownCode: String, ownNickname: String, peerCode: String, suppliedName: String,
+         localNickname: String, codeEditable: Bool, copyTarget: AnyObject?, copyAction: Selector?) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 460, height: 310))
+        func field(_ field: NSTextField, label: String, value: String, y: CGFloat) {
+            let title = NSTextField(labelWithString: label)
+            title.frame = NSRect(x: 0, y: y + 32, width: 460, height: 20)
+            addSubview(title)
+            field.frame = NSRect(x: 0, y: y, width: 460, height: 26)
+            field.stringValue = value
+            field.setAccessibilityLabel(label)
+            addSubview(field)
+        }
+        field(self.ownNickname, label: "Your nickname (shared)", value: ownNickname, y: 250)
+        self.ownNickname.placeholderString = "e.g. Studio Mac — optional"
+        let code = NSTextField()
+        field(code, label: "Your pairing code", value: ownCode, y: 176)
+        code.frame.size.width = 365
+        code.isEditable = false
+        code.isSelectable = true
+        code.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        let copy = NSButton(title: "Copy", target: copyTarget, action: copyAction)
+        copy.bezelStyle = .rounded
+        copy.frame = NSRect(x: 375, y: 175, width: 85, height: 28)
+        addSubview(copy)
+        field(self.peerCode, label: "Other Mac's pairing code", value: peerCode, y: 102)
+        self.peerCode.placeholderString = "Paste their code here (CL1.…)"
+        self.peerCode.isEditable = codeEditable
+        self.peerCode.isSelectable = true
+        field(self.localNickname, label: "Your nickname for them (only on this Mac)",
+              value: localNickname, y: 8)
+        self.localNickname.isEditable = suppliedName.isEmpty
+        self.localNickname.placeholderString = "Optional — used if they haven't provided a name"
+        if !suppliedName.isEmpty {
+            let provided = NSTextField(labelWithString: "Their nickname: \(suppliedName)")
+            provided.frame = NSRect(x: 0, y: 72, width: 460, height: 20)
+            provided.textColor = .secondaryLabelColor
+            addSubview(provided)
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var menu: NSMenu!
@@ -2838,14 +3199,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         add("Pairing…", #selector(showPairing))
+        let recent = NSMenu(title: "Recent")
+        let recentItem = NSMenuItem(title: "Recent", action: nil, keyEquivalent: "")
+        recentItem.submenu = recent
+        menu.addItem(recentItem)
+        if controller.peerStore.recent.isEmpty {
+            let empty = NSMenuItem(title: "No recent pairings", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            recent.addItem(empty)
+        }
+        for peer in controller.peerStore.recent {
+            let duplicate = controller.peerStore.recent.filter { $0.displayName == peer.displayName }.count > 1
+            let title = duplicate ? "\(peer.displayName) · \(peer.pairingCode.suffix(6))" : peer.displayName
+            let item = NSMenuItem(title: title, action: #selector(openRecent(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = peer.publicKey
+            item.state = peer.publicKey == controller.peerPublicKey ? .on : .off
+            recent.addItem(item)
+        }
         if controller.peerPublicKey != nil {
-            addDisabled("Paired with \(controller.peerShortID ?? "unknown")")
+            addDisabled("Paired with \(controller.peerName(controller.peerPublicKey!))")
             add("Unpair…", #selector(unpair))
         }
 
         if let incoming = controller.incomingPairPublicKey {
             menu.addItem(.separator())
-            add("Accept Pair Request from \(shortIdentifier(for: incoming))", #selector(acceptPair(_:))).representedObject = incoming
+            add("Review Pair Request from \(controller.peerName(incoming))…", #selector(acceptPair(_:))).representedObject = incoming
             add("Reject Pair Request", #selector(rejectPair(_:))).representedObject = incoming
         }
 
@@ -2855,9 +3234,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let item = add("PTT Enabled", #selector(disablePTT))
                 item.state = .on
                 item.toolTip = "Select to disable push-to-talk for both peers."
-            } else if controller.incomingPTTInvite {
-                add("Accept PTT Invitation", #selector(acceptPTT))
-                add("Reject PTT Invitation", #selector(rejectPTT))
+            } else if let invitation = controller.peerStore.ptt.incoming {
+                add("Accept PTT Invitation", #selector(acceptPTT(_:))).representedObject = NSNumber(value: invitation)
+                add("Reject PTT Invitation", #selector(rejectPTT(_:))).representedObject = NSNumber(value: invitation)
             } else if controller.outgoingPTTInvite {
                 addDisabled("PTT invitation sent")
             } else {
@@ -2911,49 +3290,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showPairing() {
+        presentPairing(key: controller.incomingPairPublicKey ?? controller.peerPublicKey ?? controller.outgoingPairPublicKey,
+                       incoming: controller.incomingPairPublicKey != nil)
+    }
+
+    @objc private func openRecent(_ item: NSMenuItem) {
+        guard let key = item.representedObject as? Data else { return }
+        presentPairing(key: key)
+    }
+
+    private func presentPairing(key: Data?, incoming: Bool = false) {
         let alert = NSAlert()
         alert.messageText = "Pairing"
-        let paired = controller.peerPublicKey != nil
-        alert.informativeText = paired
-            ? "Paired with \(controller.peerShortID ?? "another Mac"). Unpair from the menu before adding someone else."
-            : "Share your code, or paste someone else's to send them a pairing request."
-        alert.addButton(withTitle: "Send Pairing Request").isEnabled = !paired
+        let current = key != nil && key == controller.peerPublicKey
+        let suppliedName = key.map { controller.suppliedNickname(for: $0) }
+        alert.informativeText = incoming
+            ? "Review this request and compare pairing codes with the other person before accepting."
+            : "Share your code, or add another Mac. Your nickname is shared; a nickname you give them stays on this Mac."
+        alert.addButton(withTitle: current ? "Save Nicknames" : (incoming ? "Accept Pairing" : "Send Pairing Request"))
+        if !current { alert.addButton(withTitle: "Save Nicknames") }
         alert.addButton(withTitle: "Close")
 
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 126))
-        let yourLabel = NSTextField(labelWithString: "Your pairing code")
-        yourLabel.frame = NSRect(x: 0, y: 106, width: 460, height: 20)
-        content.addSubview(yourLabel)
-
-        let yourCode = NSTextField(frame: NSRect(x: 0, y: 73, width: 365, height: 26))
-        yourCode.stringValue = controller.identity.pairingCode
-        yourCode.isEditable = false
-        yourCode.isSelectable = true
-        yourCode.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        yourCode.setAccessibilityLabel("Your pairing code")
-        content.addSubview(yourCode)
-
-        let copy = NSButton(title: "Copy", target: self, action: #selector(copyPairingCode))
-        copy.bezelStyle = .rounded
-        copy.frame = NSRect(x: 375, y: 72, width: 85, height: 28)
-        content.addSubview(copy)
-
-        let peerLabel = NSTextField(labelWithString: "Someone else's pairing code")
-        peerLabel.frame = NSRect(x: 0, y: 35, width: 460, height: 20)
-        content.addSubview(peerLabel)
-
-        let peerCode = NSTextField(frame: NSRect(x: 0, y: 0, width: 460, height: 28))
-        peerCode.placeholderString = "Paste their code here (CL1.…)"
-        peerCode.isEnabled = !paired
-        peerCode.setAccessibilityLabel("Someone else's pairing code")
-        content.addSubview(peerCode)
-        alert.accessoryView = content
-        alert.window.initialFirstResponder = paired ? yourCode : peerCode
+        let form = PairingForm(ownCode: controller.identity.pairingCode,
+                               ownNickname: controller.peerStore.ownNickname,
+                               peerCode: key.map { "CL1." + $0.base64URL } ?? "",
+                               suppliedName: suppliedName ?? "",
+                               localNickname: (incoming ? controller.incomingLocalNickname : nil)
+                                    ?? (key == controller.outgoingPairPublicKey ? controller.outgoingLocalNickname : nil)
+                                    ?? key.flatMap { controller.peerStore.entry(for: $0)?.localNickname } ?? "",
+                               codeEditable: key == nil,
+                               copyTarget: self, copyAction: #selector(copyPairingCode))
+        alert.accessoryView = form
+        alert.window.initialFirstResponder = key == nil ? form.peerCode : form.ownNickname
         NSApp.activate(ignoringOtherApps: true)
 
-        while alert.runModal() == .alertFirstButtonReturn {
+        while true {
+            let response = alert.runModal()
+            let saveOnly = current ? response == .alertFirstButtonReturn : response == .alertSecondButtonReturn
+            guard saveOnly || response == .alertFirstButtonReturn else { return }
             do {
-                try controller.pair(using: peerCode.stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
+                let code = form.peerCode.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                let target = code.isEmpty ? nil : try IdentityStore.publicKey(fromPairingCode: code)
+                guard target != controller.identity.publicKey else {
+                    throw appError("slock.Pairing", "You cannot pair this Mac with itself.")
+                }
+                if !saveOnly {
+                    guard let target else { throw appError("slock.Pairing", "Paste the other Mac's pairing code first.") }
+                    if let active = controller.peerPublicKey, active != target {
+                        let confirm = NSAlert()
+                        confirm.messageText = "Switch to \(controller.peerName(target))?"
+                        confirm.informativeText = "This disconnects \(controller.peerName(active)) and sends a new pairing request."
+                        confirm.addButton(withTitle: "Switch")
+                        confirm.addButton(withTitle: "Cancel")
+                        guard confirm.runModal() == .alertFirstButtonReturn else { continue }
+                        controller.unpair()
+                    }
+                }
+                controller.saveNicknames(own: form.ownNickname.stringValue,
+                                         peer: target, local: form.localNickname.stringValue)
+                if saveOnly { return }
+                if incoming, let target {
+                    controller.acceptIncomingPair(expected: target, localNickname: form.localNickname.stringValue)
+                } else {
+                    try controller.pair(using: code, localNickname: form.localNickname.stringValue)
+                }
                 return
             } catch {
                 alert.informativeText = error.localizedDescription
@@ -2962,8 +3362,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func acceptPair(_ item: NSMenuItem) {
-        guard let expected = item.representedObject as? Data else { return }
-        controller.acceptIncomingPair(expected: expected)
+        guard let expected = item.representedObject as? Data,
+              expected == controller.incomingPairPublicKey else { return }
+        presentPairing(key: expected, incoming: true)
     }
 
     @objc private func rejectPair(_ item: NSMenuItem) {
@@ -2994,8 +3395,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func acceptPTT() {
-        controller.acceptPTTInvite { [weak self] granted in
+    @objc private func acceptPTT(_ item: NSMenuItem) {
+        guard let expected = item.representedObject as? NSNumber else { return }
+        controller.acceptPTTInvite(expected: expected.uint64Value) { [weak self] granted in
             if !granted {
                 self?.showAlert(
                     title: "Could not enable push-to-talk",
@@ -3005,8 +3407,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func rejectPTT() {
-        controller.rejectPTTInvite()
+    @objc private func rejectPTT(_ item: NSMenuItem) {
+        guard let expected = item.representedObject as? NSNumber else { return }
+        controller.rejectPTTInvite(expected: expected.uint64Value)
     }
 
     @objc private func disablePTT() {

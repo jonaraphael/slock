@@ -137,15 +137,18 @@ uses `capslink/v2/inbox/` topics. The existing HKDF label is retained, but the
 authenticated protocol version and receiver challenge separate the new wire format.
 
 An initial HELLO learns the sender's boot ID and requests a reply. It cannot update
-presence, LEDs, or consent. A HELLO must echo this receiver's fresh random boot ID
-before the sender session is confirmed. All commands must target that receiver
-boot and carry an increasing sequence from the confirmed sender boot. A sender
-restart retires its previous boot; old boots cannot become current again. Receiver
-restart creates a new challenge, invalidating recorded commands without relying on
-wall-clock timestamps or writes to disk for every audio packet.
+presence, LEDs, or consent. Each cached peer session has its own fresh random local
+boot ID. A HELLO must echo that receiver challenge before the sender session is
+confirmed. Commands must target it and carry an increasing sequence from the
+confirmed sender boot. A sender restart retires its previous boot; old boots cannot
+become current again. Receiver restart or session-cache eviction creates a new
+challenge, invalidating recorded commands without wall-clock timestamps or writes
+to disk for every audio packet. This keeps the protocol-2 wire layout and works with
+peers using the original process-wide boot ID.
 
 The session cache is limited to 32 identities and preserves the current peer and
-pending pairing identities. Each entry retains up to 128 retired sender boots;
+pending pairing identities for both received messages and outgoing handshakes.
+An unknown sender's non-HELLO command cannot evict an entry. Each entry retains up to 128 retired sender boots;
 further boots fail closed until the receiving app restarts. Static identity keys
 provide authentication and encryption, but this protocol does not provide forward
 secrecy if a private identity key is later compromised.
@@ -167,9 +170,12 @@ TALK_STOP(talk_id)
 `HELLO` is sent every ten seconds. Confirmed paired HELLO payloads contain one
 key-state byte and an eight-byte last-revoked PTT agreement ID. This retransmits a
 revocation even if the original QoS-0 disable message was lost. PTT acceptances
-require a matching outstanding local invitation. Consent and revocation IDs
-persist for the current peer; changing peers clears them. Concurrent invitations
-converge on the smaller ID because both users have already consented.
+require a matching outstanding local invitation. Consent, pending outgoing
+invitations, and revocation IDs persist for the current peer; changing peers clears
+them. Concurrent invitations converge on the smaller ID because both users have
+already consented, and retry that ID until acknowledged. Declined invitations are
+remembered and rejected again if the sender retries after a lost response. Menu
+actions retain the invitation ID that was displayed.
 
 A held key is refreshed once per second. The light expires after 2.5 seconds and
 presence after 25 seconds, checked by a one-second timer in common run-loop modes
@@ -182,6 +188,21 @@ PINGRESP. Audio playback bounds its queue and drains the final buffers before
 transferring the half-duplex floor.
 
 ## Caps Lock ownership
+
+Nickname metadata is optional and remains separate from key and voice state.
+`PAIR_REQUEST` and `PAIR_ACCEPT` may carry bounded JSON containing the sender's
+self-assigned `nickname`. A new `PROFILE` message (kind 12) exchanges that same
+metadata with the current or pending peer, including a reply before acceptance.
+Only authenticated messages from the paired peer or a pending request can update
+names. An empty nickname explicitly removes a previously supplied name. HELLO's
+existing nine-byte payload remains unchanged; older peers ignore PROFILE.
+
+Recent peers are stored locally by full public key, newest established pairing
+first. Pending or declined requests never enter that list. Display names prefer
+the peer's self-assigned name, then a private local alias, then the final six
+characters of the canonical pairing code. Unpairing retains history but removes
+active consent. Selecting Recent opens the modal and requires fresh acceptance to
+reconnect; it never silently restores microphone consent.
 
 The reliable cross-version input path is:
 

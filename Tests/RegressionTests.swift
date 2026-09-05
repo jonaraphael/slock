@@ -13,12 +13,13 @@ private func mustThrow(_ body: () throws -> Void) throws {
 
 private final class MemoryPreferences: Preferences {
     var values: [String: Any] = [:]
+    var syncSucceeds = true
     func object(forKey key: String) -> Any? { values[key] }
     func data(forKey key: String) -> Data? { values[key] as? Data }
     func string(forKey key: String) -> String? { values[key] as? String }
     func set(_ value: Any?, forKey key: String) { values[key] = value }
     func removeObject(forKey key: String) { values.removeValue(forKey: key) }
-    func synchronize() -> Bool { true }
+    func synchronize() -> Bool { syncSucceeds }
 }
 
 private final class FakeHID {
@@ -39,6 +40,72 @@ private final class FakeHID {
         }
         return failWrites ? (1, "", "Simulated hidutil failure") : (0, "", "")
     }
+}
+
+private func drainMainQueue() {
+    RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+}
+
+private final class FakeRelay: RelayTransport {
+    var onStateChange: ((MQTTClient.State) -> Void)?
+    var onMessage: ((String, Data) -> Void)?
+    var packets: [Data] = []
+    func start() { onStateChange?(.connected) }
+    func stop() { onStateChange?(.stopped) }
+    func publish(topic: String, payload: Data) { packets.append(payload) }
+}
+
+private final class FakeCapture: VoiceCapture {
+    var onError: ((String) -> Void)?
+    var onBatch: ((Data) -> Void)?
+    var running = false
+    func start(onBatch: @escaping (Data) -> Void) throws { self.onBatch = onBatch; running = true }
+    func stop() { running = false }
+}
+
+private final class FakePlayback: VoicePlayback {
+    var onError: ((String) -> Void)?
+    var onDrain: (() -> Void)?
+    func beginTalk() { onDrain = nil }
+    func receiveBatch(_ batch: Data) {}
+    func endTalk(completion: @escaping () -> Void) { onDrain = completion }
+    func stopImmediately() { onDrain = nil }
+    func finish() { let callback = onDrain; onDrain = nil; callback?() }
+}
+
+private final class TestMac {
+    let defaults = MemoryPreferences()
+    let hid = FakeHID()
+    let relay = FakeRelay()
+    let capture = FakeCapture()
+    let playback = FakePlayback()
+    let controller: SlockController
+    let peerStore: PeerStore
+
+    init(_ identity: IdentityStore, peer: Data? = nil,
+         requestMicrophone: @escaping (@escaping (Bool) -> Void) -> Void = { $0(true) }) {
+        peerStore = PeerStore(defaults: defaults)
+        peerStore.peerPublicKey = peer
+        let interceptor = CapsInterceptor(testDefaults: defaults, process: hid.run)
+        let capture = capture, playback = playback
+        controller = SlockController(identity: identity, peerStore: peerStore, capsInterceptor: interceptor,
+            led: CapsLED(directWriter: { _ in true }), transport: relay,
+            makeCapture: { capture }, makePlayback: { playback }, checkAudio: {},
+            requestMicrophone: requestMicrophone)
+        interceptor.start()
+    }
+
+    deinit { controller.shutdown() }
+    func key(_ down: Bool) { controller.capsInterceptor.onKeyState?(down) }
+}
+
+private func exchange(_ a: TestMac, _ b: TestMac) throws {
+    for _ in 0..<100 {
+        if a.relay.packets.isEmpty && b.relay.packets.isEmpty { return }
+        if !a.relay.packets.isEmpty { b.relay.onMessage?("", a.relay.packets.removeFirst()) }
+        if !b.relay.packets.isEmpty { a.relay.onMessage?("", b.relay.packets.removeFirst()) }
+    }
+    throw Failure(message: "Controllers did not finish exchanging messages")
 }
 
 @main
@@ -137,6 +204,21 @@ enum RegressionTests {
             try handshake(a, restarted)
             try check(restarted.open(command) == nil, "recording accepted after fresh handshake")
         }
+        test("session cache eviction requires a fresh receiver challenge") {
+            try WireReviewTests.replayAfterEviction(root: root)
+        }
+        test("session cache pressure preserves protected peers") {
+            try WireReviewTests.protectedSessionSurvivesFlood(root: root)
+        }
+        test("unknown commands cannot evict a legitimate session") {
+            try WireReviewTests.unknownCommandsDoNotEvictSessions(root: root)
+        }
+        test("outgoing handshakes preserve protected sessions and reject a full protected cache") {
+            try WireReviewTests.outgoingSessionHonorsProtection(root: root)
+        }
+        test("per-peer challenges interoperate with original protocol 2 peers") {
+            try WireReviewTests.protocolTwoCompatibility(root: root)
+        }
         test("unsolicited and stale PTT acceptances never enable the microphone") {
             var consent = PTTConsent()
             try check(!consent.receiveAcceptance(42), "unsolicited acceptance")
@@ -165,6 +247,104 @@ enum RegressionTests {
             _ = b.receiveInvitation(17)
             try check(a.active == 17 && b.active == 17, "different agreements")
         }
+        test("simultaneous PTT invitations recover when the smaller invitation is lost") {
+            var a = PTTConsent(outgoing: 17), b = PTTConsent(outgoing: 23)
+            let acknowledgment = a.receiveInvitation(23)!
+            try check(!b.receiveAcceptance(acknowledgment), "unmatched acceptance was trusted")
+            try check(a.outgoing == 17, "chosen invitation was not retained for retry")
+            let reply = b.receiveInvitation(a.outgoing!)!
+            try check(a.receiveAcceptance(reply), "retried invitation was not acknowledged")
+            try check(a.active == 17 && b.active == 17, "lost invitation prevented convergence")
+            let confirmation = a.receiveInvitation(b.outgoing!)!
+            try check(b.receiveAcceptance(confirmation), "peer could not finish retrying")
+            try check(a.receiveInvitation(23) == 17 && a.incoming == nil, "delayed original invite prompted again")
+        }
+        test("pending PTT negotiation survives restart without reviving disabled consent") {
+            let prefs = MemoryPreferences()
+            let store = PeerStore(defaults: prefs)
+            store.peerPublicKey = bob.publicKey
+            store.ptt = PTTConsent(outgoing: 17)
+            _ = store.ptt.receiveInvitation(23)
+            let restarted = PeerStore(defaults: prefs)
+            try check(restarted.ptt.outgoing == 17 && restarted.ptt.active == 17, "negotiation retry lost at restart")
+            restarted.ptt.disable()
+            try check(PeerStore(defaults: prefs).ptt.outgoing == nil, "disabled invitation restarted")
+        }
+        test("PTT menu actions refuse a changed invitation before requesting microphone access") {
+            var permissionRequests = 0
+            let mac = TestMac(alice, peer: bob.publicKey, requestMicrophone: { permissionRequests += 1; $0(true) })
+            mac.peerStore.ptt.incoming = 42
+            var accepted: Bool?
+            mac.controller.acceptPTTInvite(expected: 41) { accepted = $0 }
+            try check(accepted == false && permissionRequests == 0, "stale menu action requested access")
+            try check(!mac.controller.pttEnabled && mac.peerStore.ptt.incoming == 42, "accepted an unseen invitation")
+            mac.controller.rejectPTTInvite(expected: 41)
+            try check(mac.peerStore.ptt.incoming == 42, "stale menu rejected a newer invitation")
+        }
+        test("microphone permission completion cannot accept an invitation changed while waiting") {
+            var grant: ((Bool) -> Void)?
+            let mac = TestMac(alice, peer: bob.publicKey, requestMicrophone: { grant = $0 })
+            mac.peerStore.ptt.incoming = 41
+            mac.controller.acceptPTTInvite(expected: 41) { _ in }
+            mac.peerStore.ptt.incoming = 42
+            grant?(true)
+            try check(!mac.controller.pttEnabled && mac.peerStore.ptt.incoming == 42, "stale permission granted consent")
+        }
+        test("a lost PTT rejection is retried without prompting the recipient again") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            a.controller.invitePTT { _ in }
+            try exchange(a, b)
+            let invitation = b.peerStore.ptt.incoming!
+            b.controller.rejectPTTInvite(expected: invitation)
+            b.relay.packets.removeAll()
+            a.relay.start(); try exchange(a, b)
+            try check(!a.controller.outgoingPTTInvite && !b.controller.incomingPTTInvite, "lost rejection revived a declined invitation")
+            try check(PeerStore(defaults: b.defaults).ptt.revoked == invitation, "declined invitation was forgotten at restart")
+        }
+        test("two controllers pair only after approval and relay held keys") {
+            let a = TestMac(alice), b = TestMac(bob)
+            a.relay.start(); b.relay.start()
+            try b.controller.pair(using: alice.pairingCode)
+            try exchange(a, b)
+            try check(a.controller.incomingPairPublicKey == bob.publicKey && a.controller.peerPublicKey == nil, "pairing skipped approval")
+            a.controller.acceptIncomingPair(expected: alice.publicKey)
+            try check(a.controller.peerPublicKey == nil, "stale pair action paired a different identity")
+            a.controller.acceptIncomingPair(expected: bob.publicKey)
+            try exchange(a, b)
+            try check(a.controller.peerPublicKey == bob.publicKey && b.controller.peerPublicKey == alice.publicKey, "pairing did not persist on both Macs")
+            b.key(true); try exchange(a, b)
+            try check(a.controller.remoteKeyDown && a.controller.led.isOn && !b.controller.led.isOn, "held key lit the wrong keyboard")
+            b.key(false); try exchange(a, b)
+            try check(!a.controller.remoteKeyDown && !a.controller.led.isOn, "release did not clear the light")
+        }
+        test("simultaneous PTT holds choose one speaker and transfer only after playback drains") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            a.peerStore.ptt.active = 42; b.peerStore.ptt.active = 42
+            a.key(true); b.key(true); try exchange(a, b); drainMainQueue(); try exchange(a, b)
+            let winner = dataLexicographicallyPrecedes(alice.publicKey, bob.publicKey) ? a : b
+            let loser = winner === a ? b : a
+            try check(winner.controller.localTalking && loser.controller.remoteTalking && !loser.capture.running, "collision left both microphones running")
+            winner.key(false); drainMainQueue(); try exchange(a, b)
+            try check(!loser.capture.running && loser.playback.onDrain != nil, "floor transferred before playback drained")
+            loser.playback.finish(); try exchange(a, b)
+            try check(loser.controller.localTalking && winner.controller.remoteTalking, "held key did not acquire the released floor")
+            loser.relay.onStateChange?(.error("disconnected"))
+            try check(!loser.capture.running && !loser.controller.localTalking, "connection loss left the microphone running")
+        }
+        test("errors from an earlier talk cannot stop a new transmission") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            a.peerStore.ptt.active = 42; b.peerStore.ptt.active = 42
+            a.key(true)
+            let oldError = a.capture.onError
+            a.key(false); drainMainQueue(); a.key(true)
+            oldError?("old conversion error")
+            try check(a.controller.localTalking && a.capture.running, "old error stopped the new hold")
+            a.capture.onError?("current conversion error")
+            try check(!a.capture.running && a.controller.diagnostics().contains("current conversion error"), "current error was ignored or missing from diagnostics")
+        }
         test("pair changes clear consent and persisted revocations reload") {
             let preferences = MemoryPreferences()
             let peer = PeerStore(defaults: preferences)
@@ -184,6 +364,15 @@ enum RegressionTests {
             let mappings = try CapsInterceptor.parseMappings("({ HIDKeyboardModifierMappingSrc = 0x700000004; HIDKeyboardModifierMappingDst = 30064771077; })")
             try check(mappings.count == 1 && mappings[0].src == 0x700000004, "existing mapping")
             try mustThrow { _ = try CapsInterceptor.parseMappings("{ unknown = 1; }") }
+        }
+        test("mapping parsing refuses truncated arrays and partial numeric tokens") {
+            for text in [
+                "({ HIDKeyboardModifierMappingSrc = 4; HIDKeyboardModifierMappingDst = 5; }, { HIDKeyboardModifierMappingSrc = 6;",
+                "({ HIDKeyboardModifierMappingSrc = 4invalid; HIDKeyboardModifierMappingDst = 5; })",
+                "({ HIDKeyboardModifierMappingSrc = 4; HIDKeyboardModifierMappingDst = 5; HIDKeyboardModifierMappingSrc = 6; })"
+            ] {
+                try mustThrow { _ = try CapsInterceptor.parseMappings(text) }
+            }
         }
         test("Accessibility prompts only once across activation attempts and relaunches") {
             let prefs = MemoryPreferences(), hid = FakeHID()
@@ -346,6 +535,77 @@ enum RegressionTests {
             try check(prefs.string(forKey: "CapsLink.staleOriginalMapping") == original, "journal overwritten")
             hid.failWrites = false
             capture.stop()
+        }
+        test("a corrupt recovery journal is rejected before executing hidutil") {
+            let prefs = MemoryPreferences(), hid = FakeHID()
+            prefs.set("{\"UserKeyMapping\":[{\"HIDKeyboardModifierMappingSrc\":4}]}", forKey: "CapsLink.staleOriginalMapping")
+            let capture = CapsInterceptor(testDefaults: prefs, process: hid.run)
+            capture.start()
+            try check(hid.writes.isEmpty && !capture.isActive, "corrupt journal was sent to hidutil")
+            try check(CapsInterceptor.emergencyMappingJSON == nil, "corrupt journal reached emergency cleanup")
+            try check(prefs.string(forKey: "CapsLink.staleOriginalMapping") != nil, "corrupt journal was discarded")
+        }
+        test("emergency recovery includes only validated keyboard mappings") {
+            let prefs = MemoryPreferences(), hid = FakeHID()
+            prefs.set("{\"UserKeyMapping\":[],\"UnsupportedProperty\":123}", forKey: "CapsLink.staleOriginalMapping")
+            hid.failWrites = true
+            let capture = CapsInterceptor(testDefaults: prefs, process: hid.run)
+            try check(CapsInterceptor.emergencyMappingJSON == "{\"UserKeyMapping\":[]}", "emergency cleanup kept unsupported properties")
+            hid.failWrites = false
+            capture.stop()
+        }
+        test("failed startup rollback preserves the prior Caps Lock state for stop and retry") {
+            for retry in [false, true] {
+                let prefs = MemoryPreferences(), hid = FakeHID()
+                var lock = true, failReset = true
+                let capture = CapsInterceptor(testDefaults: prefs, process: hid.run,
+                    readLock: { lock }, writeLock: { value in
+                        lock = value
+                        if failReset && !value { failReset = false; hid.failWrites = true; return false }
+                        return true
+                    })
+                capture.start()
+                try check(!capture.isActive && !lock && prefs.string(forKey: "CapsLink.staleOriginalMapping") != nil, "failure was not reproduced")
+                hid.failWrites = false
+                if retry {
+                    capture.start()
+                    try check(capture.isActive && capture.priorCapsLockOn, "retry forgot the original lock state")
+                }
+                capture.stop()
+                try check(lock && prefs.string(forKey: "CapsLink.staleOriginalMapping") == nil, "cleanup lost the prior lock after failed startup")
+            }
+        }
+        test("capture refuses to remap when the recovery journal cannot be saved") {
+            let prefs = MemoryPreferences(), hid = FakeHID()
+            prefs.syncSucceeds = false
+            let capture = CapsInterceptor(testDefaults: prefs, process: hid.run)
+            capture.start()
+            try check(!capture.isActive && hid.writes.isEmpty, "remapped without a durable recovery journal")
+        }
+        test("duplicate mapping results cannot stand in for a missing mapping") {
+            let prefs = MemoryPreferences(), hid = FakeHID()
+            let journal = "{\"UserKeyMapping\":[{\"HIDKeyboardModifierMappingSrc\":4,\"HIDKeyboardModifierMappingDst\":5},{\"HIDKeyboardModifierMappingSrc\":6,\"HIDKeyboardModifierMappingDst\":7}]}"
+            prefs.set(journal, forKey: "CapsLink.staleOriginalMapping")
+            hid.ignoreWrites = true
+            hid.output = "({ HIDKeyboardModifierMappingSrc = 4; HIDKeyboardModifierMappingDst = 5; }, { HIDKeyboardModifierMappingSrc = 4; HIDKeyboardModifierMappingDst = 5; })"
+            let capture = CapsInterceptor(testDefaults: prefs, process: hid.run)
+            try check(prefs.string(forKey: "CapsLink.staleOriginalMapping") == journal && !capture.isActive, "duplicate mapping passed verification")
+        }
+        test("queued key presses cannot survive a tap release or capture restart") {
+            let delivery = CapturedKeyDelivery()
+            var states: [Bool] = []
+            delivery.handler = { states.append($0) }
+            delivery.enqueue(true)
+            delivery.release()
+            drainMainQueue()
+            try check(states == [false], "old press relatched after tap disable")
+            delivery.enqueue(true)
+            delivery.reset()
+            delivery.handler = { states.append($0) }
+            drainMainQueue()
+            try check(states == [false], "old press reached the new capture session")
+            delivery.enqueue(true); delivery.enqueue(false); drainMainQueue()
+            try check(states == [false, true, false], "valid key transitions lost their ordering")
         }
         test("identity persists with private permissions and corrupt keys are not replaced") {
             let location = root.appendingPathComponent("alice")

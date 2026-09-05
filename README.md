@@ -49,12 +49,25 @@ permission or could not take control of the key.
    and choose **Send Pairing Request**. Your own code is available in the same window.
 3. On Mac B, hold **Option** in the menu to reveal **This Mac**. Compare that ID
    with the incoming request on Mac A over your trusted channel.
-4. On Mac A, choose **Accept Pair Request from …** only if the IDs match.
+4. On Mac A, choose **Review Pair Request from …**, compare the codes, and choose
+   **Accept Pairing** only if they match.
 5. Wait for both Macs to show a connection, then hold Caps Lock on either Mac.
    The other Mac’s light should stay on for the duration of the hold.
 
 Choose **Unpair…** to disconnect the pairing. Upgrade both Macs together:
 version 0.2 uses protocol 2 and cannot communicate with version 0.1.
+
+The **Pairing…** window also lets you name your Mac. Self-assigned nicknames are
+exchanged during the request, before acceptance. If the other Mac hasn't supplied
+a name, you can give it a nickname that stays on your Mac. Choose **Save Nicknames**
+to edit names without starting another pairing request.
+
+Accepted pairings appear in **Recent**, newest pairing first. Each entry uses the
+other Mac's self-assigned nickname, then your local nickname, then the last six
+characters of its pairing code. Names persist across restarts and unpairing.
+Selecting an entry opens its pairing window; reconnecting sends a fresh request,
+and switching from another Mac asks before disconnecting it. Older slock versions
+can still pair, but don't provide nicknames.
 
 ## Talk with Caps Lock
 
