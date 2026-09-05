@@ -1,0 +1,97 @@
+name: Release
+run-name: Release ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate release version
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import plistlib
+          import re
+
+          tag = os.environ["RELEASE_TAG"]
+          if not re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag):
+              raise SystemExit("Release tags must use vMAJOR.MINOR.PATCH (stable releases only).")
+          version = tag[1:]
+          info = plistlib.loads(pathlib.Path("Resources/Info.plist").read_bytes())
+          source_versions = re.findall(r'static let appVersion = "([^"]+)"', pathlib.Path("slock.swift").read_text())
+          if info["CFBundleShortVersionString"] != version or source_versions != [version]:
+              raise SystemExit(f"Tag {tag} must match both Info.plist and SlockConfig.appVersion.")
+          print(f"Validated {tag}")
+          PY
+
+      - name: Run regression tests
+        run: ./test.command
+
+      - name: Build universal app
+        env:
+          CAPSLINK_ARCHS: arm64 x86_64
+        run: ./build.command
+
+      - name: Verify release bundle
+        run: |
+          app=dist/slock.app
+          /usr/bin/codesign --verify --strict "$app"
+          xcrun lipo "$app/Contents/MacOS/slock" -verify_arch arm64 x86_64
+          version=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$app/Contents/Info.plist")
+          [[ "v$version" == "$RELEASE_TAG" ]]
+          for architecture in arm64 x86_64; do
+            minimum=$(/usr/bin/otool -arch "$architecture" -l "$app/Contents/MacOS/slock" | awk '$1 == "minos" { print $2 }')
+            [[ "$minimum" == "13.0" ]]
+          done
+          /usr/bin/unzip -tq dist/slock.app.zip
+          cd dist
+          shasum -a 256 slock.app.zip > SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          state=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null || true)
+          if [[ "$state" == "false" ]]; then
+            echo "Release $RELEASE_TAG is already published; leaving its assets unchanged."
+            exit 0
+          fi
+          if [[ "$state" != "true" ]]; then
+            notes=(--generate-notes)
+            if [[ -f "docs/releases/$RELEASE_TAG.md" ]]; then
+              notes=(--notes-file "docs/releases/$RELEASE_TAG.md")
+            fi
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --title "slock $RELEASE_TAG" "${notes[@]}"
+          fi
+          # Only drafts reach this upload, so a failed upload cannot break the
+          # current download. A rerun can finish an interrupted draft release.
+          gh release upload "$RELEASE_TAG" dist/slock.app.zip dist/SHA256SUMS --clobber
+          release_id=$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq .id)
+          gh api --method PATCH "repos/$GH_REPO/releases/$release_id" \
+            -F draft=false -f make_latest=legacy --silent
+          gh release view "$RELEASE_TAG" --json url --jq .url
