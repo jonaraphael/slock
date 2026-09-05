@@ -69,11 +69,15 @@ jobs:
           xcrun lipo "$app/Contents/MacOS/slock" -verify_arch arm64 x86_64
           version=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$app/Contents/Info.plist")
           [[ "v$version" == "$RELEASE_TAG" ]]
+          icon=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIconFile' "$app/Contents/Info.plist")
+          [[ "$icon" == "AppIcon.icns" ]]
+          [[ -s "$app/Contents/Resources/$icon" ]]
           for architecture in arm64 x86_64; do
             minimum=$(/usr/bin/otool -arch "$architecture" -l "$app/Contents/MacOS/slock" | awk '$1 == "minos" { print $2 }')
             [[ "$minimum" == "13.0" ]]
           done
           /usr/bin/unzip -tq dist/slock.app.zip
+          /usr/bin/unzip -p dist/slock.app.zip "slock.app/Contents/Resources/$icon" | cmp - "$app/Contents/Resources/$icon"
           cd dist
           shasum -a 256 slock.app.zip > SHA256SUMS
 

@@ -370,7 +370,7 @@ enum RegressionTests {
             b.controller.setCaptureEnabled(false); try exchange(a, b)
             try check(a.controller.peerOnline && a.controller.peerPaused, "pause was not shared immediately")
             try check(!b.controller.peerPaused, "local pause was mistaken for peer pause")
-            try check(a.controller.statusText.hasSuffix(" · peer paused"), "pause explanation missing")
+            try check(a.controller.statusText == "Paired • Paused", "pause explanation missing")
             a.key(true); try exchange(a, b)
             try check(!b.controller.remoteKeyDown, "paused peer received a light signal")
             try check(FireflyIcon.tailState(localActive: a.controller.localKeyDown, attention: false,

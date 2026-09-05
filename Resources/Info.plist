@@ -6,6 +6,7 @@
     <key>CFBundleIdentifier</key><string>com.jonaraphael.CapsLink</string>
     <key>CFBundleName</key><string>slock</string>
     <key>CFBundleDisplayName</key><string>slock</string>
+    <key>CFBundleIconFile</key><string>AppIcon.icns</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.2.4</string>
     <key>CFBundleVersion</key><string>6</string>

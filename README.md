@@ -64,7 +64,7 @@ appear when requested capture cannot start.
 5. Wait for both Macs to show a connection, then hold Caps Lock on either Mac.
    The other Mac’s light should stay on for the duration of the hold.
 
-Choose **Unpair…** to disconnect the pairing. Upgrade both Macs together:
+Choose **Unpair** to disconnect immediately. Upgrade both Macs together:
 version 0.2 uses protocol 2 and cannot communicate with version 0.1.
 
 The **Pairing…** window also lets you name your Mac. Self-assigned nicknames are
@@ -98,7 +98,7 @@ Enabled** to disable voice for both peers. Audio uses end-to-end encrypted Opus.
 | **Permissions…** | Opens setup guidance and controls for Accessibility and Input Monitoring. |
 | **Launch at Login** | Starts slock when you sign in. Enabled on first launch when macOS allows it. |
 | **Update slock** | Appears when a newer stable release tag is available. Downloads the update, replaces the app in its current location, and restarts slock. |
-| **Unpair…** | Removes the peer and stops key mirroring and voice. |
+| **Unpair** | Immediately removes the peer and stops key mirroring and voice. |
 | **Quit slock** | Stops capture, restores the previous keyboard mapping, and exits. |
 
 Hold **Option** while the menu is open to reveal **This Mac**, **Test Caps Lock
@@ -219,6 +219,10 @@ dist/slock.app.zip
 
 There is no Xcode project or third-party package dependency. Compilation does not
 need internet access. Generated artifacts are ignored by Git.
+
+The build renders Dit's [vector artwork](docs/images/firefly.svg) into a macOS app
+icon at standard and Retina sizes and bundles it before signing, so the unzipped
+app shows Dit in Finder.
 
 To build one architecture or run the regression suite:
 

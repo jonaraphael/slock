@@ -1502,6 +1502,7 @@ final class CapsInterceptor {
 
     private(set) var isActive = false
     private(set) var permissionGranted = false
+    var inputMonitoringPermissionGranted: Bool { listenCheck() }
     private(set) var lastError: String?
     private(set) var originalMappings: [HIDMap] = []
 
@@ -2816,22 +2817,30 @@ final class SlockController {
     }
 
     var statusText: String {
-        if let lastError { return "Error: \(lastError)" }
-        if !capsInterceptor.isRequested, !capsInterceptor.isActive { return "Caps Lock capture inactive" }
-        if !capsInterceptor.permissionGranted { return "Accessibility permission required" }
-        if !capsInterceptor.isActive { return capsInterceptor.lastError ?? "Caps Lock capture inactive" }
-        if incomingPairPublicKey != nil { return "Pair request waiting" }
-        if incomingPTTInvite { return "PTT invitation waiting" }
-        if let outgoingPairPublicKey { return "Pairing request sent to \(peerName(outgoingPairPublicKey))" }
-        if peerStore.peerPublicKey == nil { return "Not paired" }
-        if transportState != .connected { return transportState.text }
-        if peerPaused { return "Paired · peer paused" }
-        if localTalking { return "Transmitting" }
-        if remoteTalking { return "Receiving" }
-        if !peerOnline { return "Paired · peer offline" }
-        if led.mode == .permissionRequired { return "Connected · keyboard light needs permission" }
-        if led.mode == .unavailable { return "Connected · keyboard light unavailable" }
-        return peerStore.pttEnabled ? "Connected · PTT enabled" : "Connected"
+        if lastError != nil { return "Error" }
+        if !capsInterceptor.isRequested, !capsInterceptor.isActive { return "Paused" }
+        if !capsInterceptor.permissionGranted { return "Permission Required • Accessibility" }
+        if !capsInterceptor.isActive {
+            if !capsInterceptor.inputMonitoringPermissionGranted { return "Permission Required • Input Monitoring" }
+            return "Error"
+        }
+        if incomingPairPublicKey != nil { return "Pairing • Request Received" }
+        if incomingPTTInvite { return "Paired • PTT Invitation Received" }
+        if outgoingPairPublicKey != nil { return "Pairing • Request Sent" }
+        guard let peerPublicKey = peerStore.peerPublicKey else { return "Unpaired" }
+        switch transportState {
+        case .stopped: return "Paired • Offline"
+        case .connecting: return "Paired • Connecting"
+        case .error: return "Error"
+        case .connected: break
+        }
+        if peerPaused { return "Paired • Paused" }
+        if localTalking { return "Paired • Transmitting" }
+        if remoteTalking { return "Paired • Receiving" }
+        if !peerOnline { return "Paired • Offline" }
+        if led.mode == .permissionRequired { return "Paired • Light Permission Required" }
+        if led.mode == .unavailable { return "Paired • Light Unavailable" }
+        return "Paired • \(peerName(peerPublicKey))"
     }
 
     func suppliedNickname(for key: Data) -> String {
@@ -4056,13 +4065,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         button.image = FireflyIcon.image(tail: tail)
         button.title = ""
-        button.toolTip = "slock — \(controller.statusText)"
+        button.toolTip = "slock - \(controller.statusText)"
     }
 
     private func rebuildMenu() {
         menu.removeAllItems()
         optionOnlyItems.removeAll()
-        addDisabled("slock — \(controller.statusText)")
+        addDisabled("slock - \(controller.statusText)")
         optionOnlyItems.append(addDisabled("This Mac: \(controller.identity.shortID)"))
         menu.addItem(.separator())
 
@@ -4086,8 +4095,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             recent.addItem(item)
         }
         if controller.peerPublicKey != nil {
-            addDisabled("Paired with \(controller.peerName(controller.peerPublicKey!))")
-            add("Unpair…", #selector(unpair))
+            add("Unpair", #selector(unpair))
         }
 
         if let incoming = controller.incomingPairPublicKey {
@@ -4106,7 +4114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 add("Accept PTT Invitation", #selector(acceptPTT(_:))).representedObject = NSNumber(value: invitation)
                 add("Reject PTT Invitation", #selector(rejectPTT(_:))).representedObject = NSNumber(value: invitation)
             } else if controller.outgoingPTTInvite {
-                addDisabled("PTT invitation sent")
+                addDisabled("PTT Invitation Sent")
             } else {
                 add("Invite Peer to Enable PTT", #selector(invitePTT))
             }
@@ -4268,15 +4276,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func unpair() {
-        let alert = NSAlert()
-        alert.messageText = "Unpair \(controller.peerShortID ?? "this peer")?"
-        alert.informativeText = "Caps Lock mirroring and PTT will stop on both Macs."
-        alert.addButton(withTitle: "Unpair")
-        alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn {
-            controller.unpair()
-        }
+        controller.unpair()
     }
 
     @objc private func invitePTT() {
