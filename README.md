@@ -78,9 +78,11 @@ Enabled** to disable voice for both peers. Audio uses end-to-end encrypted Opus.
 Hold **Option** while the menu is open to reveal **This Mac**, **Test Caps Lock
 Light**, and **Diagnostics…**. Release Option to hide them again.
 
-Dit’s tail fills while a peer holds their key or voice is active. A small
-dot beside the firefly means a pairing request or PTT invitation needs attention.
-The menu-bar mark adapts to light and dark backgrounds automatically.
+Dit’s tail glows yellow-green while you hold your key, confirming the outgoing
+light signal without lighting your own keyboard. An incoming press leaves Dit’s
+tail hollow because your keyboard light carries that signal. While you are not
+sending, red means a pairing request or PTT invitation needs attention. The
+menu-bar mark adapts to light and dark backgrounds automatically.
 
 While capture is **active**, Caps Lock must not capitalize text, display the
 macOS Caps Lock cursor indicator, or latch the local light on. Your local light

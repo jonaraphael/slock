@@ -280,6 +280,9 @@ enum RegressionTests {
             event.setIntegerValueField(.keyboardEventKeycode, value: 0)
             try check(suppressCapsLock(in: event, clearLock: { resets += 1 }), "ordinary key was swallowed")
             try check(resets == 1, "ordinary key unnecessarily reset the LED")
+            event.setIntegerValueField(.keyboardEventKeycode, value: SlockConfig.f18CGKeyCode)
+            try check(suppressCapsLock(in: event, type: .keyDown, clearLock: { resets += 1 }), "remapped Caps press was swallowed early")
+            try check(resets == 2, "remapped Caps press did not force the local lock off")
         }
         test("LED failure is reported instead of enabling logical Caps Lock") {
             var requests: [Bool] = []
@@ -289,6 +292,14 @@ enum RegressionTests {
             let working = CapsLED(directWriter: { _ in true })
             try check(working.set(true) && working.isOn && working.mode == .directHID, "direct LED failed")
             try check(working.set(false) && !working.isOn, "direct LED latched on")
+        }
+        test("Dit's tail gives outgoing activity priority over notifications") {
+            try check(FireflyIcon.tailState(localActive: false, attention: false) == .idle,
+                      "idle tail state")
+            try check(FireflyIcon.tailState(localActive: false, attention: true) == .notification,
+                      "notification tail state")
+            try check(FireflyIcon.tailState(localActive: true, attention: true) == .outgoing,
+                      "outgoing key did not get tail priority")
         }
         test("a second stop never overwrites mappings changed after capture stopped") {
             let prefs = MemoryPreferences(), hid = FakeHID()

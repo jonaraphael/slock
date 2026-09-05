@@ -18,7 +18,7 @@ enum SlockConfig {
     static let appName = "slock"
     // Keep identity keys and the single-instance lock in their existing location.
     static let storageName = "CapsLink"
-    static let appVersion = "0.2.1"
+    static let appVersion = "0.2.2"
     static let protocolVersion: UInt8 = 2
     static let brokerURL = URL(string: "wss://test.mosquitto.org:8081/mqtt")!
     static let topicPrefix = "capslink/v2/inbox/"
@@ -895,12 +895,17 @@ private func emergencyRestoreMapping() {
 }
 
 // Return false for native Caps Lock events that must never reach applications.
-func suppressCapsLock(in event: CGEvent, clearLock: () -> Void) -> Bool {
-    if event.flags.contains(.maskAlphaShift) {
+func suppressCapsLock(in event: CGEvent, type: CGEventType? = nil, clearLock: () -> Void) -> Bool {
+    let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+    // Some keyboards toggle their Caps Lock state before the Caps→F18 remap is
+    // visible to the event tap. Clear it on every captured press, even when the
+    // event no longer carries maskAlphaShift, so the local LED cannot latch.
+    let capturedPress = keyCode == SlockConfig.f18CGKeyCode && type == .keyDown
+    if event.flags.contains(.maskAlphaShift) || keyCode == 57 || capturedPress {
         clearLock()
         event.flags = event.flags.subtracting(.maskAlphaShift)
     }
-    return event.getIntegerValueField(.keyboardEventKeycode) != 57
+    return keyCode != 57
 }
 
 private func capsEventTapCallback(
@@ -920,7 +925,7 @@ private func capsEventTapCallback(
         return Unmanaged.passUnretained(event)
     }
 
-    guard suppressCapsLock(in: event, clearLock: { globalCapsClearLock?() }) else { return nil }
+    guard suppressCapsLock(in: event, type: type, clearLock: { globalCapsClearLock?() }) else { return nil }
     let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
     if keyCode == SlockConfig.f18CGKeyCode {
         if type == .keyDown {
@@ -2326,6 +2331,10 @@ final class SlockController {
     private func handleLocalKey(_ down: Bool) {
         guard localKeyDown != down else { return }
         localKeyDown = down
+        // A local press is an output for the peer, never for this keyboard.
+        // Reassert the remote state in case the keyboard firmware briefly
+        // changed its own Caps Lock LED before the remapped event arrived.
+        if capsInterceptor.isActive { led.set(remoteKeyDown) }
         if let peer = peerStore.peerPublicKey {
             send(kind: .keyState, payload: Data([down ? UInt8(1) : UInt8(0)]), to: peer)
         }
@@ -2628,28 +2637,46 @@ final class SlockController {
 // MARK: - Menu-bar interface
 
 enum FireflyIcon {
-    static let idle = makeImage(illuminated: false, attention: false)
-    static let lit = makeImage(illuminated: true, attention: false)
-    static let waiting = makeImage(illuminated: false, attention: true)
-    static let litWaiting = makeImage(illuminated: true, attention: true)
-
-    static func image(illuminated: Bool, attention: Bool) -> NSImage {
-        attention ? (illuminated ? litWaiting : waiting) : (illuminated ? lit : idle)
+    enum TailState {
+        case idle
+        case outgoing
+        case notification
     }
 
-    private static func makeImage(illuminated: Bool, attention: Bool) -> NSImage {
-        // Vector template artwork stays crisp at both Retina and standard scale.
-        // The four shapes match docs/images/firefly.svg; AppKit supplies the tint.
+    static let idle = makeImage(tail: .idle)
+    static let outgoing = makeImage(tail: .outgoing)
+    static let notification = makeImage(tail: .notification)
+
+    static func tailState(localActive: Bool, attention: Bool) -> TailState {
+        if localActive { return .outgoing }
+        if attention { return .notification }
+        return .idle
+    }
+
+    static func image(tail: TailState) -> NSImage {
+        switch tail {
+        case .idle: return idle
+        case .outgoing: return outgoing
+        case .notification: return notification
+        }
+    }
+
+    private static func makeImage(tail: TailState) -> NSImage {
+        // Vector artwork stays crisp at both Retina and standard scale. Idle
+        // artwork is a template; outgoing and notification states keep an
+        // adaptive body with a colored tail.
+        let isColored = tail == .outgoing || tail == .notification
         let image = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
             NSGraphicsContext.saveGraphicsState()
             let transform = NSAffineTransform()
             transform.translateX(by: 9, yBy: 9)
             transform.rotate(byDegrees: 45)
-            transform.scale(by: 0.083)
+            transform.scale(by: 0.17)
             transform.translateX(by: -60, yBy: -75)
             transform.concat()
-            NSColor.black.setFill()
-            NSColor.black.setStroke()
+            let bodyColor = isColored ? NSColor.labelColor : NSColor.black
+            bodyColor.setFill()
+            bodyColor.setStroke()
             NSBezierPath(ovalIn: NSRect(x: 45, y: 5, width: 30, height: 30)).fill()
 
             let left = NSBezierPath()
@@ -2666,18 +2693,22 @@ enum FireflyIcon {
             right.transform(using: mirror as AffineTransform)
             right.fill()
 
-            if illuminated {
+            switch tail {
+            case .outgoing:
+                NSColor(srgbRed: 0.72, green: 1.0, blue: 0.18, alpha: 1).setFill()
                 NSBezierPath(ovalIn: NSRect(x: 37, y: 98, width: 46, height: 46)).fill()
-            } else {
+            case .notification:
+                NSColor.systemRed.setFill()
+                NSBezierPath(ovalIn: NSRect(x: 37, y: 98, width: 46, height: 46)).fill()
+            case .idle:
                 let tail = NSBezierPath(ovalIn: NSRect(x: 41, y: 102, width: 38, height: 38))
                 tail.lineWidth = 8
                 tail.stroke()
             }
             NSGraphicsContext.restoreGraphicsState()
-            if attention { NSBezierPath(ovalIn: NSRect(x: 14, y: 1, width: 3, height: 3)).fill() }
             return true
         }
-        image.isTemplate = true
+        image.isTemplate = !isColored
         image.accessibilityDescription = "Dit, the slock firefly"
         return image
     }
@@ -2754,10 +2785,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .none:
             needsAttention = false
         }
-        button.image = FireflyIcon.image(
-            illuminated: controller.remoteKeyDown || controller.localTalking || controller.remoteTalking,
+        let tail = FireflyIcon.tailState(
+            localActive: controller.localKeyDown || controller.localTalking,
             attention: needsAttention
         )
+        button.image = FireflyIcon.image(tail: tail)
         button.title = ""
         button.toolTip = "slock — \(controller.statusText)"
     }

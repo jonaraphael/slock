@@ -211,7 +211,7 @@ and repeated cleanup after a successful stop performs no further mapping writes.
 SIGINT/SIGTERM are delivered through dispatch signal sources, allowing ordinary
 application cleanup without allocating Swift objects inside a signal handler.
 
-The event tap consumes native Caps Lock events as well as the remapped F18 events. If an event carries `.maskAlphaShift`, it clears the system lock state and strips that flag while preserving other modifiers. LED output never sets the logical lock bit, preventing capitalization and the macOS Caps Lock cursor indicator.
+The event tap consumes native Caps Lock events as well as the remapped F18 events. It clears the system lock state for every captured press, and strips `.maskAlphaShift` while preserving other modifiers. The controller immediately reapplies only the remote LED state, so a local press cannot latch the local light. LED output never sets the logical lock bit, preventing capitalization and the macOS Caps Lock cursor indicator. Dit's tail is yellow-green for outgoing activity, hollow otherwise, and red for pending attention while no outgoing key signal is active. The keyboard LED itself indicates incoming activity.
 
 ## Compatibility boundary
 

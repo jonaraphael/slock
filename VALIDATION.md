@@ -5,7 +5,7 @@ with a macOS 13 deployment target.
 
 ## Automated checks
 
-- **29/29 regression tests passed**, including actual native Opus encoding and
+- **30/30 regression tests passed**, including actual native Opus encoding and
   decoding of synthetic silent PCM. The first decoded frame can be shorter due to
   codec priming; subsequent frames retained the expected 320-sample cadence.
 - Tests cover sliced byte buffers, fragmented/coalesced MQTT input, input size
@@ -15,8 +15,11 @@ with a macOS 13 deployment target.
   single-instance locking, and subprocess pipe draining.
 - Caps Lock regressions cover silently ignored remap/restore commands, clearing
   and restoring a preexisting lock state, rollback when clearing fails, native
-  Caps Lock event suppression with other modifiers preserved, and independent
-  LED success/failure without a logical-lock fallback.
+  Caps Lock event suppression with other modifiers preserved, forcing the lock
+  off for remapped F18 presses, and independent LED success/failure without a
+  logical-lock fallback.
+- Menu icon state tests cover the hollow, outgoing, and notification tail states,
+  including outgoing activity taking priority over a pending notification.
 - Permission regressions cover one prompt across repeated activation and
   relaunch, silent migration of existing installs, and quiet capture restart
   after permission is restored.
@@ -31,8 +34,9 @@ with a macOS 13 deployment target.
   Info.plist, signature resources, MIT license, and third-party notice.
 - Outputs: `dist/slock.app` and `dist/slock.app.zip` (ignored by Git).
 - Dit's native menu-bar artwork was rendered and visually inspected at 18 pt
-  and enlarged size, covering idle, signal, and pending-request states. The mark
-  is an AppKit template image so macOS handles light/dark menu-bar tinting.
+  and enlarged size, covering hollow, yellow-green outgoing, and red notification
+  states. It uses nearly the full 18-point height without clipping. Monochrome
+  states are AppKit templates; colored states use an adaptive semantic body color.
 
 ## Local environment considerations
 
@@ -44,7 +48,7 @@ straight through to `xcrun`'s Swift compiler.
 
 The agent's restricted execution sandbox cannot create the native Opus encoder.
 The full regression executable was therefore also run with normal macOS service
-access and passed all 29 tests. No microphone or speakers were used. A sandbox
+access and passed all 30 tests. No microphone or speakers were used. A sandbox
 codec failure must not be represented as a passing audio test.
 
 ## Still requires manual validation
@@ -84,8 +88,10 @@ installed, and relaunched from `~/Applications/slock.app`. The app and repositor
 are still named slock; only the firefly is called Dit. The current keyboard
 mapping remains empty.
 
-Version 0.2.1 rotates Dit 45 degrees clockwise and adds explicit permission
-recovery actions without repeating the automatic system prompt. No persistent
+Version 0.2.2 makes the rotated Dit fill the menu-bar height, gives its tail
+hollow/yellow-green/red states, and forces the local Caps Lock state and LED back
+to the peer-driven state on every captured press. Version 0.2.1 added explicit
+permission recovery actions without repeating the automatic system prompt. No persistent
 code-signing identity is installed on this Mac, so ad-hoc rebuilds have cdhash
 designated requirements and can invalidate prior Accessibility entries. The
 final build needs one renewed user grant before its physical capture test.
