@@ -216,10 +216,14 @@ git tag -a v0.2.3 -m "Release v0.2.3"  # use the new version
 git push origin v0.2.3
 ```
 
-Monitor the Release run in GitHub Actions. If it fails, its draft stays unpublished;
-rerunning the workflow can finish the draft. A rerun leaves an already published
-release unchanged. Release automation uses the repository's built-in GitHub token
-and needs no extra secret. Builds remain ad-hoc signed and are not notarized.
+Monitor the Release run in GitHub Actions. If it fails, any draft stays unpublished;
+rerunning the workflow can finish the draft. If the workflow itself needs a fix,
+push the fix to `main`, then use **Run workflow** on `main` and enter the existing
+tag, or run `gh workflow run release.yml --ref main -f tag=v0.2.3`. This uses the
+updated workflow to rebuild the original tagged source. A rerun leaves an already
+published release unchanged. Release automation uses the repository's built-in
+GitHub token and needs no extra secret. Builds remain ad-hoc signed and are not
+notarized.
 
 ### Project guide
 

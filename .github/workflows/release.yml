@@ -1,16 +1,22 @@
 name: Release
-run-name: Release ${{ github.ref_name }}
+run-name: Release ${{ inputs.tag || github.ref_name }}
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable version tag to release
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -21,11 +27,12 @@ jobs:
       run:
         shell: bash
     env:
-      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - name: Check out tagged source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
           persist-credentials: false
 
       - name: Validate release version
@@ -91,7 +98,8 @@ jobs:
           # Only drafts reach this upload, so a failed upload cannot break the
           # current download. A rerun can finish an interrupted draft release.
           gh release upload "$RELEASE_TAG" dist/slock.app.zip dist/SHA256SUMS --clobber
-          release_id=$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq .id)
+          # REST lookup by tag excludes drafts; the CLI also searches drafts.
+          release_id=$(gh release view "$RELEASE_TAG" --json databaseId --jq .databaseId)
           gh api --method PATCH "repos/$GH_REPO/releases/$release_id" \
             -F draft=false -f make_latest=legacy --silent
           gh release view "$RELEASE_TAG" --json url --jq .url
