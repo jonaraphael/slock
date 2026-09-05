@@ -43,9 +43,10 @@ permission or could not take control of the key.
 
 ## Connect two Macs
 
-1. On **Mac A**, choose **Copy Pairing Code** and send it to your partner through
-   a channel you trust.
-2. On **Mac B**, choose **Pair Using Code…** and paste the code.
+1. On **Mac A**, open **Pairing…**, copy your displayed code, and send it to your
+   partner through a channel you trust.
+2. On **Mac B**, open **Pairing…**, paste it under **Someone else's pairing code**,
+   and choose **Send Pairing Request**. Your own code is available in the same window.
 3. On Mac B, hold **Option** in the menu to reveal **This Mac**. Compare that ID
    with the incoming request on Mac A over your trusted channel.
 4. On Mac A, choose **Accept Pair Request from …** only if the IDs match.

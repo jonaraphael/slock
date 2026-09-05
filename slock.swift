@@ -2837,10 +2837,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         optionOnlyItems.append(addDisabled("This Mac: \(controller.identity.shortID)"))
         menu.addItem(.separator())
 
-        add("Copy Pairing Code", #selector(copyPairingCode))
-        if controller.peerPublicKey == nil {
-            add("Pair Using Code…", #selector(pairUsingCode))
-        } else {
+        add("Pairing…", #selector(showPairing))
+        if controller.peerPublicKey != nil {
             addDisabled("Paired with \(controller.peerShortID ?? "unknown")")
             add("Unpair…", #selector(unpair))
         }
@@ -2912,16 +2910,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSPasteboard.general.setString(controller.identity.pairingCode, forType: .string)
     }
 
-    @objc private func pairUsingCode() {
-        guard let code = prompt(
-            title: "Pair another Mac",
-            message: "Paste the pairing code copied from your friend's slock menu.",
-            placeholder: "CL1.…"
-        ) else { return }
-        do {
-            try controller.pair(using: code)
-        } catch {
-            showAlert(title: "Could not pair", message: error.localizedDescription)
+    @objc private func showPairing() {
+        let alert = NSAlert()
+        alert.messageText = "Pairing"
+        let paired = controller.peerPublicKey != nil
+        alert.informativeText = paired
+            ? "Paired with \(controller.peerShortID ?? "another Mac"). Unpair from the menu before adding someone else."
+            : "Share your code, or paste someone else's to send them a pairing request."
+        alert.addButton(withTitle: "Send Pairing Request").isEnabled = !paired
+        alert.addButton(withTitle: "Close")
+
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 126))
+        let yourLabel = NSTextField(labelWithString: "Your pairing code")
+        yourLabel.frame = NSRect(x: 0, y: 106, width: 460, height: 20)
+        content.addSubview(yourLabel)
+
+        let yourCode = NSTextField(frame: NSRect(x: 0, y: 73, width: 365, height: 26))
+        yourCode.stringValue = controller.identity.pairingCode
+        yourCode.isEditable = false
+        yourCode.isSelectable = true
+        yourCode.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        yourCode.setAccessibilityLabel("Your pairing code")
+        content.addSubview(yourCode)
+
+        let copy = NSButton(title: "Copy", target: self, action: #selector(copyPairingCode))
+        copy.bezelStyle = .rounded
+        copy.frame = NSRect(x: 375, y: 72, width: 85, height: 28)
+        content.addSubview(copy)
+
+        let peerLabel = NSTextField(labelWithString: "Someone else's pairing code")
+        peerLabel.frame = NSRect(x: 0, y: 35, width: 460, height: 20)
+        content.addSubview(peerLabel)
+
+        let peerCode = NSTextField(frame: NSRect(x: 0, y: 0, width: 460, height: 28))
+        peerCode.placeholderString = "Paste their code here (CL1.…)"
+        peerCode.isEnabled = !paired
+        peerCode.setAccessibilityLabel("Someone else's pairing code")
+        content.addSubview(peerCode)
+        alert.accessoryView = content
+        alert.window.initialFirstResponder = paired ? yourCode : peerCode
+        NSApp.activate(ignoringOtherApps: true)
+
+        while alert.runModal() == .alertFirstButtonReturn {
+            do {
+                try controller.pair(using: peerCode.stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
+                return
+            } catch {
+                alert.informativeText = error.localizedDescription
+            }
         }
     }
 
@@ -3039,20 +3075,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             controller.lastError = "Launch at Login was not enabled automatically: \(error.localizedDescription)"
             updateStatusItem()
         }
-    }
-
-    private func prompt(title: String, message: String, placeholder: String) -> String? {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.addButton(withTitle: "Continue")
-        alert.addButton(withTitle: "Cancel")
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 24))
-        field.placeholderString = placeholder
-        alert.accessoryView = field
-        NSApp.activate(ignoringOtherApps: true)
-        let response = alert.runModal()
-        return response == .alertFirstButtonReturn ? field.stringValue : nil
     }
 
     private func showAlert(title: String, message: String) {
