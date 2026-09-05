@@ -99,12 +99,15 @@ private func exchange(_ a: NickMac, _ b: NickMac) throws {
             try expect(PeerProfile.read(Data()) == nil && PeerProfile.read(Data(repeating: 32, count: 1025)) == nil, "invalid profile accepted")
             try expect(PeerProfile.clean(String(repeating: "x", count: 100)).count == 48, "name length not bounded")
         }
-        test("both self-assigned names exchange before acceptance without adding Recents") {
+        test("an unsolicited request cannot read the recipient's name before acceptance") {
             let a = NickMac(alice, name: "Alice's Mac"), b = NickMac(bob, name: "Bob's Mac")
             try a.controller.pair(using: bob.pairingCode, localNickname: "My private alias")
             try exchange(a, b)
             try expect(b.controller.incomingNickname == "Alice's Mac", "request did not include sender name")
-            try expect(a.controller.outgoingRemoteNickname == "Bob's Mac", "receiver name not returned before acceptance")
+            try expect(a.controller.outgoingRemoteNickname == nil, "recipient name leaked before acceptance")
+            b.controller.saveNicknames(own: "Bob's Mac", peer: alice.publicKey, local: "Private")
+            try exchange(a, b)
+            try expect(a.controller.outgoingRemoteNickname == nil, "saving names leaked a profile to an unaccepted request")
             try expect(a.store.recent.isEmpty && b.store.recent.isEmpty, "unaccepted request entered Recent")
             b.controller.acceptIncomingPair(expected: alice.publicKey, localNickname: "Other private alias")
             try exchange(a, b)

@@ -18,7 +18,7 @@ The prototype intentionally supports exactly one peer. That keeps the interactio
 1. Both Macs run macOS 13 or newer; this is the deployment target, not a completed validation matrix.
 2. The build script requires both Apple Silicon and Intel slices by default. The built-in MacBook keyboard is the primary target; external keyboards are best-effort.
 3. A test build may be ad-hoc signed and manually opened; a public release would need a Developer ID signature and notarization.
-4. Internet communication needs a rendezvous/relay. The test build uses the public `test.mosquitto.org` MQTT-over-WSS endpoint, with end-to-end encryption. It is replaceable with a private Mosquitto broker by changing one constant.
+4. Internet communication needs a rendezvous/relay. The test build uses the public `test.mosquitto.org` MQTT-over-WSS endpoint, with end-to-end encryption. A production relay also needs per-user authentication, topic authorization and abuse controls; changing the endpoint alone does not provide them.
 5. Direct independent control of a built-in keyboard LED is not uniform across MacBook generations. slock uses direct HID LED elements only; unsupported lights are reported as unavailable. LED output never enables the OS Caps Lock state.
 6. The app owns Caps Lock while capture is enabled. Existing `hidutil` mappings are preserved and restored on normal exit; crash recovery runs at the next launch.
 
@@ -84,9 +84,12 @@ Each installation creates a persistent Curve25519 key-agreement private key at:
 ~/Library/Application Support/CapsLink/identity.key
 ```
 
-The file is mode `0600`. The public key determines:
+The file is mode `0600` in a directory owned by the user with mode `0700`.
+Directory-relative descriptor operations reject symbolic links, hard links and
+nonregular files before reading keys or changing permissions. Both identity and
+lock descriptors are closed on exec. The public key determines:
 
-- a short display ID, such as `6A8E2-9D417`;
+- a 128-bit verification fingerprint displayed as four groups of eight hex digits;
 - an inbox topic derived from `SHA-256(publicKey)` (routing information, not authentication);
 - a copied pairing code: `CL1.<base64url-public-key>`.
 
@@ -103,7 +106,11 @@ A accepts and sends encrypted PAIR_ACCEPT
 both persist the other public key
 ```
 
-The broker sees topics, ciphertext sizes, and timing. It cannot decrypt content. A pairing code is not a password to past traffic; it contains only a public key. The recipient still has to accept a new peer.
+The broker sees topics, sender public keys, ciphertext sizes, and timing. It cannot
+decrypt content without a peer's private key. A pairing code contains only a
+public key. The recipient still has to accept a new peer and verify the full code
+or fingerprint using a trusted channel. Older versions' 40-bit display IDs and
+the six-character Recent label must not be used as security verification.
 
 ## Encrypted envelope
 
@@ -153,6 +160,16 @@ further boots fail closed until the receiving app restarts. Static identity keys
 provide authentication and encryption, but this protocol does not provide forward
 secrecy if a private identity key is later compromised.
 
+MQTT client IDs are randomly generated per app process, rather than derived from
+public inbox IDs, so an observer cannot derive a duplicate login ID from traffic
+and disconnect the client. The relay can still interrupt or deny delivery. The
+controller limits decryption to 120 packets/second with a 120-packet burst, with
+an additional 4/second, 8-packet burst for strangers. Once an identity is selected
+or paired, other senders are ignored before decryption. Packets arriving after
+disconnect are ignored. New requests cannot replace a pending request; rejecting
+it or explicitly sending a request selects a new peer. Only a new confirmed
+session forces negotiation retries, avoiding amplification from repeated HELLOs.
+
 ## Message vocabulary
 
 ```text
@@ -186,8 +203,11 @@ An inactive state also clears held and buffered incoming lights, even if the
 peer's final key release was lost.
 Disconnect, presence expiry, unpairing, and a fresh session clear that state.
 The nine-byte `HELLO` format stays unchanged; older peers ignore the new command
-and do not supply pause status. A known paused peer gives Dit a blue tail,
-including during local key activity or pending attention.
+and do not supply pause status. A paired peer gives Dit a blue tail when capture
+is known to be inactive, the relay is disconnected, presence has expired, or a
+confirmed session is unavailable. Blue includes local key activity and pending
+attention; missing required local permissions take priority with red. Unpaired
+Macs do not show the blue tail.
 
 A physical transition carries its original `CGEvent` timestamp, captured before
 deferred controller work: one state byte followed by an eight-byte big-endian
@@ -229,8 +249,10 @@ transferring the half-duplex floor.
 
 Nickname metadata is optional and remains separate from key and voice state.
 `PAIR_REQUEST` and `PAIR_ACCEPT` may carry bounded JSON containing the sender's
-self-assigned `nickname`. A new `PROFILE` message (kind 12) exchanges that same
-metadata with the current or pending peer, including a reply before acceptance.
+self-assigned `nickname`. A `PROFILE` message (kind 12) exchanges that same
+metadata with the current peer or a peer selected by a local outgoing request.
+Receiving an unsolicited request does not send the recipient's name back; local
+acceptance sends it in `PAIR_ACCEPT`. Saving nicknames also respects this boundary.
 Only authenticated messages from the paired peer or a pending request can update
 names. An empty nickname explicitly removes a previously supplied name. HELLO's
 existing nine-byte payload remains unchanged; older peers ignore PROFILE.
@@ -270,7 +292,7 @@ and repeated cleanup after a successful stop performs no further mapping writes.
 SIGINT/SIGTERM are delivered through dispatch signal sources, allowing ordinary
 application cleanup without allocating Swift objects inside a signal handler.
 
-The event tap consumes native Caps Lock events as well as the remapped F18 events. It clears the system lock state for every captured press, and strips `.maskAlphaShift` while preserving other modifiers. The controller immediately reapplies only the remote LED state, so a local press cannot latch the local light. LED output never sets the logical lock bit, preventing capitalization and the macOS Caps Lock cursor indicator. Dit's tail is blue while the paired peer's capture is inactive; otherwise it is yellow-green for outgoing activity, hollow when idle, and red for pending attention while no outgoing key signal is active. The keyboard LED itself indicates incoming activity.
+The event tap consumes native Caps Lock events as well as the remapped F18 events. It clears the system lock state for every captured press, and strips `.maskAlphaShift` while preserving other modifiers. The controller immediately reapplies only the remote LED state, so a local press cannot latch the local light. LED output never sets the logical lock bit, preventing capitalization and the macOS Caps Lock cursor indicator. Dit's tail is red when required permissions are missing, then blue while the paired peer is unavailable; otherwise it is yellow-green for outgoing activity, hollow when idle, and red for pending attention while no outgoing key signal is active. The keyboard LED itself indicates incoming activity.
 
 ## Compatibility boundary
 

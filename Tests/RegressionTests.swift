@@ -492,6 +492,50 @@ enum RegressionTests {
             try check(a.controller.diagnostics().contains("Key messages received: 2"), "received key counter missing")
             try check(a.controller.diagnostics().contains("Last peer key state: up"), "last received key state missing")
         }
+        test("a paired peer stays unavailable until connected and confirmed, and recovers after transport loss") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            try check(a.controller.peerUnavailable, "offline saved pairing appeared available at launch")
+            a.relay.start(); b.relay.start()
+            try check(a.controller.peerUnavailable, "relay connection alone made the peer available")
+            try exchange(a, b)
+            try check(!a.controller.peerUnavailable, "confirmed active peer remained unavailable")
+            for state: MQTTClient.State in [.stopped, .connecting, .error("Disconnected")] {
+                a.relay.onStateChange?(state)
+                a.key(true)
+                try check(FireflyIcon.tailState(localActive: a.controller.localKeyDown, attention: false,
+                                               peerUnavailable: a.controller.peerUnavailable) == .unavailable,
+                          "transport loss did not keep the tail blue during a press: \(state)")
+                a.key(false)
+                a.relay.start()
+                try check(a.controller.peerUnavailable, "reconnect used stale presence")
+                try exchange(a, b)
+                try check(!a.controller.peerUnavailable, "peer did not recover after reconnect: \(state)")
+            }
+        }
+        test("a silent paired peer turns blue after presence expiry and clears on recovery or unpair") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            a.clock.time += SlockConfig.onlineTimeout
+            a.controller.advanceMaintenance()
+            try check(!a.controller.peerUnavailable, "peer expired before its presence deadline")
+            a.clock.time += 1
+            a.controller.advanceMaintenance()
+            try check(a.controller.transportState == .connected && !a.controller.peerPaused,
+                      "test lost the relay or paused the peer")
+            try check(FireflyIcon.tailState(localActive: false, attention: false,
+                                           peerUnavailable: a.controller.peerUnavailable) == .unavailable,
+                      "silent peer did not turn the tail blue")
+            try exchange(a, b)
+            try check(!a.controller.peerUnavailable, "fresh peer messages did not clear blue")
+            a.relay.stop()
+            try check(a.controller.peerUnavailable, "disconnected peer appeared available")
+            a.controller.unpair()
+            try check(!a.controller.peerUnavailable, "unpaired Mac kept the blue tail")
+            a.relay.start()
+            try a.controller.pair(using: bob.pairingCode)
+            try check(a.controller.peerPublicKey == nil && !a.controller.peerUnavailable,
+                      "pending pairing showed a blue tail before acceptance")
+        }
         test("pause and resume immediately update the paired peer's tail and status") {
             let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
             a.relay.start(); b.relay.start(); try exchange(a, b)
@@ -503,11 +547,12 @@ enum RegressionTests {
             a.key(true); try exchange(a, b)
             try check(!b.controller.remoteKeyDown, "paused peer received a light signal")
             try check(FireflyIcon.tailState(localActive: a.controller.localKeyDown, attention: false,
-                                           peerPaused: a.controller.peerPaused) == .paused,
+                                           peerUnavailable: a.controller.peerUnavailable) == .unavailable,
                       "press hid the paused peer")
             a.key(false)
             b.controller.setCaptureEnabled(true); try exchange(a, b)
             try check(!a.controller.peerPaused, "resume was not shared immediately")
+            try check(!a.controller.peerUnavailable, "resume kept the blue tail")
             a.key(true); try exchange(a, b)
             try check(b.controller.remoteKeyDown, "resumed peer stopped receiving")
         }
@@ -610,10 +655,11 @@ enum RegressionTests {
             a.relay.onMessage?("", try b.seal(kind: .captureState, payload: Data([1]), to: alice.publicKey))
             a.relay.onMessage?("", paused)
             try check(!a.controller.peerPaused, "replayed pause replaced resume")
+            a.relay.packets.removeAll()
             let stranger = SecureWire(identity: try IdentityStore(directory: root.appendingPathComponent("stranger")))
             a.relay.onMessage?("", try stranger.seal(kind: .hello, payload: Data(), to: alice.publicKey))
-            _ = try exchange(a, stranger)
-            a.relay.onMessage?("", try stranger.seal(kind: .captureState, payload: Data([0]), to: alice.publicKey))
+            try check(a.relay.packets.isEmpty, "paired Mac answered a stranger's handshake")
+            try check(!stranger.hasSession(with: alice.publicKey), "stranger established a session")
             try check(!a.controller.peerPaused, "unpaired sender changed pause status")
         }
         test("timestamped controllers preserve short ON and OFF lengths despite delivery jitter") {
@@ -1090,19 +1136,19 @@ enum RegressionTests {
                       "cached denial survived retry after permission was granted")
         }
         test("Dit's tail gives outgoing activity priority over notifications") {
-            try check(FireflyIcon.tailState(localActive: false, attention: false, peerPaused: false) == .idle,
+            try check(FireflyIcon.tailState(localActive: false, attention: false, peerUnavailable: false) == .idle,
                       "idle tail state")
-            try check(FireflyIcon.tailState(localActive: false, attention: true, peerPaused: false) == .notification,
+            try check(FireflyIcon.tailState(localActive: false, attention: true, peerUnavailable: false) == .notification,
                       "notification tail state")
-            try check(FireflyIcon.tailState(localActive: true, attention: true, peerPaused: false) == .outgoing,
+            try check(FireflyIcon.tailState(localActive: true, attention: true, peerUnavailable: false) == .outgoing,
                       "outgoing key did not get tail priority")
         }
         test("Dit's red permission tail takes priority over outgoing activity") {
             for localActive in [false, true] {
                 for attention in [false, true] {
-                    for peerPaused in [false, true] {
+                    for peerUnavailable in [false, true] {
                         try check(FireflyIcon.tailState(localActive: localActive, attention: attention,
-                                                       peerPaused: peerPaused, permissionsRequired: true) == .notification,
+                                                       peerUnavailable: peerUnavailable, permissionsRequired: true) == .notification,
                                   "missing permissions failed to select the red tail")
                     }
                 }
@@ -1111,16 +1157,16 @@ enum RegressionTests {
                                            permissionsRequired: false) == .outgoing,
                       "satisfied permissions prevented the outgoing tail")
         }
-        test("Dit's blue tail keeps a paused peer visible during activity and notifications") {
+        test("Dit's blue tail keeps an unavailable peer visible during activity and notifications") {
             for localActive in [false, true] {
                 for attention in [false, true] {
-                    try check(FireflyIcon.tailState(localActive: localActive, attention: attention, peerPaused: true) == .paused,
-                              "paused tail lost priority")
+                    try check(FireflyIcon.tailState(localActive: localActive, attention: attention, peerUnavailable: true) == .unavailable,
+                              "unavailable tail lost priority")
                 }
             }
-            try check(!FireflyIcon.image(tail: .paused).isTemplate, "blue tail was made monochrome")
-            try check(FireflyIcon.image(tail: .paused).accessibilityDescription?.contains("peer paused") == true,
-                      "pause indication is only conveyed by color")
+            try check(!FireflyIcon.image(tail: .unavailable).isTemplate, "blue tail was made monochrome")
+            try check(FireflyIcon.image(tail: .unavailable).accessibilityDescription?.contains("peer unavailable") == true,
+                      "unavailable indication is only conveyed by color")
         }
         test("a second stop never overwrites mappings changed after capture stopped") {
             let prefs = MemoryPreferences(), hid = FakeHID()
@@ -1229,6 +1275,42 @@ enum RegressionTests {
             delivery.enqueue(true, timestamp: 100); delivery.enqueue(false, timestamp: 250); drainMainQueue()
             try check(states == [false, true, false], "valid key transitions lost their ordering")
             try check(timestamps == [nil, 100, 250], "queue delivery replaced event timestamps")
+        }
+        test("re-pairing the current peer stops microphone capture when consent is cleared") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            a.controller.invitePTT { _ in }; try exchange(a, b)
+            b.controller.acceptPTTInvite(expected: b.peerStore.ptt.incoming!) { _ in }
+            try exchange(a, b)
+            a.key(true); try exchange(a, b)
+            try check(a.capture.running && b.controller.remoteTalking, "test did not start voice")
+            try a.controller.pair(using: bob.pairingCode); try exchange(a, b)
+            try check(!a.controller.pttEnabled && !a.capture.running && !a.controller.localTalking,
+                      "microphone kept recording after pairing cleared consent")
+            drainMainQueue(); try exchange(a, b)
+            try check(!b.controller.remoteTalking, "peer kept playing after consent was cleared")
+        }
+        test("queued voice packets cannot restart playback after disconnect or pause") {
+            for pause in [false, true] {
+                let a = TestMac(alice, peer: bob.publicKey), remote = SecureWire(identity: bob)
+                a.relay.start(); _ = try exchange(a, remote)
+                a.peerStore.ptt.active = 42
+                var payload = Data(); payload.appendUInt64(123)
+                let packet = try remote.seal(kind: .talkStart, payload: payload, to: alice.publicKey)
+                if pause { a.controller.setCaptureEnabled(false) } else { a.relay.stop() }
+                a.relay.onMessage?("", packet)
+                try check(!a.controller.remoteTalking, "voice restarted after \(pause ? "pause" : "disconnect")")
+            }
+        }
+        test("pausing immediately stops playback as well as capture") {
+            let a = TestMac(alice, peer: bob.publicKey), remote = SecureWire(identity: bob)
+            a.relay.start(); _ = try exchange(a, remote)
+            a.peerStore.ptt.active = 42
+            var payload = Data(); payload.appendUInt64(123)
+            a.relay.onMessage?("", try remote.seal(kind: .talkStart, payload: payload, to: alice.publicKey))
+            try check(a.controller.remoteTalking, "test did not start playback")
+            a.controller.setCaptureEnabled(false)
+            try check(!a.controller.remoteTalking, "pause left voice playback active")
         }
         test("identity persists with private permissions and corrupt keys are not replaced") {
             let location = root.appendingPathComponent("alice")

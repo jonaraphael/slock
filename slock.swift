@@ -18,7 +18,7 @@ enum SlockConfig {
     static let appName = "slock"
     // Keep identity keys and the single-instance lock in their existing location.
     static let storageName = "CapsLink"
-    static let appVersion = "0.2.5"
+    static let appVersion = "0.2.6"
     static let protocolVersion: UInt8 = 2
     static let brokerURL = URL(string: "wss://test.mosquitto.org:8081/mqtt")!
     static let topicPrefix = "capslink/v2/inbox/"
@@ -98,8 +98,10 @@ func randomUInt64() -> UInt64 {
 
 func shortIdentifier(for publicKey: Data) -> String {
     let digest = Data(SHA256.hash(data: publicKey))
-    let text = digest.prefix(5).map { String(format: "%02X", $0) }.joined()
-    return String(text.prefix(5)) + "-" + String(text.suffix(5))
+    let bytes = Array(digest.prefix(16))
+    return stride(from: 0, to: bytes.count, by: 4).map { offset in
+        bytes[offset..<(offset + 4)].map { String(format: "%02X", $0) }.joined()
+    }.joined(separator: "-")
 }
 
 func routeIdentifier(for publicKey: Data) -> String {
@@ -141,6 +143,59 @@ func appError(_ domain: String, _ message: String, code: Int = 1) -> NSError {
 
 // MARK: - Release updates
 
+// Metadata only. Installing an ad-hoc signed download cannot authenticate its
+// publisher. Downloads are left to the browser and macOS's normal launch checks.
+final class ReleaseRequest: NSObject, URLSessionDataDelegate {
+    static let maximumBytes = 128 * 1024
+    private var bytes = Data()
+    private var exceededLimit = false
+    private var completion: UpdateChecker.Completion?
+    private var session: URLSession?
+
+    static func fetch(_ request: URLRequest, configuration: URLSessionConfiguration = .ephemeral,
+                      completion: @escaping UpdateChecker.Completion) {
+        let fetch = ReleaseRequest()
+        fetch.completion = completion
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 30
+        configuration.httpShouldSetCookies = false
+        configuration.urlCache = nil
+        let session = URLSession(configuration: configuration, delegate: fetch, delegateQueue: nil)
+        fetch.session = session
+        session.dataTask(with: request).resume()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                    didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        exceededLimit = response.expectedContentLength > Int64(Self.maximumBytes)
+        completionHandler(exceededLimit ? .cancel : .allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard !exceededLimit, data.count <= Self.maximumBytes - bytes.count else {
+            exceededLimit = true
+            dataTask.cancel()
+            return
+        }
+        bytes.append(data)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        let failure = exceededLimit ? URLError(.dataLengthExceedsMaximum) : error
+        completion?(failure == nil ? bytes : nil, task.response, failure)
+        completion = nil
+        session.invalidateAndCancel()
+        self.session = nil
+    }
+}
+
 struct ReleaseVersion: Comparable {
     let major: Int
     let minor: Int
@@ -169,14 +224,22 @@ struct ReleaseVersion: Comparable {
 struct SlockUpdate: Equatable {
     let tag: String
 
+    var releaseURL: URL? {
+        guard tag.hasPrefix("v"), ReleaseVersion(tag) != nil else { return nil }
+        return URL(string: "https://github.com/jonaraphael/slock/releases/tag/\(tag)")
+    }
+
     static func available(in data: Data, currentVersion: String) throws -> SlockUpdate? {
         struct Release: Decodable {
             let tag_name: String
             let draft: Bool
             let prerelease: Bool
         }
+        guard data.count <= ReleaseRequest.maximumBytes else {
+            throw appError("slock.Update", "The release response exceeded its limit.")
+        }
         let release = try JSONDecoder().decode(Release.self, from: data)
-        guard !release.draft, !release.prerelease,
+        guard !release.draft, !release.prerelease, release.tag_name.hasPrefix("v"),
               let remote = ReleaseVersion(release.tag_name),
               let local = ReleaseVersion(currentVersion), remote > local else { return nil }
         return SlockUpdate(tag: release.tag_name)
@@ -203,7 +266,7 @@ final class UpdateChecker {
              ?? SlockConfig.appVersion,
          now: @escaping () -> Date = Date.init,
          fetch: @escaping Fetch = { request, completion in
-             URLSession.shared.dataTask(with: request, completionHandler: completion).resume()
+             ReleaseRequest.fetch(request, completion: completion)
          }) {
         self.currentVersion = currentVersion
         self.now = now
@@ -243,222 +306,49 @@ final class UpdateChecker {
     }
 }
 
-// The replacement is staged beside the installed app so renames stay on one volume.
-struct PreparedUpdate {
-    let directory: URL
-    let destination: URL
-    var app: URL { directory.appendingPathComponent("slock.app") }
-    var backup: URL { directory.appendingPathComponent("previous.app") }
-    var helper: URL { directory.appendingPathComponent("install-update") }
+// MARK: - Local identity
 
-    func launchHelper() throws {
-        let process = Process()
-        process.executableURL = helper
-        process.arguments = ["--slock-install-update", String(getpid()), directory.path, destination.path]
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try process.run()
+// Open relative to a verified private directory and never follow a final symlink.
+// Descriptor checks also reject FIFOs, devices and hard links before reading or
+// changing permissions. Close-on-exec keeps helpers from inheriting the lock/key.
+final class PrivateStorage {
+    let descriptor: Int32
+
+    init(directory: URL? = nil) throws {
+        let support = try directory ?? FileManager.default.url(for: .applicationSupportDirectory,
+            in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent(SlockConfig.storageName, isDirectory: true)
+        guard mkdir(support.path, 0o700) == 0 || errno == EEXIST else {
+            throw appError("slock.Storage", "Could not create the private storage directory.")
+        }
+        let fd = open(support.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw appError("slock.Storage", "Private storage must be a real directory, not a link.") }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_uid == geteuid(),
+              info.st_mode & S_IFMT == S_IFDIR, fchmod(fd, 0o700) == 0 else {
+            close(fd)
+            throw appError("slock.Storage", "Private storage must be owned by this user and accessible only to them.")
+        }
+        descriptor = fd
     }
 
-    func install(relaunch: (URL) throws -> Void = { url in
-        let (status, _, error) = try runProcess("/usr/bin/open", ["-n", url.path])
-        guard status == 0 else { throw appError("slock.Update", "Could not reopen slock: \(error)") }
-    }) throws {
-        let fm = FileManager.default
-        do { try fm.moveItem(at: destination, to: backup) }
-        catch { try? relaunch(destination); throw error }
-        do {
-            try fm.moveItem(at: app, to: destination)
-            try relaunch(destination)
-        } catch {
-            let installError = error
-            do {
-                if fm.fileExists(atPath: destination.path) { try fm.moveItem(at: destination, to: app) }
-                try fm.moveItem(at: backup, to: destination)
-            } catch {
-                throw appError("slock.Update", "The update could not be installed or restored. Your previous app is at \(backup.path). \(error.localizedDescription)")
-            }
-            try? relaunch(destination)
-            throw installError
-        }
-        try? fm.removeItem(at: directory)
-    }
-}
+    deinit { close(descriptor) }
 
-enum UpdateInstaller {
-    static func verifyChecksum(_ checksumData: Data, archive: URL) throws {
-        guard let checksums = String(data: checksumData, encoding: .utf8) else {
-            throw appError("slock.Update", "The release checksum file is invalid.")
+    func openFile(_ name: String) throws -> (descriptor: Int32, created: Bool) {
+        let flags = O_RDWR | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK
+        var fd = openat(descriptor, name, flags | O_CREAT | O_EXCL, 0o600)
+        let created = fd >= 0
+        if fd < 0, errno == EEXIST { fd = openat(descriptor, name, flags) }
+        guard fd >= 0 else { throw appError("slock.Storage", "Could not safely open \(name).") }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_uid == geteuid(), info.st_nlink == 1,
+              info.st_mode & S_IFMT == S_IFREG, fchmod(fd, 0o600) == 0 else {
+            close(fd)
+            throw appError("slock.Storage", "\(name) must be a private regular file owned by this user, without links.")
         }
-        let matches = checksums.split(whereSeparator: \.isNewline).compactMap { line -> String? in
-            let fields = line.split(whereSeparator: \.isWhitespace)
-            guard fields.count == 2, fields[1] == "slock.app.zip", fields[0].count == 64,
-                  fields[0].utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return nil }
-            return String(fields[0])
-        }
-        guard matches.count == 1 else { throw appError("slock.Update", "The release is missing its app checksum.") }
-        let actual = SHA256.hash(data: try Data(contentsOf: archive, options: .mappedIfSafe))
-            .map { String(format: "%02x", $0) }.joined()
-        guard actual == matches[0] else { throw appError("slock.Update", "The download failed its checksum check. Please try again.") }
-    }
-
-    static func validateBundle(_ app: URL, expectedTag: String,
-                               verifySignature: (URL) throws -> Void = { url in
-        let (status, _, error) = try runProcess("/usr/bin/codesign", ["--verify", "--deep", "--strict", url.path])
-        guard status == 0 else { throw appError("slock.Update", "The downloaded app failed signature verification: \(error)") }
-    }) throws {
-        let data = try Data(contentsOf: app.appendingPathComponent("Contents/Info.plist"))
-        guard let info = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
-              info["CFBundleIdentifier"] as? String == "com.jonaraphael.CapsLink",
-              info["CFBundleExecutable"] as? String == "slock",
-              let version = info["CFBundleShortVersionString"] as? String,
-              let expected = ReleaseVersion(expectedTag), ReleaseVersion(version) == expected,
-              FileManager.default.isExecutableFile(atPath: app.appendingPathComponent("Contents/MacOS/slock").path) else {
-            throw appError("slock.Update", "The download is not the expected slock release.")
-        }
-        try verifySignature(app)
-    }
-
-    static func prepare(_ update: SlockUpdate, currentApp: URL, executable: URL,
-                        status: @escaping (String) -> Void) async throws -> PreparedUpdate {
-        let fm = FileManager.default
-        let destination = currentApp.resolvingSymlinksInPath()
-        guard destination.pathExtension == "app" else {
-            throw appError("slock.Update", "Run slock from slock.app to install an update.")
-        }
-        let directory = destination.deletingLastPathComponent().appendingPathComponent(".slock-update-\(UUID())")
-        do { try fm.createDirectory(at: directory, withIntermediateDirectories: false,
-                                   attributes: [.posixPermissions: 0o700]) }
-        catch {
-            throw appError("slock.Update", "slock cannot update in this location. Move slock.app to a writable Applications folder and try again. \(error.localizedDescription)")
-        }
-        let prepared = PreparedUpdate(directory: directory, destination: destination)
-        var keep = false
-        defer { if !keep { try? fm.removeItem(at: directory) } }
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 30
-        configuration.timeoutIntervalForResource = 300
-        let session = URLSession(configuration: configuration)
-        defer { session.invalidateAndCancel() }
-        let base = URL(string: "https://github.com/jonaraphael/slock/releases/download/\(update.tag)/")!
-        let (checksumData, checksumResponse) = try await session.data(from: base.appendingPathComponent("SHA256SUMS"))
-        guard (checksumResponse as? HTTPURLResponse)?.statusCode == 200, checksumData.count <= 4096 else {
-            throw appError("slock.Update", "The release checksum is unavailable. Please try again later.")
-        }
-        let (archive, response) = try await session.download(from: base.appendingPathComponent("slock.app.zip"))
-        defer { try? fm.removeItem(at: archive) }
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-            throw appError("slock.Update", "The app download is unavailable. Please try again later.")
-        }
-        try Task.checkCancellation()
-        status("Verifying update…")
-        try verifyChecksum(checksumData, archive: archive)
-        let (listingStatus, listing, _) = try runProcess("/usr/bin/unzip", ["-Z1", archive.path])
-        guard listingStatus == 0, validArchivePaths(listing) else {
-            throw appError("slock.Update", "The app archive contains unexpected files.")
-        }
-        let (unzipStatus, _, unzipError) = try runProcess("/usr/bin/ditto", ["-x", "-k", archive.path, directory.path])
-        guard unzipStatus == 0 else { throw appError("slock.Update", "Could not unpack the update: \(unzipError)") }
-        try validateBundle(prepared.app, expectedTag: update.tag)
-        try fm.copyItem(at: executable, to: prepared.helper)
-        try Task.checkCancellation()
-        keep = true
-        return prepared
-    }
-
-    static func validArchivePaths(_ listing: String) -> Bool {
-        let paths = listing.split(whereSeparator: \.isNewline)
-        return !paths.isEmpty && paths.allSatisfy { path in
-            !path.hasPrefix("/") && !path.split(separator: "/").contains("..")
-                && (path == "slock.app/" || path.hasPrefix("slock.app/") || path.hasPrefix("__MACOSX/"))
-        }
-    }
-
-    // This process has no keyboard capture or identity lock. The old app exits
-    // normally first, restoring its mapping and closing microphone/relay access.
-    static func runHelperIfRequested() -> Bool {
-        let args = CommandLine.arguments
-        guard args.dropFirst().first == "--slock-install-update" else { return false }
-        guard args.count == 5, let parent = Int32(args[2]), parent > 1 else { return true }
-        let prepared = PreparedUpdate(directory: URL(fileURLWithPath: args[3]),
-                                      destination: URL(fileURLWithPath: args[4]))
-        do {
-            let deadline = Date().addingTimeInterval(30)
-            while kill(parent, 0) == 0 || errno == EPERM {
-                guard Date() < deadline else { throw appError("slock.Update", "slock did not quit in time. Please try the update again.") }
-                Thread.sleep(forTimeInterval: 0.1)
-            }
-            try prepared.install()
-        } catch {
-            NSApplication.shared.setActivationPolicy(.accessory)
-            let alert = NSAlert()
-            alert.messageText = "Could not update slock"
-            alert.informativeText = error.localizedDescription
-            alert.addButton(withTitle: "OK")
-            NSApp.activate(ignoringOtherApps: true)
-            alert.runModal()
-            // Keep the directory if rollback failed; it holds the previous app.
-            if !FileManager.default.fileExists(atPath: prepared.backup.path) {
-                try? FileManager.default.removeItem(at: prepared.directory)
-            }
-        }
-        return true
+        return (fd, created)
     }
 }
-
-// State is confined to the main queue; the detached task only delivers results
-// there. Keep AppKit's existing delegate/callback model without actor hopping.
-final class AppUpdater: @unchecked Sendable {
-    private(set) var status: String?
-    var onChange: (() -> Void)?
-    var onError: ((Error) -> Void)?
-    var onReadyToRelaunch: (() -> Void)?
-    private var task: Task<Void, Never>?
-
-    func install(_ update: SlockUpdate) {
-        dispatchPrecondition(condition: .onQueue(.main))
-        guard status == nil, let executable = Bundle.main.executableURL else { return }
-        status = "Downloading update…"
-        onChange?()
-        let app = Bundle.main.bundleURL
-        task = Task.detached(priority: .utility) { [weak self] in
-            do {
-                let prepared = try await UpdateInstaller.prepare(update, currentApp: app, executable: executable) { text in
-                    DispatchQueue.main.async { self?.status = text; self?.onChange?() }
-                }
-                DispatchQueue.main.async {
-                    guard let self else { try? FileManager.default.removeItem(at: prepared.directory); return }
-                    do {
-                        try prepared.launchHelper()
-                        self.status = "Restarting slock…"
-                        self.onChange?()
-                        self.onReadyToRelaunch?()
-                    } catch {
-                        try? FileManager.default.removeItem(at: prepared.directory)
-                        self.failed(error)
-                    }
-                }
-            } catch {
-                DispatchQueue.main.async { self?.failed(error) }
-            }
-        }
-    }
-
-    func cancel() {
-        dispatchPrecondition(condition: .onQueue(.main))
-        task?.cancel()
-    }
-
-    private func failed(_ error: Error) {
-        status = nil
-        task = nil
-        onChange?()
-        onError?(error)
-    }
-}
-
-// MARK: - Identity and peer storage
 
 final class IdentityStore {
     let privateKey: Curve25519.KeyAgreement.PrivateKey
@@ -468,30 +358,24 @@ final class IdentityStore {
     let pairingCode: String
 
     init(directory: URL? = nil) throws {
-        let fm = FileManager.default
-        let support = try directory ?? fm.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        ).appendingPathComponent(SlockConfig.storageName, isDirectory: true)
-        try fm.createDirectory(at: support, withIntermediateDirectories: true)
-        let keyURL = support.appendingPathComponent("identity.key")
-
-        if fm.fileExists(atPath: keyURL.path) {
-            let stored = try Data(contentsOf: keyURL)
-            guard stored.count == 32 else {
+        let storage = try PrivateStorage(directory: directory)
+        let file = try storage.openFile("identity.key")
+        defer { close(file.descriptor) }
+        if !file.created {
+            var info = stat()
+            var stored = Data(count: 32)
+            guard fstat(file.descriptor, &info) == 0, info.st_size == 32,
+                  stored.withUnsafeMutableBytes({ read(file.descriptor, $0.baseAddress, 32) }) == 32 else {
                 throw appError("slock.Identity", "The saved identity is invalid. Restore it from a backup or remove it and pair again.")
             }
             privateKey = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: stored)
         } else {
             privateKey = Curve25519.KeyAgreement.PrivateKey()
-            guard fm.createFile(atPath: keyURL.path, contents: privateKey.rawRepresentation,
-                                attributes: [.posixPermissions: 0o600]) else {
+            guard privateKey.rawRepresentation.withUnsafeBytes({ write(file.descriptor, $0.baseAddress, 32) }) == 32,
+                  fsync(file.descriptor) == 0 else {
                 throw appError("slock.Identity", "Could not save the private identity key.")
             }
         }
-        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyURL.path)
 
         publicKey = privateKey.publicKey.rawRepresentation
         shortID = shortIdentifier(for: publicKey)
@@ -500,6 +384,9 @@ final class IdentityStore {
     }
 
     static func publicKey(fromPairingCode input: String) throws -> Data {
+        guard input.utf8.count <= 256 else {
+            throw appError("slock.Identity", "That is not a valid slock pairing code.")
+        }
         let compact = input
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "slock://pair/", with: "", options: [.caseInsensitive])
@@ -637,8 +524,10 @@ final class PeerStore {
 
     func rename(_ key: Data, ownNickname: String? = nil, localNickname: String? = nil) {
         guard let index = recent.firstIndex(where: { $0.publicKey == key }) else { return }
+        let old = recent[index]
         if let ownNickname { recent[index].ownNickname = PeerProfile.clean(ownNickname) }
         if let localNickname { recent[index].localNickname = PeerProfile.clean(localNickname) }
+        guard old.ownNickname != recent[index].ownNickname || old.localNickname != recent[index].localNickname else { return }
         persistRecent()
     }
 
@@ -978,6 +867,29 @@ protocol RelayTransport: AnyObject {
     func publish(topic: String, payload: Data)
 }
 
+// The public relay can send arbitrary traffic. Bound expensive decryption and
+// reserve most of the budget for selected identities. This is a client resource
+// bound, not a substitute for authentication and rate limits at the broker.
+struct InboundBudget {
+    private var tokens: Double = 120
+    private var strangerTokens: Double = 8
+    private var last: TimeInterval?
+
+    mutating func allow(selected: Bool, at now: TimeInterval) -> Bool {
+        let elapsed = max(0, now - (last ?? now))
+        last = now
+        tokens = min(120, tokens + elapsed * 120)
+        strangerTokens = min(8, strangerTokens + elapsed * 4)
+        if !selected {
+            guard strangerTokens >= 1 else { return false }
+            strangerTokens -= 1
+        }
+        guard tokens >= 1 else { return false }
+        tokens -= 1
+        return true
+    }
+}
+
 final class MQTTClient: NSObject, URLSessionWebSocketDelegate, RelayTransport {
     enum State: Equatable {
         case stopped
@@ -1018,6 +930,10 @@ final class MQTTClient: NSObject, URLSessionWebSocketDelegate, RelayTransport {
     private var pendingWriteBytes = 0
     private var sending = false
     private let pendingMessages = DispatchSemaphore(value: 64)
+
+    static func freshClientID() -> String {
+        "cl-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(20)
+    }
 
     init(brokerURL: URL, clientID: String, subscriptionTopic: String) {
         self.brokerURL = brokerURL
@@ -1305,6 +1221,10 @@ final class MQTTClient: NSObject, URLSessionWebSocketDelegate, RelayTransport {
     ) {
         queue.async {
             guard self.webSocket === webSocketTask, !self.stopping else { return }
+            guard `protocol` == "mqtt" else {
+                self.scheduleReconnect("The relay did not negotiate MQTT")
+                return
+            }
             self.sendRaw(self.connectPacket())
             self.receiveNext()
         }
@@ -2744,6 +2664,7 @@ final class SlockController {
     var onStateChange: (() -> Void)?
 
     private let wire: SecureWire
+    private var inboundBudget = InboundBudget()
     private let transport: RelayTransport
     private let makeCapture: () throws -> VoiceCapture
     private let makePlayback: () throws -> VoicePlayback
@@ -2804,7 +2725,7 @@ final class SlockController {
         let identity = try IdentityStore()
         let transport = MQTTClient(
             brokerURL: SlockConfig.brokerURL,
-            clientID: "cl-" + String(identity.routeID.prefix(20)),
+            clientID: MQTTClient.freshClientID(),
             subscriptionTopic: SlockConfig.topicPrefix + identity.routeID
         )
         self.init(identity: identity, peerStore: PeerStore(), capsInterceptor: CapsInterceptor(),
@@ -2889,6 +2810,11 @@ final class SlockController {
     var peerShortID: String? { peerStore.peerPublicKey.map(shortIdentifier(for:)) }
     var pttEnabled: Bool { peerStore.pttEnabled }
 
+    var peerUnavailable: Bool {
+        guard let peer = peerPublicKey else { return false }
+        return transportState != .connected || !peerOnline || peerPaused || !wire.hasSession(with: peer)
+    }
+
     var attention: PendingAttention {
         if incomingPairPublicKey != nil { return .pairing }
         if incomingPTTInvite { return .ptt }
@@ -2943,7 +2869,7 @@ final class SlockController {
             if peer == outgoingPairPublicKey { outgoingLocalNickname = PeerProfile.clean(local) }
         }
         sendHello(force: true)
-        for key in [incomingPairPublicKey, outgoingPairPublicKey].compactMap({ $0 }) {
+        for key in [outgoingPairPublicKey].compactMap({ $0 }) {
             send(kind: .profile, payload: PeerProfile.payload(peerStore.ownNickname), to: key)
         }
         changed()
@@ -2957,6 +2883,7 @@ final class SlockController {
         if let peer = peerStore.peerPublicKey, peer != publicKey {
             throw appError("slock.Pairing", "Unpair the current peer before pairing another Mac.")
         }
+        if peerStore.peerPublicKey != nil { disablePTT() }
         outgoingPairPublicKey = publicKey
         outgoingLocalNickname = localNickname
         outgoingRemoteNickname = nil
@@ -2976,6 +2903,7 @@ final class SlockController {
         if let peer = peerStore.peerPublicKey, peer != incoming {
             send(kind: .pairReject, payload: Data(), to: incoming)
         } else {
+            disablePTT()
             peerStore.peerPublicKey = incoming
             peerStore.establish(incoming, ownNickname: incomingNickname,
                                 localNickname: localNickname ?? incomingLocalNickname)
@@ -3134,6 +3062,7 @@ final class SlockController {
             capsInterceptor.requestPermissionAndStart()
         } else {
             handleLocalKey(false)
+            stopRemoteTalk(immediate: true)
             clearRemoteKey()
             capsInterceptor.stop()
         }
@@ -3239,7 +3168,14 @@ final class SlockController {
     }
 
     private func receive(_ packet: Data) {
+        guard transportState == .connected, packet.count >= 86, packet.count <= 64_000,
+              packet.first == SlockConfig.protocolVersion else { return }
         let protected = Set([peerStore.peerPublicKey, outgoingPairPublicKey, incomingPairPublicKey].compactMap { $0 })
+        let senderKey = Data(packet.dropFirst().prefix(32))
+        // Once a peer has been selected, strangers cannot replace its request,
+        // query our profile, or consume public-key operations on the main queue.
+        guard protected.isEmpty || protected.contains(senderKey),
+              inboundBudget.allow(selected: protected.contains(senderKey), at: now()) else { return }
         guard let message = wire.open(packet, protecting: protected) else { return }
         let sender = message.senderPublicKey
 
@@ -3262,8 +3198,10 @@ final class SlockController {
                 stopRemoteTalk(immediate: true)
                 clearRemoteKey()
             }
-            retryOutgoingPairRequest(force: true)
-            retryOutgoingPTTInvite(force: true)
+            if message.newSession {
+                retryOutgoingPairRequest(force: true)
+                retryOutgoingPTTInvite(force: true)
+            }
         }
 
         if message.kind == .pairRequest {
@@ -3294,6 +3232,7 @@ final class SlockController {
         case .pairRequest:
             break
         case .pairAccept:
+            disablePTT()
             peerStore.peerPublicKey = sender
             peerStore.establish(sender, ownNickname: PeerProfile.read(message.payload) ?? outgoingRemoteNickname,
                                 localNickname: outgoingLocalNickname)
@@ -3382,7 +3321,11 @@ final class SlockController {
         if incomingPairPublicKey != sender { incomingLocalNickname = nil }
         incomingPairPublicKey = sender
         incomingNickname = nickname
-        send(kind: .profile, payload: PeerProfile.payload(peerStore.ownNickname), to: sender)
+        // A publicly visible key is not consent to disclose this Mac's name.
+        // Return our profile only after local acceptance or a local request.
+        if outgoingPairPublicKey == sender {
+            send(kind: .profile, payload: PeerProfile.payload(peerStore.ownNickname), to: sender)
+        }
         changed()
     }
 
@@ -3559,8 +3502,8 @@ final class SlockController {
     }
 
     private func handleRemoteTalkStart(_ payload: Data) {
-        guard peerStore.pttEnabled,
-              let talkID = payload.uint64(at: 0),
+        guard peerStore.pttEnabled, capsInterceptor.isActive, transportState == .connected,
+              payload.count == 8, let talkID = payload.uint64(at: 0), talkID != 0,
               let peer = peerStore.peerPublicKey else { return }
         guard remoteTalkID != talkID else { return }
         markPeerSeen()
@@ -3590,7 +3533,8 @@ final class SlockController {
     }
 
     private func handleRemoteAudio(_ payload: Data) {
-        guard remoteTalking, !remoteTalkEnding,
+        guard peerStore.pttEnabled, capsInterceptor.isActive, transportState == .connected,
+              remoteTalking, !remoteTalkEnding,
               let talkID = payload.uint64(at: 0),
               talkID == remoteTalkID,
               payload.count > 8 else { return }
@@ -3600,7 +3544,7 @@ final class SlockController {
     }
 
     private func handleRemoteTalkStop(_ payload: Data) {
-        guard let talkID = payload.uint64(at: 0), talkID == remoteTalkID else { return }
+        guard payload.count == 8, let talkID = payload.uint64(at: 0), talkID == remoteTalkID else { return }
         stopRemoteTalk(immediate: false)
     }
 
@@ -3797,18 +3741,18 @@ enum FireflyIcon {
         case idle
         case outgoing
         case notification
-        case paused
+        case unavailable
     }
 
     static let idle = makeImage(tail: .idle)
     static let outgoing = makeImage(tail: .outgoing)
     static let notification = makeImage(tail: .notification)
-    static let paused = makeImage(tail: .paused)
+    static let unavailable = makeImage(tail: .unavailable)
 
-    static func tailState(localActive: Bool, attention: Bool, peerPaused: Bool = false,
+    static func tailState(localActive: Bool, attention: Bool, peerUnavailable: Bool = false,
                           permissionsRequired: Bool = false) -> TailState {
         if permissionsRequired { return .notification }
-        if peerPaused { return .paused }
+        if peerUnavailable { return .unavailable }
         if localActive { return .outgoing }
         if attention { return .notification }
         return .idle
@@ -3819,7 +3763,7 @@ enum FireflyIcon {
         case .idle: return idle
         case .outgoing: return outgoing
         case .notification: return notification
-        case .paused: return paused
+        case .unavailable: return unavailable
         }
     }
 
@@ -3861,7 +3805,7 @@ enum FireflyIcon {
             case .notification:
                 NSColor.systemRed.setFill()
                 NSBezierPath(ovalIn: NSRect(x: 37, y: 98, width: 46, height: 46)).fill()
-            case .paused:
+            case .unavailable:
                 NSColor.systemBlue.setFill()
                 NSBezierPath(ovalIn: NSRect(x: 37, y: 98, width: 46, height: 46)).fill()
             case .idle:
@@ -3873,10 +3817,33 @@ enum FireflyIcon {
             return true
         }
         image.isTemplate = !isColored
-        image.accessibilityDescription = tail == .paused
-            ? "Dit, the slock firefly — peer paused" : "Dit, the slock firefly"
+        image.accessibilityDescription = tail == .unavailable
+            ? "Dit, the slock firefly — peer unavailable" : "Dit, the slock firefly"
         return image
     }
+}
+
+// Accessory apps have no nib-provided Edit menu. AppKit needs these actions
+// in the main menu to route text-editing shortcuts to the active field editor.
+func makeMainMenu() -> NSMenu {
+    let main = NSMenu()
+    let appItem = main.addItem(withTitle: SlockConfig.appName, action: nil, keyEquivalent: "")
+    appItem.submenu = NSMenu(title: SlockConfig.appName)
+    appItem.submenu?.addItem(withTitle: "Quit slock", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+
+    let editItem = main.addItem(withTitle: "Edit", action: nil, keyEquivalent: "")
+    let edit = NSMenu(title: "Edit")
+    editItem.submenu = edit
+    edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+    edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+    edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    // Accept Control+V as an alias while keeping the standard menu shortcut.
+    let controlPaste = edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    controlPaste.keyEquivalentModifierMask = .control
+    controlPaste.isHidden = true
+    controlPaste.allowsKeyEquivalentWhenHidden = true
+    edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    return main
 }
 
 final class PairingForm: NSView {
@@ -4155,10 +4122,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var menu: NSMenu!
     private var controller: SlockController!
     private var instanceLock: SingleInstanceLock?
+    private var titleMenuItem: NSMenuItem?
     private var optionOnlyItems: [NSMenuItem] = []
     private var menuModifierTimer: Timer?
     private let updateChecker = UpdateChecker()
-    private let updater = AppUpdater()
     private var updateTimer: Timer?
     private var updateMenuItem: NSMenuItem?
     private let permissionSetup = KeyboardPermissionSetup()
@@ -4167,6 +4134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        NSApp.mainMenu = makeMainMenu()
         do {
             instanceLock = try SingleInstanceLock()
             controller = try SlockController()
@@ -4182,11 +4150,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         updateChecker.onChange = { [weak self] in self?.refreshUpdateMenuItem() }
-        updater.onChange = { [weak self] in self?.refreshUpdateMenuItem() }
-        updater.onError = { [weak self] error in
-            self?.showAlert(title: "Could not update slock", message: error.localizedDescription)
-        }
-        updater.onReadyToRelaunch = { NSApp.terminate(nil) }
         updateChecker.checkIfNeeded()
         let updateTimer = Timer(timeInterval: UpdateChecker.retryInterval, repeats: true) { [weak self] _ in
             self?.updateChecker.checkIfNeeded()
@@ -4206,7 +4169,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         menuModifierTimer?.invalidate()
         updateTimer?.invalidate()
-        updater.cancel()
         permissionWindow?.close()
         controller?.shutdown()
     }
@@ -4245,6 +4207,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateOptionOnlyItems() {
         let hidden = !NSEvent.modifierFlags.contains(.option)
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            ?? SlockConfig.appVersion
+        let title = "slock\(hidden ? "" : " \(version)") - \(controller.statusText)"
+        if titleMenuItem?.title != title {
+            titleMenuItem?.title = title
+        }
         for item in optionOnlyItems where item.isHidden != hidden {
             item.isHidden = hidden
         }
@@ -4264,7 +4232,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let tail = FireflyIcon.tailState(
             localActive: controller.localKeyDown || controller.localTalking,
             attention: needsAttention,
-            peerPaused: controller.peerPaused,
+            peerUnavailable: controller.peerUnavailable,
             permissionsRequired: !permissions.isReady
         )
         button.image = FireflyIcon.image(tail: tail)
@@ -4276,7 +4244,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
         optionOnlyItems.removeAll()
         permissionsRequiredItem = nil
-        addDisabled("slock - \(controller.statusText)")
+        titleMenuItem = addDisabled("slock - \(controller.statusText)")
         optionOnlyItems.append(addDisabled("This Mac: \(controller.identity.shortID)"))
         menu.addItem(.separator())
 
@@ -4354,16 +4322,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refreshUpdateMenuItem() {
         guard let item = updateMenuItem else { return }
-        item.title = updater.status ?? "Update slock"
-        item.isHidden = updateChecker.availableUpdate == nil && updater.status == nil
-        item.action = updater.status == nil ? #selector(updateSlock) : nil
-        item.isEnabled = updater.status == nil && updateChecker.availableUpdate != nil
-        item.toolTip = updateChecker.availableUpdate.map { "Download \($0.tag), replace slock, and restart." }
+        item.title = "Download Update…"
+        item.isHidden = updateChecker.availableUpdate == nil
+        item.isEnabled = updateChecker.availableUpdate?.releaseURL != nil
+        item.toolTip = "Open the new release on GitHub to review and download it."
     }
 
     @objc private func updateSlock() {
-        guard let update = updateChecker.availableUpdate else { return }
-        updater.install(update)
+        guard let url = updateChecker.availableUpdate?.releaseURL else { return }
+        if !NSWorkspace.shared.open(url) {
+            showAlert(title: "Could not open the release", message: "Open the slock releases page on GitHub to download the update.")
+        }
     }
 
     @discardableResult
@@ -4617,12 +4586,8 @@ final class SingleInstanceLock {
     private let descriptor: Int32
 
     init(directory: URL? = nil) throws {
-        let support = try directory ?? FileManager.default.url(for: .applicationSupportDirectory,
-            in: .userDomainMask, appropriateFor: nil, create: true)
-            .appendingPathComponent(SlockConfig.storageName, isDirectory: true)
-        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
-        descriptor = open(support.appendingPathComponent("instance.lock").path, O_CREAT | O_RDWR, 0o600)
-        guard descriptor >= 0 else { throw appError("slock.Lock", "Could not open the application lock.") }
+        let storage = try PrivateStorage(directory: directory)
+        descriptor = try storage.openFile("instance.lock").descriptor
         guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
             close(descriptor)
             throw appError("slock.Lock", "slock is already running. Use its existing menu-bar item.")
@@ -4649,7 +4614,6 @@ private func installProcessCleanupHandlers() {
 @main
 enum SlockApp {
     static func main() {
-        if UpdateInstaller.runHelperIfRequested() { return }
         installProcessCleanupHandlers()
         let app = NSApplication.shared
         let delegate = AppDelegate()

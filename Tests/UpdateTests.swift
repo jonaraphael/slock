@@ -15,6 +15,22 @@ private func release(_ tag: String, draft: Bool = false, prerelease: Bool = fals
 }
 private func drainUpdates() { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
 
+private final class MetadataProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let mode = request.url!.lastPathComponent
+        let headers = mode == "declared" ? ["Content-Length": String(ReleaseRequest.maximumBytes + 1)] : [:]
+        client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: 200,
+            httpVersion: "HTTP/1.1", headerFields: headers)!, cacheStoragePolicy: .notAllowed)
+        if mode == "streamed" {
+            for _ in 0..<3 { client?.urlProtocol(self, didLoad: Data(count: ReleaseRequest.maximumBytes / 2)) }
+        } else { client?.urlProtocol(self, didLoad: Data("{}".utf8)) }
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
+
 private final class FakeReleaseServer {
     var requests: [URLRequest] = []
     var completions: [UpdateChecker.Completion] = []
@@ -41,20 +57,6 @@ private final class FakeReleaseServer {
             do { try body(); print("PASS \(name)") }
             catch { failures += 1; print("FAIL \(name): \(error)") }
         }
-        func fixture() throws -> PreparedUpdate {
-            let parent = root.appendingPathComponent(UUID().uuidString)
-            let prepared = PreparedUpdate(directory: parent.appendingPathComponent("staging"),
-                                          destination: parent.appendingPathComponent("slock.app"))
-            try fm.createDirectory(at: prepared.app, withIntermediateDirectories: true)
-            try fm.createDirectory(at: prepared.destination, withIntermediateDirectories: true)
-            try Data("old".utf8).write(to: prepared.destination.appendingPathComponent("version"))
-            try Data("new".utf8).write(to: prepared.app.appendingPathComponent("version"))
-            return prepared
-        }
-        func installedVersion(_ app: URL) throws -> String {
-            try String(contentsOf: app.appendingPathComponent("version"), encoding: .utf8)
-        }
-
         test("updates compare numeric tags and never offer the same or an older version") {
             try expectUpdate(SlockUpdate.available(in: release("v0.2.4"), currentVersion: "0.2.4") == nil, "same tag")
             try expectUpdate(SlockUpdate.available(in: release("v0.2.3"), currentVersion: "0.2.4") == nil, "downgrade")
@@ -118,93 +120,37 @@ private final class FakeReleaseServer {
             server.respond(status: 404)
             try expectUpdate(checker.availableUpdate == nil, "removed release still offered")
         }
-        test("download checksums reject tampering, missing entries and duplicate entries") {
-            let archive = root.appendingPathComponent("archive.zip")
-            let data = Data("downloaded app".utf8)
-            try data.write(to: archive)
-            let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-            let sums = "\(hash)  slock.app.zip\n"
-            try UpdateInstaller.verifyChecksum(Data(sums.utf8), archive: archive)
-            try expectUpdateError { try UpdateInstaller.verifyChecksum(Data((sums + sums).utf8), archive: archive) }
-            try expectUpdateError { try UpdateInstaller.verifyChecksum(Data("missing".utf8), archive: archive) }
-            try Data("tampered".utf8).write(to: archive)
-            try expectUpdateError { try UpdateInstaller.verifyChecksum(Data(sums.utf8), archive: archive) }
-        }
-        test("archive paths cannot write outside the staging directory") {
-            try expectUpdate(UpdateInstaller.validArchivePaths("slock.app/\nslock.app/Contents/MacOS/slock\n__MACOSX/slock.app/._Contents\n"), "valid package")
-            for path in ["", "/slock.app/Contents", "slock.app/../../outside", "__MACOSX/../../outside", "elsewhere/app", "slock.app/../outside"] {
-                try expectUpdate(!UpdateInstaller.validArchivePaths(path), path)
+        test("release links stay on GitHub and reject path, query and fragment injection") {
+            for tag in ["v1.2.3/../../elsewhere", "v1.2.3?download=evil", "v1.2.3#evil", "1.2.3", "https://example.com", "v1.2.3\n"] {
+                try expectUpdate(SlockUpdate(tag: tag).releaseURL == nil, tag)
             }
+            try expectUpdate(SlockUpdate(tag: "v1.2.3").releaseURL?.absoluteString ==
+                "https://github.com/jonaraphael/slock/releases/tag/v1.2.3", "wrong release URL")
         }
-        test("bundle verification checks identity, version, executable and signature") {
-            let app = root.appendingPathComponent("validate.app")
-            let binary = app.appendingPathComponent("Contents/MacOS/slock")
-            try fm.createDirectory(at: binary.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try Data("fixture".utf8).write(to: binary)
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
-            var info = ["CFBundleIdentifier": "com.jonaraphael.CapsLink", "CFBundleExecutable": "slock", "CFBundleShortVersionString": "0.2.5"]
-            func saveInfo() throws {
-                try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
-                    .write(to: app.appendingPathComponent("Contents/Info.plist"))
-            }
-            try saveInfo()
-            var verified = false
-            try UpdateInstaller.validateBundle(app, expectedTag: "v0.2.5") { _ in verified = true }
-            try expectUpdate(verified, "signature skipped")
-            try expectUpdateError { try UpdateInstaller.validateBundle(app, expectedTag: "v0.2.5") { _ in throw UpdateFailure(message: "bad signature") } }
-            try expectUpdateError { try UpdateInstaller.validateBundle(app, expectedTag: "v0.2.6") { _ in } }
-            info["CFBundleIdentifier"] = "another.app"
-            try saveInfo()
-            try expectUpdateError { try UpdateInstaller.validateBundle(app, expectedTag: "v0.2.5") { _ in } }
-        }
-        test("installation replaces the app, relaunches its existing path and removes staging") {
-            let prepared = try fixture()
-            var opened = false
-            try prepared.install { url in
-                try expectUpdate(url == prepared.destination, "changed app location")
-                try expectUpdate(installedVersion(url) == "new", "launched old app")
-                try expectUpdate(installedVersion(prepared.backup) == "old", "no backup")
-                opened = true
-            }
-            try expectUpdate(opened && !fm.fileExists(atPath: prepared.directory.path), "no relaunch or staging remains")
-        }
-        test("failed replacement restores and reopens the previous app") {
-            let prepared = try fixture()
-            try fm.removeItem(at: prepared.app)
-            var opened = false
+        test("oversized release metadata is rejected") {
             try expectUpdateError {
-                try prepared.install { url in opened = true; try expectUpdate(installedVersion(url) == "old", "wrong restored app") }
+                _ = try SlockUpdate.available(in: Data(repeating: 32, count: ReleaseRequest.maximumBytes + 1),
+                                             currentVersion: "0.2.5")
             }
-            try expectUpdate(opened && installedVersion(prepared.destination) == "old", "old app lost")
         }
-        test("failed relaunch rolls back before reopening the previous app") {
-            let prepared = try fixture()
-            var launches = 0
-            try expectUpdateError {
-                try prepared.install { url in
-                    launches += 1
-                    if launches == 1 { throw UpdateFailure(message: "launch failed") }
-                    try expectUpdate(installedVersion(url) == "old", "rollback launch used new app")
+        test("the HTTP reader bounds both declared and streamed response sizes") {
+            for mode in ["small", "declared", "streamed"] {
+                let configuration = URLSessionConfiguration.ephemeral
+                configuration.protocolClasses = [MetadataProtocol.self]
+                var finished = false, received: Data?, failure: Error?
+                ReleaseRequest.fetch(URLRequest(url: URL(string: "https://api.github.com/\(mode)")!),
+                                     configuration: configuration) { data, _, error in
+                    DispatchQueue.main.async { received = data; failure = error; finished = true }
+                }
+                let deadline = Date().addingTimeInterval(5)
+                while !finished, Date() < deadline { drainUpdates() }
+                try expectUpdate(finished, "request never completed")
+                if mode == "small" {
+                    try expectUpdate(received == Data("{}".utf8) && failure == nil, "valid metadata failed")
+                } else {
+                    try expectUpdate(received == nil && failure != nil, "oversized response was delivered")
                 }
             }
-            try expectUpdate(launches == 2 && installedVersion(prepared.destination) == "old", "no rollback")
-        }
-        test("failed backup leaves the original app intact and reopens it") {
-            let prepared = try fixture()
-            try fm.createDirectory(at: prepared.backup, withIntermediateDirectories: false)
-            var opened = false
-            try expectUpdateError { try prepared.install { _ in opened = true } }
-            try expectUpdate(opened && installedVersion(prepared.destination) == "old", "original app changed")
-        }
-        test("failed rollback preserves the backup for recovery") {
-            let prepared = try fixture()
-            try expectUpdateError {
-                try prepared.install { _ in
-                    try fm.createDirectory(at: prepared.app, withIntermediateDirectories: false)
-                    throw UpdateFailure(message: "launch failed with occupied staging path")
-                }
-            }
-            try expectUpdate(installedVersion(prepared.backup) == "old", "backup lost after rollback failure")
         }
         print("\(count - failures)/\(count) update tests passed")
         if failures > 0 { exit(1) }

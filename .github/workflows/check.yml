@@ -1,0 +1,29 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Check scripts and bundle metadata
+        run: |
+          bash -n build.command test.command scripts/swiftc.command
+          /usr/bin/plutil -lint Resources/Info.plist
+          git diff --check
+      - name: Run regression and security tests
+        run: ./test.command
