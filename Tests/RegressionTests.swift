@@ -133,6 +133,22 @@ private func exchange(_ a: TestMac, _ b: TestMac) throws {
     throw Failure(message: "Controllers did not finish exchanging messages")
 }
 
+// A peer that only understands legacy HELLOs lets us inject authenticated
+// status packets and verify that old peers keep their key/PTT snapshots.
+private func exchange(_ mac: TestMac, _ peer: SecureWire) throws -> [OpenedMessage] {
+    var messages: [OpenedMessage] = []
+    for _ in 0..<100 {
+        if mac.relay.packets.isEmpty { return messages }
+        guard let message = peer.open(mac.relay.packets.removeFirst()) else { continue }
+        messages.append(message)
+        if message.needsHelloReply {
+            mac.relay.onMessage?("", try peer.seal(kind: .hello, payload: Data(repeating: 0, count: 9),
+                                                  to: mac.controller.identity.publicKey))
+        }
+    }
+    throw Failure(message: "Legacy peer handshake did not settle")
+}
+
 @main
 enum RegressionTests {
     static func main() throws {
@@ -346,6 +362,130 @@ enum RegressionTests {
             try check(b.controller.diagnostics().contains("Key messages queued: 2"), "queued key counter missing")
             try check(a.controller.diagnostics().contains("Key messages received: 2"), "received key counter missing")
             try check(a.controller.diagnostics().contains("Last peer key state: up"), "last received key state missing")
+        }
+        test("pause and resume immediately update the paired peer's tail and status") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            try check(!a.controller.peerPaused && !b.controller.peerPaused, "active peer reported paused")
+            b.controller.setCaptureEnabled(false); try exchange(a, b)
+            try check(a.controller.peerOnline && a.controller.peerPaused, "pause was not shared immediately")
+            try check(!b.controller.peerPaused, "local pause was mistaken for peer pause")
+            try check(a.controller.statusText.hasSuffix(" · peer paused"), "pause explanation missing")
+            a.key(true); try exchange(a, b)
+            try check(!b.controller.remoteKeyDown, "paused peer received a light signal")
+            try check(FireflyIcon.tailState(localActive: a.controller.localKeyDown, attention: false,
+                                           peerPaused: a.controller.peerPaused) == .paused,
+                      "press hid the paused peer")
+            a.key(false)
+            b.controller.setCaptureEnabled(true); try exchange(a, b)
+            try check(!a.controller.peerPaused, "resume was not shared immediately")
+            a.key(true); try exchange(a, b)
+            try check(b.controller.remoteKeyDown, "resumed peer stopped receiving")
+        }
+        test("an already paused peer is reported after reconnecting or accepting a new pairing") {
+            for alreadyPaired in [false, true] {
+                let a = TestMac(alice, peer: alreadyPaired ? bob.publicKey : nil)
+                let b = TestMac(bob, peer: alreadyPaired ? alice.publicKey : nil)
+                b.controller.setCaptureEnabled(false)
+                a.relay.start(); b.relay.start()
+                if !alreadyPaired {
+                    try a.controller.pair(using: bob.pairingCode)
+                    try exchange(a, b)
+                    try check(!a.controller.peerPaused, "unaccepted pairing changed pause status")
+                    b.controller.acceptIncomingPair(expected: alice.publicKey)
+                }
+                try exchange(a, b)
+                try check(a.controller.peerPaused && !b.controller.peerPaused, "initial pause status missing")
+            }
+        }
+        test("a peer pause cancels pending and held lights even when its release packet is lost") {
+            for alreadyLit in [false, true] {
+                let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+                a.relay.start(); b.relay.start(); try exchange(a, b)
+                b.key(true, timestamp: 1_000_000_000); try exchange(a, b)
+                if alreadyLit {
+                    a.advance(to: 101)
+                    try check(a.controller.led.isOn, "initial held light missing")
+                }
+                b.controller.setCaptureEnabled(false)
+                try check(b.relay.packets.count == 2, "pause did not send release followed by capture state")
+                b.relay.packets.removeFirst()
+                try exchange(a, b)
+                try check(a.controller.peerPaused && !a.controller.remoteKeyDown && !a.controller.led.isOn,
+                          "peer pause left a held light on")
+                a.advance(to: 102)
+                try check(!a.controller.led.isOn && a.controller.diagnostics().contains("Pending light transitions: 0"),
+                          "peer pause replayed a buffered pulse")
+            }
+        }
+        test("HELLO refreshes recover lost pause and resume updates") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            for enabled in [false, true] {
+                b.controller.setCaptureEnabled(enabled)
+                b.relay.packets.removeAll()
+                try check(a.controller.peerPaused == enabled, "status changed before receiving the update")
+                a.clock.time += SlockConfig.helloInterval
+                a.controller.advanceMaintenance(); try exchange(a, b)
+                try check(a.controller.peerPaused == !enabled, "HELLO did not repair the lost update")
+            }
+        }
+        test("peer pause is cleared on disconnect, expiry, unpair and a fresh legacy session") {
+            for action in 0..<4 {
+                let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+                a.relay.start(); b.relay.start(); try exchange(a, b)
+                b.controller.setCaptureEnabled(false); try exchange(a, b)
+                try check(a.controller.peerPaused, "missing initial pause")
+                switch action {
+                case 0:
+                    a.relay.stop()
+                    try check(!a.controller.peerPaused, "disconnect kept stale pause")
+                    a.relay.start(); try exchange(a, b)
+                    try check(a.controller.peerPaused, "reconnect did not refresh pause")
+                    a.relay.stop()
+                case 1:
+                    a.clock.time += SlockConfig.onlineTimeout + 1
+                    a.controller.advanceMaintenance()
+                case 2:
+                    a.controller.unpair()
+                default:
+                    let legacy = SecureWire(identity: bob)
+                    a.clock.time += 2
+                    a.relay.onMessage?("", try legacy.seal(kind: .hello, payload: Data(), to: alice.publicKey))
+                    let messages = try exchange(a, legacy)
+                    try check(messages.contains { $0.kind == .hello && $0.sessionConfirmed && $0.payload.count == 9 },
+                              "legacy HELLO snapshot format changed")
+                }
+                try check(!a.controller.peerPaused, "stale pause survived action \(action)")
+            }
+        }
+        test("failed capture stop does not tell the peer it is paused") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            b.hid.failWrites = true
+            b.controller.setCaptureEnabled(false); try exchange(a, b)
+            try check(b.controller.capsInterceptor.isActive && !a.controller.peerPaused,
+                      "failed pause was advertised as successful")
+            b.hid.failWrites = false
+        }
+        test("only valid fresh status from the paired peer can change its pause indicator") {
+            let a = TestMac(alice, peer: bob.publicKey), b = SecureWire(identity: bob)
+            a.relay.start(); _ = try exchange(a, b)
+            let paused = try b.seal(kind: .captureState, payload: Data([0]), to: alice.publicKey)
+            a.relay.onMessage?("", paused)
+            try check(a.controller.peerPaused, "authenticated pause missing")
+            for payload in [Data(), Data([2]), Data([0, 1])] {
+                a.relay.onMessage?("", try b.seal(kind: .captureState, payload: payload, to: alice.publicKey))
+                try check(a.controller.peerPaused, "malformed state changed pause")
+            }
+            a.relay.onMessage?("", try b.seal(kind: .captureState, payload: Data([1]), to: alice.publicKey))
+            a.relay.onMessage?("", paused)
+            try check(!a.controller.peerPaused, "replayed pause replaced resume")
+            let stranger = SecureWire(identity: try IdentityStore(directory: root.appendingPathComponent("stranger")))
+            a.relay.onMessage?("", try stranger.seal(kind: .hello, payload: Data(), to: alice.publicKey))
+            _ = try exchange(a, stranger)
+            a.relay.onMessage?("", try stranger.seal(kind: .captureState, payload: Data([0]), to: alice.publicKey))
+            try check(!a.controller.peerPaused, "unpaired sender changed pause status")
         }
         test("timestamped controllers preserve short ON and OFF lengths despite delivery jitter") {
             let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
@@ -733,12 +873,23 @@ enum RegressionTests {
                       "cached denial survived retry after permission was granted")
         }
         test("Dit's tail gives outgoing activity priority over notifications") {
-            try check(FireflyIcon.tailState(localActive: false, attention: false) == .idle,
+            try check(FireflyIcon.tailState(localActive: false, attention: false, peerPaused: false) == .idle,
                       "idle tail state")
-            try check(FireflyIcon.tailState(localActive: false, attention: true) == .notification,
+            try check(FireflyIcon.tailState(localActive: false, attention: true, peerPaused: false) == .notification,
                       "notification tail state")
-            try check(FireflyIcon.tailState(localActive: true, attention: true) == .outgoing,
+            try check(FireflyIcon.tailState(localActive: true, attention: true, peerPaused: false) == .outgoing,
                       "outgoing key did not get tail priority")
+        }
+        test("Dit's blue tail keeps a paused peer visible during activity and notifications") {
+            for localActive in [false, true] {
+                for attention in [false, true] {
+                    try check(FireflyIcon.tailState(localActive: localActive, attention: attention, peerPaused: true) == .paused,
+                              "paused tail lost priority")
+                }
+            }
+            try check(!FireflyIcon.image(tail: .paused).isTemplate, "blue tail was made monochrome")
+            try check(FireflyIcon.image(tail: .paused).accessibilityDescription?.contains("peer paused") == true,
+                      "pause indication is only conveyed by color")
         }
         test("a second stop never overwrites mappings changed after capture stopped") {
             let prefs = MemoryPreferences(), hid = FakeHID()

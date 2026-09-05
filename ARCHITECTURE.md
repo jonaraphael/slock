@@ -159,6 +159,7 @@ secrecy if a private identity key is later compromised.
 PAIR_REQUEST / PAIR_ACCEPT / PAIR_REJECT
 HELLO
 KEY_STATE(up|down [, capture_timestamp_ns])
+CAPTURE_STATE(inactive|active)
 PTT_INVITE(invitation_id) / PTT_ACCEPT(invitation_id) / PTT_REJECT(invitation_id)
 PTT_DISABLE(agreement_id)
 UNPAIR
@@ -176,6 +177,17 @@ them. Concurrent invitations converge on the smaller ID because both users have
 already consented, and retry that ID until acknowledged. Declined invitations are
 remembered and rejected again if the sender retries after a lost response. Menu
 actions retain the invitation ID that was displayed.
+
+`CAPTURE_STATE` (kind 13) carries one byte: 0 for inactive capture and 1 for
+active capture. It is sent immediately when capture changes and in response to
+each confirmed paired `HELLO`, so the next heartbeat repairs a lost update.
+Only fresh, authenticated messages from the paired peer can set its pause state.
+An inactive state also clears held and buffered incoming lights, even if the
+peer's final key release was lost.
+Disconnect, presence expiry, unpairing, and a fresh session clear that state.
+The nine-byte `HELLO` format stays unchanged; older peers ignore the new command
+and do not supply pause status. A known paused peer gives Dit a blue tail,
+including during local key activity or pending attention.
 
 A physical transition carries its original `CGEvent` timestamp, captured before
 deferred controller work: one state byte followed by an eight-byte big-endian
@@ -258,7 +270,7 @@ and repeated cleanup after a successful stop performs no further mapping writes.
 SIGINT/SIGTERM are delivered through dispatch signal sources, allowing ordinary
 application cleanup without allocating Swift objects inside a signal handler.
 
-The event tap consumes native Caps Lock events as well as the remapped F18 events. It clears the system lock state for every captured press, and strips `.maskAlphaShift` while preserving other modifiers. The controller immediately reapplies only the remote LED state, so a local press cannot latch the local light. LED output never sets the logical lock bit, preventing capitalization and the macOS Caps Lock cursor indicator. Dit's tail is yellow-green for outgoing activity, hollow otherwise, and red for pending attention while no outgoing key signal is active. The keyboard LED itself indicates incoming activity.
+The event tap consumes native Caps Lock events as well as the remapped F18 events. It clears the system lock state for every captured press, and strips `.maskAlphaShift` while preserving other modifiers. The controller immediately reapplies only the remote LED state, so a local press cannot latch the local light. LED output never sets the logical lock bit, preventing capitalization and the macOS Caps Lock cursor indicator. Dit's tail is blue while the paired peer's capture is inactive; otherwise it is yellow-green for outgoing activity, hollow when idle, and red for pending attention while no outgoing key signal is active. The keyboard LED itself indicates incoming activity.
 
 ## Compatibility boundary
 

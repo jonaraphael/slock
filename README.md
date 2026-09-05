@@ -113,11 +113,16 @@ installer restores the previous app. Updating requires write access to the app's
 folder. Pairings and preferences are retained; macOS may require renewed keyboard
 permissions after an update.
 
-Dit’s tail glows yellow-green while you hold your key, confirming the outgoing
-light signal without lighting your own keyboard. An incoming press leaves Dit’s
-tail hollow because your keyboard light carries that signal. While you are not
-sending, red means a pairing request or PTT invitation needs attention. The
-menu-bar mark adapts to light and dark backgrounds automatically.
+Dit’s tail turns **blue when your paired peer’s capture is paused or inactive**,
+so you know they cannot receive your light signals. Blue stays visible while you
+press your key and clears when they resume. Both Macs need this update to share
+pause status; disconnected peers still appear as offline in the menu.
+
+Otherwise, Dit’s tail glows yellow-green while you hold your key, confirming the
+outgoing light signal without lighting your own keyboard. An incoming press
+leaves Dit’s tail hollow because your keyboard light carries that signal. While
+you are not sending, red means a pairing request or PTT invitation needs
+attention. The menu-bar mark adapts to light and dark backgrounds automatically.
 
 While capture is **active**, Caps Lock must not capitalize text, display the
 macOS Caps Lock cursor indicator, or latch the local light on. Your local light

@@ -693,6 +693,7 @@ enum WireKind: UInt8 {
     case hello = 10
     case keyState = 11
     case profile = 12
+    case captureState = 13
     case pttInvite = 20
     case pttAccept = 21
     case pttReject = 22
@@ -2685,6 +2686,7 @@ final class SlockController {
     private(set) var localKeyDown = false
     private(set) var remoteKeyDown = false
     private(set) var peerOnline = false
+    private(set) var peerPaused = false
     private(set) var localTalking = false
     private(set) var remoteTalking = false
     private(set) var incomingPairPublicKey: Data?
@@ -2758,6 +2760,7 @@ final class SlockController {
                 self.retryOutgoingPTTInvite(force: true)
             } else {
                 self.peerOnline = false
+                self.peerPaused = false
                 self.lastPeerSeen = nil
                 self.clearRemoteKey()
                 self.stopLocalTalk()
@@ -2785,6 +2788,7 @@ final class SlockController {
                 self.captureWasActive = self.capsInterceptor.isActive
                 if self.captureWasActive { self.led.set(false) }
                 else { self.clearRemoteKey() }
+                self.sendCaptureState()
             }
             self.changed()
         }
@@ -2821,6 +2825,7 @@ final class SlockController {
         if let outgoingPairPublicKey { return "Pairing request sent to \(peerName(outgoingPairPublicKey))" }
         if peerStore.peerPublicKey == nil { return "Not paired" }
         if transportState != .connected { return transportState.text }
+        if peerPaused { return "Paired · peer paused" }
         if localTalking { return "Transmitting" }
         if remoteTalking { return "Receiving" }
         if !peerOnline { return "Paired · peer offline" }
@@ -3082,6 +3087,7 @@ final class SlockController {
             "Peer: \(peerShortID ?? "none")",
             "Transport: \(transportState.text)",
             "Peer online: \(peerOnline)",
+            "Peer paused: \(peerPaused)",
             "PTT enabled: \(pttEnabled)",
             "Accessibility trusted: \(capsInterceptor.permissionGranted)",
             "Input Monitoring allowed: \(CGPreflightListenEventAccess())",
@@ -3123,6 +3129,7 @@ final class SlockController {
             }
             guard message.sessionConfirmed else { return }
             if message.newSession, peerStore.peerPublicKey == sender {
+                peerPaused = false
                 consentGeneration = UUID()
                 peerStore.ptt.incoming = nil
                 // An outgoing invitation is retried only after this fresh handshake.
@@ -3180,6 +3187,14 @@ final class SlockController {
                 applyPTTRevocation(revoked)
                 receiveRemoteKeySnapshot(message.payload[0] != 0)
             }
+            // Refresh after every confirmed HELLO so lost pause/resume updates
+            // recover without changing the legacy HELLO payload.
+            sendCaptureState()
+        case .captureState:
+            guard message.payload.count == 1, let active = message.payload.first, active <= 1 else { return }
+            markPeerSeen()
+            peerPaused = active == 0
+            if peerPaused { clearRemoteKey() }
         case .keyState:
             if let event = KeyLightEvent.read(message.payload) {
                 markPeerSeen()
@@ -3522,6 +3537,11 @@ final class SlockController {
         return payload
     }
 
+    private func sendCaptureState() {
+        guard let peer = peerStore.peerPublicKey else { return }
+        send(kind: .captureState, payload: Data([capsInterceptor.isActive ? UInt8(1) : UInt8(0)]), to: peer)
+    }
+
     private func applyPTTRevocation(_ id: UInt64) {
         let before = peerStore.ptt.active
         peerStore.ptt.receiveRevocation(id)
@@ -3580,6 +3600,7 @@ final class SlockController {
             peerOnline = false
         }
         if wasOnline && !peerOnline {
+            peerPaused = false
             clearRemoteKey()
             stopRemoteTalk(immediate: true)
             stopLocalTalk()
@@ -3609,6 +3630,7 @@ final class SlockController {
         lastPTTInviteSent = -.infinity
         lastPeerSeen = nil
         peerOnline = false
+        peerPaused = false
         changed()
     }
 
@@ -3628,6 +3650,7 @@ final class SlockController {
     private func changed() {
         if logsStatus {
             let status = "transport=\(transportState.text) paired=\(peerPublicKey != nil) online=\(peerOnline) "
+                + "peerPaused=\(peerPaused) "
                 + "capture=\(capsInterceptor.isActive) led=\(led.mode.rawValue) "
                 + "presses=\(localPressCount) sentKeys=\(sentKeyMessages) receivedKeys=\(receivedKeyMessages)"
             if status != lastLoggedLinkStatus {
@@ -3646,13 +3669,16 @@ enum FireflyIcon {
         case idle
         case outgoing
         case notification
+        case paused
     }
 
     static let idle = makeImage(tail: .idle)
     static let outgoing = makeImage(tail: .outgoing)
     static let notification = makeImage(tail: .notification)
+    static let paused = makeImage(tail: .paused)
 
-    static func tailState(localActive: Bool, attention: Bool) -> TailState {
+    static func tailState(localActive: Bool, attention: Bool, peerPaused: Bool) -> TailState {
+        if peerPaused { return .paused }
         if localActive { return .outgoing }
         if attention { return .notification }
         return .idle
@@ -3663,14 +3689,14 @@ enum FireflyIcon {
         case .idle: return idle
         case .outgoing: return outgoing
         case .notification: return notification
+        case .paused: return paused
         }
     }
 
     private static func makeImage(tail: TailState) -> NSImage {
         // Vector artwork stays crisp at both Retina and standard scale. Idle
-        // artwork is a template; outgoing and notification states keep an
-        // adaptive body with a colored tail.
-        let isColored = tail == .outgoing || tail == .notification
+        // artwork is a template; colored tails keep an adaptive body.
+        let isColored = tail != .idle
         let image = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
             NSGraphicsContext.saveGraphicsState()
             let transform = NSAffineTransform()
@@ -3705,6 +3731,9 @@ enum FireflyIcon {
             case .notification:
                 NSColor.systemRed.setFill()
                 NSBezierPath(ovalIn: NSRect(x: 37, y: 98, width: 46, height: 46)).fill()
+            case .paused:
+                NSColor.systemBlue.setFill()
+                NSBezierPath(ovalIn: NSRect(x: 37, y: 98, width: 46, height: 46)).fill()
             case .idle:
                 let tail = NSBezierPath(ovalIn: NSRect(x: 41, y: 102, width: 38, height: 38))
                 tail.lineWidth = 8
@@ -3714,7 +3743,8 @@ enum FireflyIcon {
             return true
         }
         image.isTemplate = !isColored
-        image.accessibilityDescription = "Dit, the slock firefly"
+        image.accessibilityDescription = tail == .paused
+            ? "Dit, the slock firefly — peer paused" : "Dit, the slock firefly"
         return image
     }
 }
@@ -4021,7 +4051,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let tail = FireflyIcon.tailState(
             localActive: controller.localKeyDown || controller.localTalking,
-            attention: needsAttention
+            attention: needsAttention,
+            peerPaused: controller.peerPaused
         )
         button.image = FireflyIcon.image(tail: tail)
         button.title = ""
