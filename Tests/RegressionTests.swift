@@ -73,6 +73,14 @@ private final class FakePlayback: VoicePlayback {
     func finish() { let callback = onDrain; onDrain = nil; callback?() }
 }
 
+private final class FakeLEDOutput: CapsLEDOutput {
+    let allowedAtCreation: Bool
+    var lastError: String? { allowedAtCreation ? nil : "Cached keyboard permission denial" }
+    var diagnostics: String { allowedAtCreation ? "1 keyboard, 1 successful write" : "1 keyboard, 0 successful writes" }
+    init(allowed: Bool) { allowedAtCreation = allowed }
+    func set(_ on: Bool) -> Bool { allowedAtCreation }
+}
+
 private final class TestMac {
     let defaults = MemoryPreferences()
     let hid = FakeHID()
@@ -317,6 +325,10 @@ enum RegressionTests {
             try check(a.controller.remoteKeyDown && a.controller.led.isOn && !b.controller.led.isOn, "held key lit the wrong keyboard")
             b.key(false); try exchange(a, b)
             try check(!a.controller.remoteKeyDown && !a.controller.led.isOn, "release did not clear the light")
+            try check(b.controller.diagnostics().contains("Local Caps presses: 1"), "local capture counter missing")
+            try check(b.controller.diagnostics().contains("Key messages queued: 2"), "queued key counter missing")
+            try check(a.controller.diagnostics().contains("Key messages received: 2"), "received key counter missing")
+            try check(a.controller.diagnostics().contains("Last peer key state: up"), "last received key state missing")
         }
         test("simultaneous PTT holds choose one speaker and transfer only after playback drains") {
             let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
@@ -492,6 +504,34 @@ enum RegressionTests {
             let working = CapsLED(directWriter: { _ in true })
             try check(working.set(true) && working.isOn && working.mode == .directHID, "direct LED failed")
             try check(working.set(false) && !working.isOn, "direct LED latched on")
+        }
+        test("LED devices are created only after keyboard access and recreated after revocation") {
+            var access = HIDEventAccess.unknown
+            var created = 0
+            let led = CapsLED(accessCheck: { access }, makeOutput: {
+                created += 1
+                return FakeLEDOutput(allowed: access == .granted)
+            })
+            try check(created == 0, "LED initialization opened keyboard devices")
+            try check(!led.set(true) && created == 0 && led.mode == .permissionRequired, "opened devices before permission")
+            access = .granted
+            try check(led.set(true) && created == 1 && led.isOn, "permission grant did not enable LED output")
+            try check(led.set(false) && created == 1, "working device was unnecessarily reopened")
+            access = .denied
+            try check(!led.set(true) && led.mode == .permissionRequired, "permission revocation was ignored")
+            access = .granted
+            try check(led.set(true) && created == 2 && led.lastError == nil, "regrant reused a denied device")
+        }
+        test("a cached HID denial is discarded so a later LED retry can recover") {
+            var created = 0
+            let led = CapsLED(accessCheck: { .granted }, makeOutput: {
+                created += 1
+                return FakeLEDOutput(allowed: created > 1)
+            })
+            try check(!led.set(true) && led.lastError == "Cached keyboard permission denial", "failure reason was hidden")
+            try check(led.diagnostics.contains("0 successful writes"), "device failure details were hidden")
+            try check(led.set(true) && created == 2 && led.isOn && led.lastError == nil,
+                      "cached denial survived retry after permission was granted")
         }
         test("Dit's tail gives outgoing activity priority over notifications") {
             try check(FireflyIcon.tailState(localActive: false, attention: false) == .idle,

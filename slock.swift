@@ -18,7 +18,7 @@ enum SlockConfig {
     static let appName = "slock"
     // Keep identity keys and the single-instance lock in their existing location.
     static let storageName = "CapsLink"
-    static let appVersion = "0.2.2"
+    static let appVersion = "0.2.3"
     static let protocolVersion: UInt8 = 2
     static let brokerURL = URL(string: "wss://test.mosquitto.org:8081/mqtt")!
     static let topicPrefix = "capslink/v2/inbox/"
@@ -1080,6 +1080,10 @@ enum KeyboardTapAccess {
     }
 
     static func verifyCurrentProcess() throws {
+        try validate(mask: currentProcessMask())
+    }
+
+    static func currentProcessMask() throws -> CGEventMask {
         var count: UInt32 = 0
         guard CGGetEventTapList(0, nil, &count) == .success else {
             throw appError("slock.Keyboard", "Could not verify keyboard event access. Capture is inactive.")
@@ -1095,7 +1099,7 @@ enum KeyboardTapAccess {
               }) else {
             throw appError("slock.Keyboard", "Could not verify the keyboard event tap. Capture is inactive.")
         }
-        try validate(mask: tap.eventsOfInterest)
+        return tap.eventsOfInterest
     }
 }
 
@@ -1514,52 +1518,118 @@ final class CapsInterceptor {
 
 // MARK: - Caps Lock LED output
 
+enum HIDEventAccess: String {
+    case granted, denied, unknown
+
+    static func current() -> HIDEventAccess {
+        switch IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) {
+        case kIOHIDAccessTypeGranted: return .granted
+        case kIOHIDAccessTypeDenied: return .denied
+        default: return .unknown
+        }
+    }
+}
+
+protocol CapsLEDOutput: AnyObject {
+    var lastError: String? { get }
+    var diagnostics: String { get }
+    func set(_ on: Bool) -> Bool
+}
+
 final class CapsLED {
     enum Mode: String {
         case unknown = "Not tested"
         case directHID = "Direct HID LED"
+        case permissionRequired = "Keyboard light permission required"
         case unavailable = "Unavailable"
     }
 
-    private let manager: IOHIDManager?
+    private let accessCheck: () -> HIDEventAccess
+    private let makeOutput: () -> CapsLEDOutput
+    private var output: CapsLEDOutput?
     private var directWriter: ((Bool) -> Bool)?
     private(set) var mode: Mode = .unknown
     private(set) var isOn = false
+    private(set) var lastError: String?
+    private(set) var deviceDiagnostics = "Not opened"
 
-    init() {
-        let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        self.manager = manager
-        IOHIDManagerSetDeviceMatching(manager, nil)
-        _ = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-    }
-
-    deinit {
-        if let manager { _ = IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone)) }
+    init(accessCheck: @escaping () -> HIDEventAccess = HIDEventAccess.current,
+         makeOutput: @escaping () -> CapsLEDOutput = { HIDCapsLEDOutput() }) {
+        self.accessCheck = accessCheck
+        self.makeOutput = makeOutput
+        // HID device objects cache a denied access result. Do not create them
+        // at launch, before the user has granted keyboard access.
     }
 
     #if CAPSLINK_TESTING
-    init(directWriter: @escaping (Bool) -> Bool) {
-        manager = nil
+    convenience init(directWriter: @escaping (Bool) -> Bool) {
+        self.init(accessCheck: { .granted })
         self.directWriter = directWriter
     }
     #endif
 
     @discardableResult
     func set(_ on: Bool) -> Bool {
-        let direct = directWriter?(on) ?? setDirect(on)
+        guard accessCheck() == .granted else {
+            output = nil
+            mode = .permissionRequired
+            isOn = false
+            lastError = "Allow slock in Input Monitoring, then retry the keyboard light."
+            deviceDiagnostics = "Not opened: HID listening access is not granted"
+            return false
+        }
+        let direct: Bool
+        if let directWriter {
+            direct = directWriter(on)
+        } else {
+            let output = output ?? makeOutput()
+            self.output = output
+            direct = output.set(on)
+            deviceDiagnostics = output.diagnostics
+            lastError = output.lastError
+            // A permission change can race the preflight. Release failed HID
+            // objects so a subsequent attempt gets a fresh authorization check.
+            if !direct { self.output = nil }
+        }
         if direct {
             mode = .directHID
             isOn = on
+            lastError = nil
             return true
         }
         mode = .unavailable
         isOn = false
+        if lastError == nil { lastError = "This keyboard does not expose a writable Caps Lock light." }
         return false
     }
 
-    private func setDirect(_ on: Bool) -> Bool {
-        guard let manager, let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else { return false }
-        var changed = false
+    var diagnostics: String {
+        "HID listening access: \(accessCheck().rawValue)\nLED devices: \(deviceDiagnostics)\nLED error: \(lastError ?? "none")"
+    }
+}
+
+private final class HIDCapsLEDOutput: CapsLEDOutput {
+    private let manager: IOHIDManager
+    private let openResult: IOReturn
+    private(set) var lastError: String?
+    private(set) var diagnostics = "Not written"
+
+    init() {
+        manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        IOHIDManagerSetDeviceMatching(manager, [
+            kIOHIDDeviceUsagePageKey: kHIDPage_GenericDesktop,
+            kIOHIDDeviceUsageKey: kHIDUsage_GD_Keyboard
+        ] as CFDictionary)
+        openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+    }
+
+    deinit { IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone)) }
+
+    func set(_ on: Bool) -> Bool {
+        let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> ?? []
+        var elementCount = 0
+        var writeCount = 0
+        var writeError: IOReturn?
         for device in devices {
             guard IOHIDDeviceConformsTo(
                 device,
@@ -1574,20 +1644,32 @@ final class CapsLED {
             for case let element as IOHIDElement in (copied as NSArray) {
                 guard IOHIDElementGetUsagePage(element) == UInt32(kHIDPage_LEDs),
                       IOHIDElementGetUsage(element) == UInt32(kHIDUsage_LED_CapsLock) else { continue }
+                elementCount += 1
                 let value = IOHIDValueCreateWithIntegerValue(
                         kCFAllocatorDefault,
                         element,
                         mach_absolute_time(),
                         on ? 1 : 0
                       )
-                if IOHIDDeviceSetValue(device, element, value) == kIOReturnSuccess {
-                    changed = true
-                }
+                let result = IOHIDDeviceSetValue(device, element, value)
+                if result == kIOReturnSuccess { writeCount += 1 }
+                else { writeError = result }
             }
         }
-        return changed
+        diagnostics = "\(devices.count) keyboards, \(elementCount) Caps LED elements, \(writeCount) successful writes; open=\(Self.code(openResult))"
+        if writeCount > 0 {
+            lastError = nil
+        } else if let writeError {
+            lastError = "Caps Lock light write failed (\(Self.code(writeError))). Check Input Monitoring access."
+        } else if openResult != kIOReturnSuccess {
+            lastError = "Keyboard devices could not be opened (\(Self.code(openResult))). Check Input Monitoring access."
+        } else {
+            lastError = "No writable Caps Lock light was found on the connected keyboards."
+        }
+        return writeCount > 0
     }
 
+    private static func code(_ result: IOReturn) -> String { String(format: "0x%08x", UInt32(bitPattern: result)) }
 }
 
 // Only capture ownership changes may restore Caps Lock. LED output must never
@@ -2136,6 +2218,7 @@ final class SlockController {
     private let makePlayback: () throws -> VoicePlayback
     private let checkAudio: () throws -> Void
     private let requestMicrophone: (@escaping (Bool) -> Void) -> Void
+    private let logsStatus: Bool
     private var timer: Timer?
     private var audioCapture: VoiceCapture?
     private var audioPlayback: VoicePlayback?
@@ -2157,6 +2240,12 @@ final class SlockController {
     private var consentGeneration = UUID()
     private var captureWasActive = false
     private var lastLoggedCaptureStatus: String?
+    private var lastLoggedLinkStatus: String?
+    private var localPressCount = 0
+    private var sentKeyMessages = 0
+    private var receivedKeyMessages = 0
+    private var receivedPeerHellos = 0
+    private var lastPeerKeyState: Bool?
     private var lastHandshakeReply: [Data: TimeInterval] = [:]
     fileprivate(set) var lastError: String?
 
@@ -2197,6 +2286,7 @@ final class SlockController {
         self.makePlayback = makePlayback
         self.checkAudio = checkAudio
         self.requestMicrophone = requestMicrophone
+        logsStatus = startServices
         wire = SecureWire(identity: identity)
 
         transport.onStateChange = { [weak self] state in
@@ -2273,6 +2363,8 @@ final class SlockController {
         if localTalking { return "Transmitting" }
         if remoteTalking { return "Receiving" }
         if !peerOnline { return "Paired · peer offline" }
+        if led.mode == .permissionRequired { return "Connected · keyboard light needs permission" }
+        if led.mode == .unavailable { return "Connected · keyboard light unavailable" }
         return peerStore.pttEnabled ? "Connected · PTT enabled" : "Connected"
     }
 
@@ -2472,7 +2564,7 @@ final class SlockController {
             return
         }
         if !led.set(true) {
-            lastError = "This keyboard does not support independent Caps Lock light control. System Caps Lock remains off."
+            lastError = led.lastError
         }
         changed()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
@@ -2480,6 +2572,12 @@ final class SlockController {
             self.led.set(self.remoteKeyDown)
             self.changed()
         }
+    }
+
+    func retryLED() {
+        guard capsInterceptor.isActive else { return }
+        _ = led.set(remoteKeyDown)
+        changed()
     }
 
     func clearError() {
@@ -2530,9 +2628,17 @@ final class SlockController {
             "Input Monitoring allowed: \(CGPreflightListenEventAccess())",
             "Caps capture requested: \(capsInterceptor.isRequested)",
             "Caps capture active: \(capsInterceptor.isActive)",
+            "Keyboard event mask: \((try? KeyboardTapAccess.currentProcessMask()).map(String.init) ?? "not installed") (required \(KeyboardTapAccess.requiredMask))",
+            "Peer session confirmed: \(peerStore.peerPublicKey.map { wire.hasSession(with: $0) } ?? false)",
+            "Local Caps presses: \(localPressCount)",
+            "Key messages queued: \(sentKeyMessages)",
+            "Key messages received: \(receivedKeyMessages)",
+            "Peer HELLOs received: \(receivedPeerHellos)",
+            "Last peer key state: \(lastPeerKeyState.map { $0 ? "down" : "up" } ?? "none")",
             "System Caps Lock on: \(CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift))",
             "Caps error: \(capsInterceptor.lastError ?? "none")",
             "LED mode: \(led.mode.rawValue)",
+            led.diagnostics,
             "App error: \(lastError ?? "none")",
             "OS: \(ProcessInfo.processInfo.operatingSystemVersionString)",
             "Architecture: \(architecture)",
@@ -2608,13 +2714,18 @@ final class SlockController {
             lastError = "Pairing was declined by \(shortIdentifier(for: sender))."
         case .hello:
             markPeerSeen()
+            receivedPeerHellos += 1
             if message.payload.count == 9, let revoked = message.payload.uint64(at: 1) {
                 applyPTTRevocation(revoked)
                 updateRemoteKey(message.payload[0] != 0)
             }
         case .keyState:
             markPeerSeen()
-            if let value = message.payload.first { updateRemoteKey(value != 0) }
+            if let value = message.payload.first {
+                receivedKeyMessages += 1
+                lastPeerKeyState = value != 0
+                updateRemoteKey(value != 0)
+            }
         case .profile:
             break
         case .pttInvite:
@@ -2672,6 +2783,7 @@ final class SlockController {
         guard !down || capsInterceptor.isActive else { return }
         guard localKeyDown != down else { return }
         localKeyDown = down
+        if down { localPressCount += 1 }
         // A local press is an output for the peer, never for this keyboard.
         // Reassert the remote state in case the keyboard firmware briefly
         // changed its own Caps Lock LED before the remapped event arrived.
@@ -2900,6 +3012,7 @@ final class SlockController {
                 topic: SlockConfig.topicPrefix + routeIdentifier(for: peer),
                 payload: packet
             )
+            if kind == .keyState { sentKeyMessages += 1 }
         } catch {
             lastError = error.localizedDescription
             changed()
@@ -2979,6 +3092,15 @@ final class SlockController {
     }
 
     private func changed() {
+        if logsStatus {
+            let status = "transport=\(transportState.text) paired=\(peerPublicKey != nil) online=\(peerOnline) "
+                + "capture=\(capsInterceptor.isActive) led=\(led.mode.rawValue) "
+                + "presses=\(localPressCount) sentKeys=\(sentKeyMessages) receivedKeys=\(receivedKeyMessages)"
+            if status != lastLoggedLinkStatus {
+                lastLoggedLinkStatus = status
+                NSLog("Light link: %@", status)
+            }
+        }
         DispatchQueue.main.async { [weak self] in self?.onStateChange?() }
     }
 }
@@ -3245,13 +3367,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
-        let capturePending = controller.capsInterceptor.isRequested && !controller.capsInterceptor.isActive
-        let capture = add("Capture Caps Lock", #selector(toggleCapture))
-        capture.state = controller.capsInterceptor.isActive ? .on : (capturePending ? .mixed : .off)
+        let captureActive = controller.capsInterceptor.isActive
+        let capturePending = controller.capsInterceptor.isRequested && !captureActive
+        if captureActive {
+            add("Pause Slock", #selector(pauseSlock))
+        } else {
+            add("Resume Slock", #selector(resumeSlock))
+        }
         if capturePending {
             add("Retry Capture", #selector(retryCapture))
             add("Open Accessibility Settings…", #selector(openAccessibilitySettings))
+        }
+        if capturePending || controller.led.mode == .permissionRequired {
             add("Open Input Monitoring Settings…", #selector(openInputMonitoringSettings))
+        }
+        if controller.capsInterceptor.isActive,
+           controller.led.mode == .permissionRequired || controller.led.mode == .unavailable {
+            add("Retry Keyboard Light", #selector(retryLED))
         }
         let login = add("Launch at Login", #selector(toggleLaunchAtLogin))
         login.state = launchAtLoginEnabled ? .on : .off
@@ -3416,8 +3548,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller.disablePTT()
     }
 
-    @objc private func toggleCapture() {
-        controller.setCaptureEnabled(!controller.capsInterceptor.isRequested)
+    @objc private func pauseSlock() {
+        controller.setCaptureEnabled(false)
+    }
+
+    @objc private func resumeSlock() {
+        controller.setCaptureEnabled(true)
     }
 
     @objc private func retryCapture() {
@@ -3450,8 +3586,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller.selfTestLED()
     }
 
+    @objc private func retryLED() {
+        controller.retryLED()
+    }
+
     @objc private func showDiagnostics() {
-        showAlert(title: "slock Diagnostics", message: controller.diagnostics())
+        let text = controller.diagnostics()
+        let alert = NSAlert()
+        alert.messageText = "slock Diagnostics"
+        alert.informativeText = text
+        alert.addButton(withTitle: "Copy Diagnostics")
+        alert.addButton(withTitle: "Close")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+        }
     }
 
     @objc private func clearError() {

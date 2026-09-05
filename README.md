@@ -27,8 +27,9 @@ A small macOS menu-bar app. No account required. Built for Apple Silicon and Int
    and the login item use a stable path.
 3. Allow **Accessibility** access when asked. Look for slock’s firefly icon in
    the menu bar.
-4. Make sure **Capture Caps Lock** is active. Hold **Option** while the menu is
-   open and choose **Test Caps Lock Light** to check your keyboard.
+4. Choose **Resume Slock** if capture is inactive. The menu shows **Pause Slock**
+   while the key is captured. Hold **Option** while the menu is open and choose
+   **Test Caps Lock Light** to check your keyboard.
 
 Requires **macOS 13 or later** and an internet connection. The prototype is
 ad-hoc signed and **not notarized**, so macOS may block its first launch. Follow
@@ -38,8 +39,8 @@ slock asks for Accessibility access **at most once**. Later activation attempts,
 restarts, and updates check quietly. If access is missing, use **Open Accessibility
 Settings…**, remove any stale slock entry, and add the copy in Applications. Then
 choose **Retry Capture**; requested capture also starts automatically when access
-is granted. A mixed check beside **Capture Caps Lock** means slock is waiting for
-permission or could not take control of the key.
+is granted. **Resume Slock** means the key is not currently captured. If requested
+capture cannot start, **Retry Capture** and permission recovery actions appear.
 
 ## Connect two Macs
 
@@ -84,7 +85,7 @@ Enabled** to disable voice for both peers. Audio uses end-to-end encrypted Opus.
 
 | Menu item | What it does |
 | --- | --- |
-| **Capture Caps Lock** | Gives slock control of the key, or restores normal Caps Lock behavior. |
+| **Pause Slock / Resume Slock** | Restores normal Caps Lock behavior, or gives slock control of the key. |
 | **Launch at Login** | Starts slock when you sign in. Enabled on first launch when macOS allows it. |
 | **Unpair…** | Removes the peer and stops key mirroring and voice. |
 | **Quit slock** | Stops capture, restores the previous keyboard mapping, and exits. |
@@ -131,6 +132,25 @@ authentication. See [the architecture](ARCHITECTURE.md) for protocol details and
 
 Hold **Option** in slock’s menu to open **Diagnostics…**.
 
+Pairing confirms that the network connection works; each Mac still needs working
+keyboard capture and independent LED access. In version 0.2.3, use **Copy
+Diagnostics** to share the checks below:
+
+- **Local Caps presses** should increase when this Mac holds Caps Lock. If it
+  stays at zero and Dit's tail never glows, check capture permissions and the
+  keyboard event mask (required: `7168`).
+- **Key messages queued** on the sender and **Key messages received** on the
+  recipient separate keyboard capture from message delivery. Counters are since
+  app launch; queued messages do not prove delivery.
+- **HID listening access**, **LED devices**, and **LED error** distinguish missing
+  permission from a keyboard that cannot control its light. Grant Input Monitoring
+  access if requested, then choose **Retry Keyboard Light**.
+
+The LED driver waits for keyboard permission before opening devices and recreates
+failed device objects on retry. Granting permission after launch no longer leaves
+the light driver stuck with its initial denial. Keyboard capture permissions can
+still require reopening the app when macOS reports incomplete event access.
+
 | Problem | Check |
 | --- | --- |
 | Caps Lock still capitalizes, shows a blue indicator, or leaves the light on | Diagnostics must show **Accessibility trusted: true** and **Caps capture active: true**. If capture is active and the issue persists, record the diagnostics and keyboard model. |
@@ -145,7 +165,7 @@ Hold **Option** in slock’s menu to open **Diagnostics…**.
 
 For a useful bug report, include both Macs’ models, macOS versions, keyboard types,
 app versions, the relevant diagnostic error, and whether key capture, the light
-test, and voice each work. State whether **Capture Caps Lock** was actually active.
+test, and voice each work. State whether the menu shows **Pause Slock** or **Resume Slock**.
 
 ## Build from source
 
