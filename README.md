@@ -97,11 +97,21 @@ Enabled** to disable voice for both peers. Audio uses end-to-end encrypted Opus.
 | **Pause Slock / Resume Slock** | Restores normal Caps Lock behavior, or gives slock control of the key. |
 | **Permissions…** | Opens setup guidance and controls for Accessibility and Input Monitoring. |
 | **Launch at Login** | Starts slock when you sign in. Enabled on first launch when macOS allows it. |
+| **Update slock** | Appears when a newer stable release tag is available. Downloads the update, replaces the app in its current location, and restarts slock. |
 | **Unpair…** | Removes the peer and stops key mirroring and voice. |
 | **Quit slock** | Stops capture, restores the previous keyboard mapping, and exits. |
 
 Hold **Option** while the menu is open to reveal **This Mac**, **Test Caps Lock
 Light**, and **Diagnostics…**. Release Option to hide them again.
+
+slock checks GitHub for updates at launch and hourly while running. Checks happen
+in the background; a temporary network failure retries after five minutes. The
+update option stays hidden when the installed version is current or ahead of the
+latest release. The download's SHA-256 checksum, app identity, version, and code
+signature are verified before slock quits. If replacement or relaunch fails, the
+installer restores the previous app. Updating requires write access to the app's
+folder. Pairings and preferences are retained; macOS may require renewed keyboard
+permissions after an update.
 
 Dit’s tail glows yellow-green while you hold your key, confirming the outgoing
 light signal without lighting your own keyboard. An incoming press leaves Dit’s

@@ -138,6 +138,325 @@ func appError(_ domain: String, _ message: String, code: Int = 1) -> NSError {
     NSError(domain: domain, code: code, userInfo: [NSLocalizedDescriptionKey: message])
 }
 
+// MARK: - Release updates
+
+struct ReleaseVersion: Comparable {
+    let major: Int
+    let minor: Int
+    let patch: Int
+
+    init?(_ tag: String) {
+        let text = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+        let parts = text.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3 else { return nil }
+        let numbers = parts.compactMap { part -> Int? in
+            guard !part.isEmpty, part.utf8.allSatisfy({ (48...57).contains($0) }),
+                  part.count == 1 || part.first != "0" else { return nil }
+            return Int(part)
+        }
+        guard numbers.count == 3 else { return nil }
+        major = numbers[0]
+        minor = numbers[1]
+        patch = numbers[2]
+    }
+
+    static func < (lhs: Self, rhs: Self) -> Bool {
+        (lhs.major, lhs.minor, lhs.patch) < (rhs.major, rhs.minor, rhs.patch)
+    }
+}
+
+struct SlockUpdate: Equatable {
+    let tag: String
+
+    static func available(in data: Data, currentVersion: String) throws -> SlockUpdate? {
+        struct Release: Decodable {
+            let tag_name: String
+            let draft: Bool
+            let prerelease: Bool
+        }
+        let release = try JSONDecoder().decode(Release.self, from: data)
+        guard !release.draft, !release.prerelease,
+              let remote = ReleaseVersion(release.tag_name),
+              let local = ReleaseVersion(currentVersion), remote > local else { return nil }
+        return SlockUpdate(tag: release.tag_name)
+    }
+}
+
+// Owned and called by the main thread. Network work never blocks menu tracking.
+final class UpdateChecker {
+    typealias Completion = (Data?, URLResponse?, Error?) -> Void
+    typealias Fetch = (URLRequest, @escaping Completion) -> Void
+    static let checkInterval: TimeInterval = 60 * 60
+    static let retryInterval: TimeInterval = 5 * 60
+    static let latestReleaseURL = URL(string: "https://api.github.com/repos/jonaraphael/slock/releases/latest")!
+
+    private(set) var availableUpdate: SlockUpdate?
+    var onChange: (() -> Void)?
+    private let currentVersion: String
+    private let fetch: Fetch
+    private let now: () -> Date
+    private var nextCheck = Date.distantPast
+    private var checking = false
+
+    init(currentVersion: String = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+             ?? SlockConfig.appVersion,
+         now: @escaping () -> Date = Date.init,
+         fetch: @escaping Fetch = { request, completion in
+             URLSession.shared.dataTask(with: request, completionHandler: completion).resume()
+         }) {
+        self.currentVersion = currentVersion
+        self.now = now
+        self.fetch = fetch
+    }
+
+    func checkIfNeeded() {
+        guard !checking, now() >= nextCheck else { return }
+        checking = true
+        var request = URLRequest(url: Self.latestReleaseURL, cachePolicy: .reloadIgnoringLocalCacheData,
+                                 timeoutInterval: 15)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("2026-03-10", forHTTPHeaderField: "X-GitHub-Api-Version")
+        request.setValue("slock/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+        fetch(request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.checking = false
+                self.nextCheck = self.now().addingTimeInterval(Self.retryInterval)
+                // Keep a known update through temporary network/rate-limit failures.
+                guard error == nil, let http = response as? HTTPURLResponse else { return }
+                let update: SlockUpdate?
+                if http.statusCode == 404 {
+                    update = nil
+                } else if http.statusCode == 200, let data {
+                    do { update = try SlockUpdate.available(in: data, currentVersion: self.currentVersion) }
+                    catch { return }
+                } else {
+                    return
+                }
+                self.nextCheck = self.now().addingTimeInterval(Self.checkInterval)
+                guard update != self.availableUpdate else { return }
+                self.availableUpdate = update
+                self.onChange?()
+            }
+        }
+    }
+}
+
+// The replacement is staged beside the installed app so renames stay on one volume.
+struct PreparedUpdate {
+    let directory: URL
+    let destination: URL
+    var app: URL { directory.appendingPathComponent("slock.app") }
+    var backup: URL { directory.appendingPathComponent("previous.app") }
+    var helper: URL { directory.appendingPathComponent("install-update") }
+
+    func launchHelper() throws {
+        let process = Process()
+        process.executableURL = helper
+        process.arguments = ["--slock-install-update", String(getpid()), directory.path, destination.path]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+    }
+
+    func install(relaunch: (URL) throws -> Void = { url in
+        let (status, _, error) = try runProcess("/usr/bin/open", ["-n", url.path])
+        guard status == 0 else { throw appError("slock.Update", "Could not reopen slock: \(error)") }
+    }) throws {
+        let fm = FileManager.default
+        do { try fm.moveItem(at: destination, to: backup) }
+        catch { try? relaunch(destination); throw error }
+        do {
+            try fm.moveItem(at: app, to: destination)
+            try relaunch(destination)
+        } catch {
+            let installError = error
+            do {
+                if fm.fileExists(atPath: destination.path) { try fm.moveItem(at: destination, to: app) }
+                try fm.moveItem(at: backup, to: destination)
+            } catch {
+                throw appError("slock.Update", "The update could not be installed or restored. Your previous app is at \(backup.path). \(error.localizedDescription)")
+            }
+            try? relaunch(destination)
+            throw installError
+        }
+        try? fm.removeItem(at: directory)
+    }
+}
+
+enum UpdateInstaller {
+    static func verifyChecksum(_ checksumData: Data, archive: URL) throws {
+        guard let checksums = String(data: checksumData, encoding: .utf8) else {
+            throw appError("slock.Update", "The release checksum file is invalid.")
+        }
+        let matches = checksums.split(whereSeparator: \.isNewline).compactMap { line -> String? in
+            let fields = line.split(whereSeparator: \.isWhitespace)
+            guard fields.count == 2, fields[1] == "slock.app.zip", fields[0].count == 64,
+                  fields[0].utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return nil }
+            return String(fields[0])
+        }
+        guard matches.count == 1 else { throw appError("slock.Update", "The release is missing its app checksum.") }
+        let actual = SHA256.hash(data: try Data(contentsOf: archive, options: .mappedIfSafe))
+            .map { String(format: "%02x", $0) }.joined()
+        guard actual == matches[0] else { throw appError("slock.Update", "The download failed its checksum check. Please try again.") }
+    }
+
+    static func validateBundle(_ app: URL, expectedTag: String,
+                               verifySignature: (URL) throws -> Void = { url in
+        let (status, _, error) = try runProcess("/usr/bin/codesign", ["--verify", "--deep", "--strict", url.path])
+        guard status == 0 else { throw appError("slock.Update", "The downloaded app failed signature verification: \(error)") }
+    }) throws {
+        let data = try Data(contentsOf: app.appendingPathComponent("Contents/Info.plist"))
+        guard let info = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              info["CFBundleIdentifier"] as? String == "com.jonaraphael.CapsLink",
+              info["CFBundleExecutable"] as? String == "slock",
+              let version = info["CFBundleShortVersionString"] as? String,
+              let expected = ReleaseVersion(expectedTag), ReleaseVersion(version) == expected,
+              FileManager.default.isExecutableFile(atPath: app.appendingPathComponent("Contents/MacOS/slock").path) else {
+            throw appError("slock.Update", "The download is not the expected slock release.")
+        }
+        try verifySignature(app)
+    }
+
+    static func prepare(_ update: SlockUpdate, currentApp: URL, executable: URL,
+                        status: @escaping (String) -> Void) async throws -> PreparedUpdate {
+        let fm = FileManager.default
+        let destination = currentApp.resolvingSymlinksInPath()
+        guard destination.pathExtension == "app" else {
+            throw appError("slock.Update", "Run slock from slock.app to install an update.")
+        }
+        let directory = destination.deletingLastPathComponent().appendingPathComponent(".slock-update-\(UUID())")
+        do { try fm.createDirectory(at: directory, withIntermediateDirectories: false,
+                                   attributes: [.posixPermissions: 0o700]) }
+        catch {
+            throw appError("slock.Update", "slock cannot update in this location. Move slock.app to a writable Applications folder and try again. \(error.localizedDescription)")
+        }
+        let prepared = PreparedUpdate(directory: directory, destination: destination)
+        var keep = false
+        defer { if !keep { try? fm.removeItem(at: directory) } }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 300
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let base = URL(string: "https://github.com/jonaraphael/slock/releases/download/\(update.tag)/")!
+        let (checksumData, checksumResponse) = try await session.data(from: base.appendingPathComponent("SHA256SUMS"))
+        guard (checksumResponse as? HTTPURLResponse)?.statusCode == 200, checksumData.count <= 4096 else {
+            throw appError("slock.Update", "The release checksum is unavailable. Please try again later.")
+        }
+        let (archive, response) = try await session.download(from: base.appendingPathComponent("slock.app.zip"))
+        defer { try? fm.removeItem(at: archive) }
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw appError("slock.Update", "The app download is unavailable. Please try again later.")
+        }
+        try Task.checkCancellation()
+        status("Verifying update…")
+        try verifyChecksum(checksumData, archive: archive)
+        let (listingStatus, listing, _) = try runProcess("/usr/bin/unzip", ["-Z1", archive.path])
+        guard listingStatus == 0, validArchivePaths(listing) else {
+            throw appError("slock.Update", "The app archive contains unexpected files.")
+        }
+        let (unzipStatus, _, unzipError) = try runProcess("/usr/bin/ditto", ["-x", "-k", archive.path, directory.path])
+        guard unzipStatus == 0 else { throw appError("slock.Update", "Could not unpack the update: \(unzipError)") }
+        try validateBundle(prepared.app, expectedTag: update.tag)
+        try fm.copyItem(at: executable, to: prepared.helper)
+        try Task.checkCancellation()
+        keep = true
+        return prepared
+    }
+
+    static func validArchivePaths(_ listing: String) -> Bool {
+        let paths = listing.split(whereSeparator: \.isNewline)
+        return !paths.isEmpty && paths.allSatisfy { path in
+            !path.hasPrefix("/") && !path.split(separator: "/").contains("..")
+                && (path == "slock.app/" || path.hasPrefix("slock.app/") || path.hasPrefix("__MACOSX/"))
+        }
+    }
+
+    // This process has no keyboard capture or identity lock. The old app exits
+    // normally first, restoring its mapping and closing microphone/relay access.
+    static func runHelperIfRequested() -> Bool {
+        let args = CommandLine.arguments
+        guard args.dropFirst().first == "--slock-install-update" else { return false }
+        guard args.count == 5, let parent = Int32(args[2]), parent > 1 else { return true }
+        let prepared = PreparedUpdate(directory: URL(fileURLWithPath: args[3]),
+                                      destination: URL(fileURLWithPath: args[4]))
+        do {
+            let deadline = Date().addingTimeInterval(30)
+            while kill(parent, 0) == 0 || errno == EPERM {
+                guard Date() < deadline else { throw appError("slock.Update", "slock did not quit in time. Please try the update again.") }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            try prepared.install()
+        } catch {
+            NSApplication.shared.setActivationPolicy(.accessory)
+            let alert = NSAlert()
+            alert.messageText = "Could not update slock"
+            alert.informativeText = error.localizedDescription
+            alert.addButton(withTitle: "OK")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+            // Keep the directory if rollback failed; it holds the previous app.
+            if !FileManager.default.fileExists(atPath: prepared.backup.path) {
+                try? FileManager.default.removeItem(at: prepared.directory)
+            }
+        }
+        return true
+    }
+}
+
+// State is confined to the main queue; the detached task only delivers results
+// there. Keep AppKit's existing delegate/callback model without actor hopping.
+final class AppUpdater: @unchecked Sendable {
+    private(set) var status: String?
+    var onChange: (() -> Void)?
+    var onError: ((Error) -> Void)?
+    var onReadyToRelaunch: (() -> Void)?
+    private var task: Task<Void, Never>?
+
+    func install(_ update: SlockUpdate) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard status == nil, let executable = Bundle.main.executableURL else { return }
+        status = "Downloading update…"
+        onChange?()
+        let app = Bundle.main.bundleURL
+        task = Task.detached(priority: .utility) { [weak self] in
+            do {
+                let prepared = try await UpdateInstaller.prepare(update, currentApp: app, executable: executable) { text in
+                    DispatchQueue.main.async { self?.status = text; self?.onChange?() }
+                }
+                DispatchQueue.main.async {
+                    guard let self else { try? FileManager.default.removeItem(at: prepared.directory); return }
+                    do {
+                        try prepared.launchHelper()
+                        self.status = "Restarting slock…"
+                        self.onChange?()
+                        self.onReadyToRelaunch?()
+                    } catch {
+                        try? FileManager.default.removeItem(at: prepared.directory)
+                        self.failed(error)
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async { self?.failed(error) }
+            }
+        }
+    }
+
+    func cancel() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        task?.cancel()
+    }
+
+    private func failed(_ error: Error) {
+        status = nil
+        task = nil
+        onChange?()
+        onError?(error)
+    }
+}
+
 // MARK: - Identity and peer storage
 
 final class IdentityStore {
@@ -3458,6 +3777,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var instanceLock: SingleInstanceLock?
     private var optionOnlyItems: [NSMenuItem] = []
     private var menuModifierTimer: Timer?
+    private let updateChecker = UpdateChecker()
+    private let updater = AppUpdater()
+    private var updateTimer: Timer?
+    private var updateMenuItem: NSMenuItem?
     private let permissionSetup = KeyboardPermissionSetup()
     private var permissionWindow: PermissionSetupWindow?
 
@@ -3477,6 +3800,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
+        updateChecker.onChange = { [weak self] in self?.refreshUpdateMenuItem() }
+        updater.onChange = { [weak self] in self?.refreshUpdateMenuItem() }
+        updater.onError = { [weak self] error in
+            self?.showAlert(title: "Could not update slock", message: error.localizedDescription)
+        }
+        updater.onReadyToRelaunch = { NSApp.terminate(nil) }
+        updateChecker.checkIfNeeded()
+        let updateTimer = Timer(timeInterval: UpdateChecker.retryInterval, repeats: true) { [weak self] _ in
+            self?.updateChecker.checkIfNeeded()
+        }
+        self.updateTimer = updateTimer
+        RunLoop.main.add(updateTimer, forMode: .common)
         updateStatusItem()
         enableLaunchAtLoginByDefault()
         updateStatusItem()
@@ -3489,12 +3824,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         menuModifierTimer?.invalidate()
+        updateTimer?.invalidate()
+        updater.cancel()
         permissionWindow?.close()
         controller?.shutdown()
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         rebuildMenu()
+        updateChecker.checkIfNeeded()
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -3623,8 +3961,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             add("Clear Error", #selector(clearError))
         }
         menu.addItem(.separator())
+        updateMenuItem = add("Update slock", #selector(updateSlock))
+        refreshUpdateMenuItem()
         add("Quit slock", #selector(quit))
         updateOptionOnlyItems()
+    }
+
+    private func refreshUpdateMenuItem() {
+        guard let item = updateMenuItem else { return }
+        item.title = updater.status ?? "Update slock"
+        item.isHidden = updateChecker.availableUpdate == nil && updater.status == nil
+        item.action = updater.status == nil ? #selector(updateSlock) : nil
+        item.isEnabled = updater.status == nil && updateChecker.availableUpdate != nil
+        item.toolTip = updateChecker.availableUpdate.map { "Download \($0.tag), replace slock, and restart." }
+    }
+
+    @objc private func updateSlock() {
+        guard let update = updateChecker.availableUpdate else { return }
+        updater.install(update)
     }
 
     @discardableResult
@@ -3924,6 +4278,7 @@ private func installProcessCleanupHandlers() {
 @main
 enum SlockApp {
     static func main() {
+        if UpdateInstaller.runHelperIfRequested() { return }
         installProcessCleanupHandlers()
         let app = NSApplication.shared
         let delegate = AppDelegate()
