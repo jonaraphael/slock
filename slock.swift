@@ -949,6 +949,37 @@ private func capsEventTapCallback(
     return Unmanaged.passUnretained(event)
 }
 
+enum KeyboardTapAccess {
+    static let requiredMask: CGEventMask = (1 << CGEventType.keyDown.rawValue)
+        | (1 << CGEventType.keyUp.rawValue)
+        | (1 << CGEventType.flagsChanged.rawValue)
+
+    static func validate(mask: CGEventMask) throws {
+        guard mask & requiredMask == requiredMask else {
+            throw appError("slock.Keyboard", "Keyboard event access is incomplete. Enable slock in Input Monitoring and Accessibility, then quit and reopen slock.")
+        }
+    }
+
+    static func verifyCurrentProcess() throws {
+        var count: UInt32 = 0
+        guard CGGetEventTapList(0, nil, &count) == .success else {
+            throw appError("slock.Keyboard", "Could not verify keyboard event access. Capture is inactive.")
+        }
+        var taps = [CGEventTapInformation](repeating: CGEventTapInformation(), count: Int(count) + 8)
+        let result = taps.withUnsafeMutableBufferPointer {
+            CGGetEventTapList(UInt32($0.count), $0.baseAddress, &count)
+        }
+        guard result == .success, Int(count) <= taps.count,
+              let tap = taps.prefix(Int(count)).first(where: {
+                  $0.tappingProcess == getpid() && $0.tapPoint == .cgSessionEventTap
+                      && $0.options == .defaultTap
+              }) else {
+            throw appError("slock.Keyboard", "Could not verify the keyboard event tap. Capture is inactive.")
+        }
+        try validate(mask: tap.eventsOfInterest)
+    }
+}
+
 final class CapsInterceptor {
     typealias HIDMap = (src: UInt64, dst: UInt64)
 
@@ -974,6 +1005,7 @@ final class CapsInterceptor {
     }
     private let permissionPromptKey = "CapsLink.didRequestAccessibility"
     private var createsEventTap = true
+    private var verifyTap: () throws -> Void = KeyboardTapAccess.verifyCurrentProcess
     private var readLock: () -> Bool = {
         CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift)
     }
@@ -1002,10 +1034,12 @@ final class CapsInterceptor {
                      readLock: @escaping () -> Bool = { false },
                      writeLock: @escaping (Bool) -> Bool = { _ in true },
                      trustCheck: @escaping () -> Bool = { true },
+                     verifyTap: @escaping () throws -> Void = {},
                      permissionPrompt: @escaping () -> Void = {}) {
         self.init(defaults: testDefaults, process: process)
         self.trustCheck = trustCheck
         self.permissionPrompt = permissionPrompt
+        self.verifyTap = verifyTap
         createsEventTap = false
         self.readLock = readLock
         self.writeLock = writeLock
@@ -1070,6 +1104,9 @@ final class CapsInterceptor {
 
             priorCapsLockOn = readLock()
             try installEventTap()
+            // CGEvent.tapCreate can succeed after silently removing key-down
+            // and key-up from the mask. Verify before taking over the keyboard.
+            try verifyTap()
             originalMappings = mappings
             let originalJSON = mappingJSON(mappings)
             defaults.set(originalJSON, forKey: staleMappingKey)
@@ -1140,9 +1177,7 @@ final class CapsInterceptor {
     private func installEventTap() throws {
         guard createsEventTap else { return }
         guard eventTap == nil else { return }
-        let mask: CGEventMask = (1 << CGEventType.keyDown.rawValue)
-            | (1 << CGEventType.keyUp.rawValue)
-            | (1 << CGEventType.flagsChanged.rawValue)
+        let mask = KeyboardTapAccess.requiredMask
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
@@ -2212,6 +2247,7 @@ final class SlockController {
             "Peer online: \(peerOnline)",
             "PTT enabled: \(pttEnabled)",
             "Accessibility trusted: \(capsInterceptor.permissionGranted)",
+            "Input Monitoring allowed: \(CGPreflightListenEventAccess())",
             "Caps capture requested: \(capsInterceptor.isRequested)",
             "Caps capture active: \(capsInterceptor.isActive)",
             "System Caps Lock on: \(CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift))",
@@ -2838,6 +2874,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if capturePending {
             add("Retry Capture", #selector(retryCapture))
             add("Open Accessibility Settings…", #selector(openAccessibilitySettings))
+            add("Open Input Monitoring Settings…", #selector(openInputMonitoringSettings))
         }
         let login = add("Launch at Login", #selector(toggleLaunchAtLogin))
         login.state = launchAtLoginEnabled ? .on : .off
@@ -2950,6 +2987,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openAccessibilitySettings() {
         guard let settings = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else { return }
+        NSWorkspace.shared.open(settings)
+    }
+
+    @objc private func openInputMonitoringSettings() {
+        guard let settings = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") else { return }
         NSWorkspace.shared.open(settings)
     }
 

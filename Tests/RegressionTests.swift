@@ -239,6 +239,17 @@ enum RegressionTests {
             try check(!capture.isActive && capture.lastError != nil, "claimed capture without a mapping")
             try check(prefs.string(forKey: "CapsLink.staleOriginalMapping") == nil, "empty original mapping was not recovered")
         }
+        test("a modifier-only event tap cannot claim capture or remap the keyboard") {
+            let prefs = MemoryPreferences(), hid = FakeHID()
+            let capture = CapsInterceptor(testDefaults: prefs, process: hid.run,
+                verifyTap: { try KeyboardTapAccess.validate(mask: 1 << CGEventType.flagsChanged.rawValue) })
+            capture.requestPermissionAndStart()
+            try check(!capture.isActive && capture.lastError != nil, "partial tap claimed capture")
+            try check(hid.writes.isEmpty, "partial tap changed keyboard mapping")
+            try check(prefs.string(forKey: "CapsLink.staleOriginalMapping") == nil, "partial tap claimed recovery ownership")
+            try KeyboardTapAccess.validate(mask: KeyboardTapAccess.requiredMask)
+            capture.stop()
+        }
         test("capture clears a preexisting Caps Lock latch and restores it only after stopping") {
             let prefs = MemoryPreferences(), hid = FakeHID()
             var writes: [Bool] = []

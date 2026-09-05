@@ -5,7 +5,7 @@ with a macOS 13 deployment target.
 
 ## Automated checks
 
-- **30/30 regression tests passed**, including actual native Opus encoding and
+- **31/31 regression tests passed**, including actual native Opus encoding and
   decoding of synthetic silent PCM. The first decoded frame can be shorter due to
   codec priming; subsequent frames retained the expected 320-sample cadence.
 - Tests cover sliced byte buffers, fragmented/coalesced MQTT input, input size
@@ -23,6 +23,9 @@ with a macOS 13 deployment target.
 - Permission regressions cover one prompt across repeated activation and
   relaunch, silent migration of existing installs, and quiet capture restart
   after permission is restored.
+- A modifier-only event tap is rejected before key mappings or the recovery
+  journal are changed. The actual event mask is checked because macOS can
+  silently remove key-down and key-up access from a successfully created tap.
 - Test keyboard commands and preferences are in-memory doubles. Tests do not
   install an event tap, remap keys, change LEDs, register a login item, contact the
   broker, or request microphone access.
@@ -48,7 +51,7 @@ straight through to `xcrun`'s Swift compiler.
 
 The agent's restricted execution sandbox cannot create the native Opus encoder.
 The full regression executable was therefore also run with normal macOS service
-access and passed all 30 tests. No microphone or speakers were used. A sandbox
+access and passed all 31 tests. No microphone or speakers were used. A sandbox
 codec failure must not be represented as a passing audio test.
 
 ## Still requires manual validation
@@ -94,7 +97,17 @@ to the peer-driven state on every captured press. Version 0.2.1 added explicit
 permission recovery actions without repeating the automatic system prompt. No persistent
 code-signing identity is installed on this Mac, so ad-hoc rebuilds have cdhash
 designated requirements and can invalidate prior Accessibility entries. The
-final build needs one renewed user grant before its physical capture test.
+installed builds can need a renewed user grant before their physical capture test.
+
+The user subsequently granted Accessibility for the installed 0.2.2 binary, but
+its event tap still had mask 4096 (modifier changes only), despite requesting
+7168 (key-down, key-up, and modifier changes). TCC logs explicitly rejected the
+Input Monitoring record because it contained an older build's code requirement.
+Resetting only `ListenEvent` for `com.jonaraphael.CapsLink` and restarting the
+unchanged app restored mask 7168. The user then confirmed that holding Caps Lock
+lights Dit's tail while the local LED stays off, and releasing restores the
+hollow tail. The new event-mask validation has passed regression tests in source;
+the working installed 0.2.2 binary was retained to preserve its permission grant.
 
 - Accessibility/Input Monitoring prompts and the signed app's permission identity.
 - Built-in and external keyboard interception, absence of the Caps Lock cursor
