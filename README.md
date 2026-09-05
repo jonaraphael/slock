@@ -109,6 +109,9 @@ A few useful things in the menu:
 | **Download Update…** | Appears only when a newer stable release exists. Opens the GitHub release page. |
 | **Quit slock** | Restore the previous keyboard mapping and let Dit clock out. |
 
+When either Mac unpairs, the other returns to **Unpaired** too. If the message is
+missed, the other Mac catches up when both Macs are online and check in.
+
 Hold **Option** in the menu to reveal **This Mac** (your fingerprint), **Test
 Caps Lock Light**, **Diagnostics…**, and the installed version.
 

@@ -3304,9 +3304,12 @@ final class SlockController {
               packet.first == SlockConfig.protocolVersion else { return }
         let protected = Set([peerStore.peerPublicKey, outgoingPairPublicKey, incomingPairPublicKey].compactMap { $0 })
         let senderKey = Data(packet.dropFirst().prefix(32))
+        let formerPeer = !protected.contains(senderKey) && peerStore.entry(for: senderKey) != nil
         // Once a peer has been selected, strangers cannot replace its request,
         // query our profile, or consume public-key operations on the main queue.
-        guard protected.isEmpty || protected.contains(senderKey),
+        // Former peers may handshake to recover a lost/offline unpair, using the
+        // stranger budget and without displacing any selected session.
+        guard protected.isEmpty || protected.contains(senderKey) || formerPeer,
               inboundBudget.allow(selected: protected.contains(senderKey), at: now()) else { return }
         guard let message = wire.open(packet, protecting: protected) else { return }
         let sender = message.senderPublicKey
@@ -3321,6 +3324,18 @@ final class SlockController {
                 }
             }
             guard message.sessionConfirmed else { return }
+            if formerPeer {
+                // A confirmed paired HELLO means this Mac's one-shot UNPAIR was
+                // missed. Recent history survives restarts; pending new pairings
+                // are protected above so their handshakes cannot be revoked here.
+                if message.payload.count == 9 {
+                    // Confirm our side too, in case the peer missed the final
+                    // handshake reply and still cannot authenticate commands.
+                    send(kind: .hello, payload: Data(), to: sender)
+                    send(kind: .unpair, payload: Data(), to: sender)
+                }
+                return
+            }
             if message.newSession, peerStore.peerPublicKey == sender {
                 peerPaused = false
                 consentGeneration = UUID()
@@ -3335,6 +3350,10 @@ final class SlockController {
                 retryOutgoingPTTInvite(force: true)
             }
         }
+
+        // The former-peer exception permits only HELLO while another identity
+        // is selected. A new request still follows normal unpaired approval.
+        guard protected.isEmpty || protected.contains(sender) else { return }
 
         if message.kind == .pairRequest {
             handlePairRequest(from: sender, nickname: PeerProfile.read(message.payload))

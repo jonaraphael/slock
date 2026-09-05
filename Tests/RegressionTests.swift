@@ -94,7 +94,7 @@ private final class TestMac {
         var lightWrites: [(time: TimeInterval, down: Bool)] = []
     }
     let clock = Clock()
-    let defaults = MemoryPreferences()
+    let defaults: MemoryPreferences
     let hid = FakeHID()
     let relay = FakeRelay()
     let capture = FakeCapture()
@@ -102,10 +102,11 @@ private final class TestMac {
     let controller: SlockController
     let peerStore: PeerStore
 
-    init(_ identity: IdentityStore, peer: Data? = nil,
+    init(_ identity: IdentityStore, peer: Data? = nil, defaults: MemoryPreferences = MemoryPreferences(),
          requestMicrophone: @escaping (@escaping (Bool) -> Void) -> Void = { $0(true) }) {
+        self.defaults = defaults
+        if let peer { defaults.set(peer, forKey: "CapsLink.peerPublicKey") }
         peerStore = PeerStore(defaults: defaults)
-        peerStore.peerPublicKey = peer
         let interceptor = CapsInterceptor(testDefaults: defaults, process: hid.run)
         let capture = capture, playback = playback, clock = clock
         controller = SlockController(identity: identity, peerStore: peerStore, capsInterceptor: interceptor,
@@ -492,6 +493,153 @@ enum RegressionTests {
             try check(b.controller.diagnostics().contains("Key messages queued: 2"), "queued key counter missing")
             try check(a.controller.diagnostics().contains("Key messages received: 2"), "received key counter missing")
             try check(a.controller.diagnostics().contains("Last peer key state: up"), "last received key state missing")
+        }
+        test("remote unpair restores unpaired state and stops lights and voice in either direction") {
+            for transmitting in [false, true] {
+                let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+                a.relay.start(); b.relay.start(); try exchange(a, b)
+                a.peerStore.ptt.active = 42; b.peerStore.ptt.active = 42
+                (transmitting ? a : b).key(true)
+                try exchange(a, b)
+                try check(transmitting ? a.capture.running : a.controller.remoteTalking,
+                          "voice did not start before unpair")
+                b.controller.unpair()
+                try exchange(a, b)
+                drainMainQueue()
+                try check(a.controller.peerPublicKey == nil && a.controller.statusText == "Unpaired",
+                          "remote unpair did not restore unpaired mode")
+                try check(!a.controller.peerUnavailable && !a.controller.peerOnline && !a.controller.peerPaused,
+                          "remote unpair retained peer availability")
+                try check(!a.controller.remoteKeyDown && !a.controller.led.isOn && !a.controller.pttEnabled
+                          && !a.controller.localTalking && !a.controller.remoteTalking && !a.capture.running,
+                          "remote unpair retained lights or voice")
+                try check(a.controller.incomingPairPublicKey == nil && a.controller.outgoingPairPublicKey == nil
+                          && !a.controller.incomingPTTInvite && !a.controller.outgoingPTTInvite,
+                          "remote unpair retained pending invitations")
+                let restored = PeerStore(defaults: a.defaults)
+                try check(restored.peerPublicKey == nil && !restored.pttEnabled && restored.recent.count == 1,
+                          "remote unpair did not persist or lost Recent history")
+            }
+        }
+        test("a missed unpair is repaired by the former peer's next heartbeat") {
+            for offline in [false, true] {
+                let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+                a.relay.start(); b.relay.start(); try exchange(a, b)
+                if offline { a.relay.stop() }
+                a.controller.unpair()
+                a.relay.packets.removeAll() // The relay's QoS-0 unpair can be lost.
+                try check(b.controller.peerPublicKey == alice.publicKey, "test delivered the original unpair")
+                if offline { a.relay.start() }
+                a.clock.time += SlockConfig.helloInterval
+                b.clock.time += SlockConfig.helloInterval
+                b.controller.advanceMaintenance()
+                try exchange(a, b)
+                try check(b.controller.peerPublicKey == nil && b.controller.statusText == "Unpaired",
+                          "missed unpair left the other Mac paired (offline: \(offline))")
+            }
+        }
+        test("unpair before a session is confirmed completes when the peer reconnects") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start()
+            a.controller.unpair()
+            a.relay.packets.removeAll()
+            b.relay.start()
+            try exchange(a, b)
+            try check(b.controller.peerPublicKey == nil, "unpair was discarded while waiting for a session")
+        }
+        test("unpair recovery repairs a lost final handshake reply") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start()
+            let aDiscovery = a.relay.packets.removeFirst(), bDiscovery = b.relay.packets.removeFirst()
+            a.relay.packets.removeAll(); b.relay.packets.removeAll()
+            a.relay.onMessage?("", bDiscovery)
+            b.relay.onMessage?("", aDiscovery)
+            a.relay.onMessage?("", b.relay.packets.removeFirst())
+            try check(a.controller.peerOnline && !b.controller.peerOnline, "test confirmed both sides")
+            a.controller.unpair()
+            a.relay.packets.removeAll() // Lose the reply that confirms Alice to Bob.
+            a.clock.time += SlockConfig.helloInterval
+            b.clock.time += SlockConfig.helloInterval
+            b.controller.advanceMaintenance()
+            try exchange(a, b)
+            try check(b.controller.peerPublicKey == nil, "unpair recovery never finished the peer's handshake")
+        }
+        test("missed unpair survives restart and does not disturb a different current peer") {
+            let charlie = try IdentityStore(directory: root.appendingPathComponent("unpair-charlie"))
+            for switchPeer in [false, true] {
+                let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+                a.relay.start(); b.relay.start(); try exchange(a, b)
+                a.relay.stop()
+                a.controller.unpair()
+                let restarted = TestMac(alice, defaults: a.defaults)
+                restarted.relay.start()
+                if switchPeer { restarted.peerStore.peerPublicKey = charlie.publicKey }
+                for _ in 0..<3 {
+                    restarted.clock.time += SlockConfig.helloInterval
+                    b.clock.time += SlockConfig.helloInterval
+                    b.controller.advanceMaintenance()
+                    try exchange(restarted, b)
+                }
+                try check(b.controller.peerPublicKey == nil, "restart or a different peer prevented unpair recovery")
+                try check(restarted.controller.peerPublicKey == (switchPeer ? charlie.publicKey : nil),
+                          "former peer changed the current pairing")
+            }
+        }
+        test("former peers can request a new pairing and still require acceptance") {
+            for formerPeerInitiates in [false, true] {
+                let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+                a.relay.start(); b.relay.start(); try exchange(a, b)
+                a.controller.unpair(); try exchange(a, b)
+                let initiator = formerPeerInitiates ? b : a
+                let recipient = formerPeerInitiates ? a : b
+                try initiator.controller.pair(using: recipient.controller.identity.pairingCode)
+                try exchange(a, b)
+                try check(recipient.controller.incomingPairPublicKey == initiator.controller.identity.publicKey
+                          && recipient.controller.peerPublicKey == nil && initiator.controller.peerPublicKey == nil,
+                          "former peer's new request was rejected or bypassed acceptance")
+                recipient.controller.acceptIncomingPair(expected: initiator.controller.identity.publicKey)
+                try exchange(a, b)
+                try check(a.controller.peerPublicKey == bob.publicKey && b.controller.peerPublicKey == alice.publicKey,
+                          "unpair recovery interrupted an accepted new pairing")
+            }
+        }
+        test("former peer recovery cannot replace another selection or disclose its profile") {
+            let charlie = try IdentityStore(directory: root.appendingPathComponent("unpair-selected-charlie"))
+            for paired in [false, true] {
+                let a = TestMac(alice, peer: bob.publicKey), b = SecureWire(identity: bob)
+                a.relay.start(); _ = try exchange(a, b)
+                a.controller.unpair(); _ = try exchange(a, b)
+                a.peerStore.ownNickname = "Private new name"
+                if paired { a.peerStore.peerPublicKey = charlie.publicKey }
+                else { try a.controller.pair(using: charlie.pairingCode) }
+                a.relay.packets.removeAll()
+                a.clock.time += SlockConfig.helloInterval
+                a.relay.onMessage?("", try b.seal(kind: .hello, payload: Data(repeating: 0, count: 9),
+                                                 to: alice.publicKey))
+                let replies = try exchange(a, b)
+                try check(replies.contains { $0.kind == .unpair }, "former peer did not receive unpair")
+                try check(replies.allSatisfy { $0.kind == .unpair || ($0.kind == .hello && $0.payload.isEmpty) },
+                          "former peer received private state or retried another peer's negotiation")
+                var invitation = Data()
+                invitation.appendUInt64(42)
+                let commands: [(WireKind, Data)] = [
+                    (.pairRequest, PeerProfile.payload("Unwanted name")),
+                    (.profile, PeerProfile.payload("Unwanted name")),
+                    (.keyState, Data([1])), (.captureState, Data([0])),
+                    (.pttInvite, invitation), (.unpair, Data())
+                ]
+                for (kind, payload) in commands {
+                    a.clock.time += 1
+                    a.relay.onMessage?("", try b.seal(kind: kind, payload: payload, to: alice.publicKey))
+                }
+                try check(a.controller.peerPublicKey == (paired ? charlie.publicKey : nil)
+                          && a.controller.outgoingPairPublicKey == (paired ? nil : charlie.publicKey)
+                          && a.controller.incomingPairPublicKey == nil && !a.controller.incomingPTTInvite,
+                          "former peer changed the current selection")
+                try check(a.relay.packets.isEmpty && !a.controller.peerOnline && !a.controller.peerPaused
+                          && !a.controller.remoteKeyDown && !a.controller.led.isOn,
+                          "former peer affected live state or queried a profile")
+            }
         }
         test("a paired peer stays unavailable until connected and confirmed, and recovers after transport loss") {
             let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)

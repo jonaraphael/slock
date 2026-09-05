@@ -165,10 +165,13 @@ public inbox IDs, so an observer cannot derive a duplicate login ID from traffic
 and disconnect the client. The relay can still interrupt or deny delivery. The
 controller limits decryption to 120 packets/second with a 120-packet burst, with
 an additional 4/second, 8-packet burst for strangers. Once an identity is selected
-or paired, other senders are ignored before decryption. Packets arriving after
-disconnect are ignored. New requests cannot replace a pending request; rejecting
-it or explicitly sending a request selects a new peer. Only a new confirmed
-session forces negotiation retries, avoiding amplification from repeated HELLOs.
+or paired, other senders are ignored before decryption, except former accepted
+peers: they may complete a HELLO handshake under the stranger budget to recover a
+missed unpair, but cannot change the current selection or query its profile.
+Packets arriving after disconnect are ignored. New requests cannot replace a
+pending request; rejecting it or explicitly sending a request selects a new peer.
+Only a new confirmed session forces negotiation retries, avoiding amplification
+from repeated HELLOs.
 
 ## Message vocabulary
 
@@ -268,6 +271,15 @@ the peer's self-assigned name, then a private local alias, then the final six
 characters of the canonical pairing code. Unpairing retains history but removes
 active consent. Selecting Recent opens the modal and requires fresh acceptance to
 reconnect; it never silently restores microphone consent.
+
+An authenticated, confirmed nine-byte HELLO from a recent peer that is neither
+current nor pending means that peer still considers this Mac paired. Reply with
+an empty HELLO and UNPAIR, completing both sides of the session before revoking
+the stale pairing. This repairs lost QoS-0 unpairs and offline unpairs, including
+after app restart or switching peers, using the persisted Recent history. Empty
+discovery HELLOs do not trigger UNPAIR, and pending new pairings follow the normal
+acceptance flow. Receiving UNPAIR clears the saved peer, consent, pending requests,
+presence, incoming lights, and voice, and refreshes the menu to unpaired mode.
 
 The reliable cross-version input path is:
 
