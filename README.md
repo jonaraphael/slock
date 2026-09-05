@@ -124,6 +124,14 @@ macOS Caps Lock cursor indicator, or latch the local light on. Your local light
 follows your **partner’s** held key, except during the brief light test.
 Disabling capture restores the Caps Lock state that preceded it.
 
+Light playback prioritizes your rhythm: it buffers about one second, then keeps
+short flashes and short dark gaps at their captured lengths. Holds and pauses of
+one second or longer absorb timing adjustments. This adds eight bytes per key
+transition, with no extra messages or faster heartbeats. Upgrade both Macs for
+the timing improvement in both directions; older peers still work with immediate
+light updates. PTT starts and stops immediately. Network stalls beyond the buffer
+or a busy Mac can still stretch a flash or gap.
+
 slock preserves existing keyboard mappings and restores them when capture stops
 or the app quits. A recovery journal allows the next launch to restore mappings
 after a crash. Force-quitting or losing power cannot run immediate cleanup.

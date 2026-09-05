@@ -28,6 +28,7 @@ enum SlockConfig {
     static let helloInterval: TimeInterval = 10
     static let onlineTimeout: TimeInterval = 25
     static let remoteKeyTimeout: TimeInterval = 2.5
+    static let lightPlaybackDelay: TimeInterval = 1
     static let remoteTalkTimeout: TimeInterval = 5
 }
 
@@ -858,6 +859,76 @@ final class SecureWire {
     }
 }
 
+// MARK: - Key rhythm playback
+
+struct KeyLightEvent {
+    let down: Bool
+    // CGEvent's monotonic timestamp, in nanoseconds. Only differences are used;
+    // the Macs' clocks never need to agree.
+    let timestamp: UInt64
+
+    var payload: Data {
+        var data = Data([down ? UInt8(1) : UInt8(0)])
+        data.appendUInt64(timestamp)
+        return data
+    }
+
+    static func read(_ payload: Data) -> KeyLightEvent? {
+        guard payload.count == 9, let state = payload.first, state <= 1,
+              let timestamp = payload.uint64(at: 1) else { return nil }
+        return KeyLightEvent(down: state == 1, timestamp: timestamp)
+    }
+}
+
+struct KeyLightTimeline {
+    private struct Pending {
+        let event: KeyLightEvent
+        var deadline: TimeInterval
+    }
+
+    private var pending: [Pending] = []
+    private var previousDeadline: TimeInterval?
+    private(set) var latest: KeyLightEvent?
+    var nextDeadline: TimeInterval? { pending.first?.deadline }
+    var pendingCount: Int { pending.count }
+
+    mutating func reset() { self = KeyLightTimeline() }
+
+    // Preserve every subsecond interval, including OFF gaps. Refill the buffer
+    // during longer intervals, where the duration is deliberately flexible.
+    // False means corrupt/discontinuous input or an excessive replay backlog.
+    mutating func append(_ event: KeyLightEvent, receivedAt now: TimeInterval) -> Bool {
+        var deadline = now + SlockConfig.lightPlaybackDelay
+        if let latest, let previousDeadline {
+            guard event.timestamp > latest.timestamp, event.down != latest.down else { return false }
+            let interval = Double(event.timestamp - latest.timestamp) / 1_000_000_000
+            if interval < 1 {
+                deadline = previousDeadline + interval
+            } else {
+                deadline = max(previousDeadline + 1, deadline)
+            }
+        }
+        guard pending.count < 256, deadline - now <= SlockConfig.remoteKeyTimeout else { return false }
+        pending.append(Pending(event: event, deadline: deadline))
+        latest = event
+        previousDeadline = deadline
+        return true
+    }
+
+    mutating func takeDue(at now: TimeInterval) -> KeyLightEvent? {
+        guard let first = pending.first, first.deadline <= now else { return nil }
+        pending.removeFirst()
+        // A late timer/packet must never cause a burst of catch-up flashes.
+        // Shift remaining playback so already queued short intervals survive.
+        let lateness = now - first.deadline
+        if lateness > 0 {
+            for index in pending.indices { pending[index].deadline += lateness }
+            if let previousDeadline { self.previousDeadline = previousDeadline + lateness }
+        }
+        return first.event
+    }
+}
+
 // MARK: - Minimal MQTT 3.1.1 client over secure WebSocket
 
 struct MQTTPacketDecoder {
@@ -1274,20 +1345,20 @@ private var cleanupArg3: UnsafeMutablePointer<CChar>?
 // Tap callbacks must defer expensive controller work, but queued presses must
 // never survive a disabled tap or be delivered to a later capture session.
 final class CapturedKeyDelivery {
-    var handler: ((Bool) -> Void)?
+    var handler: ((Bool, UInt64?) -> Void)?
     private var generation = UUID()
 
-    func enqueue(_ down: Bool) {
+    func enqueue(_ down: Bool, timestamp: UInt64) {
         let generation = generation
         DispatchQueue.main.async { [weak self] in
             guard let self, self.generation == generation else { return }
-            self.handler?(down)
+            self.handler?(down, timestamp)
         }
     }
 
     func release() {
         generation = UUID()
-        handler?(false)
+        handler?(false, nil)
     }
 
     func reset() {
@@ -1370,14 +1441,14 @@ private func capsEventTapCallback(
             let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
             if !isRepeat, !globalCapsIsDown {
                 globalCapsIsDown = true
-                globalCapsDelivery.enqueue(true)
+                globalCapsDelivery.enqueue(true, timestamp: event.timestamp)
             }
             return nil
         }
         if type == .keyUp {
             if globalCapsIsDown {
                 globalCapsIsDown = false
-                globalCapsDelivery.enqueue(false)
+                globalCapsDelivery.enqueue(false, timestamp: event.timestamp)
             }
             return nil
         }
@@ -1425,7 +1496,7 @@ enum KeyboardTapAccess {
 final class CapsInterceptor {
     typealias HIDMap = (src: UInt64, dst: UInt64)
 
-    var onKeyState: ((Bool) -> Void)?
+    var onKeyState: ((Bool, UInt64?) -> Void)?
     var onStatusChange: (() -> Void)?
 
     private(set) var isActive = false
@@ -1590,7 +1661,7 @@ final class CapsInterceptor {
         globalCapsDelivery.release()
         if globalCapsIsDown {
             globalCapsIsDown = false
-            onKeyState?(false)
+            onKeyState?(false, nil)
         }
         if let json = defaults.string(forKey: staleMappingKey) {
             do {
@@ -1639,7 +1710,7 @@ final class CapsInterceptor {
         eventTap = tap
         runLoopSource = source
         globalCapsEventTap = tap
-        globalCapsDelivery.handler = { [weak self] down in self?.onKeyState?(down) }
+        globalCapsDelivery.handler = { [weak self] down, timestamp in self?.onKeyState?(down, timestamp) }
         globalCapsClearLock = { [weak self] in
             guard let self else { return }
             if !self.writeLock(false) {
@@ -2602,7 +2673,11 @@ final class SlockController {
     private let checkAudio: () throws -> Void
     private let requestMicrophone: (@escaping (Bool) -> Void) -> Void
     private let logsStatus: Bool
+    private let now: () -> TimeInterval
     private var timer: Timer?
+    private var lightTimer: DispatchSourceTimer?
+    private var lightTimeline = KeyLightTimeline()
+    private var lightGeneration = UUID()
     private var audioCapture: VoiceCapture?
     private var audioPlayback: VoicePlayback?
 
@@ -2659,7 +2734,8 @@ final class SlockController {
          makeCapture: @escaping () throws -> VoiceCapture = { try AudioCapture() },
          makePlayback: @escaping () throws -> VoicePlayback = { try AudioPlayback() },
          checkAudio: @escaping () throws -> Void = { _ = try OpusEncoder(); _ = try OpusDecoder() },
-         requestMicrophone: @escaping (@escaping (Bool) -> Void) -> Void = SlockController.ensureMicrophonePermission) {
+         requestMicrophone: @escaping (@escaping (Bool) -> Void) -> Void = SlockController.ensureMicrophonePermission,
+         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.identity = identity
         self.peerStore = peerStore
         self.capsInterceptor = capsInterceptor
@@ -2669,6 +2745,7 @@ final class SlockController {
         self.makePlayback = makePlayback
         self.checkAudio = checkAudio
         self.requestMicrophone = requestMicrophone
+        self.now = now
         logsStatus = startServices
         wire = SecureWire(identity: identity)
 
@@ -2682,7 +2759,7 @@ final class SlockController {
             } else {
                 self.peerOnline = false
                 self.lastPeerSeen = nil
-                self.updateRemoteKey(false)
+                self.clearRemoteKey()
                 self.stopLocalTalk()
                 self.stopRemoteTalk(immediate: true)
             }
@@ -2691,8 +2768,8 @@ final class SlockController {
         transport.onMessage = { [weak self] _, packet in
             self?.receive(packet)
         }
-        capsInterceptor.onKeyState = { [weak self] down in
-            self?.handleLocalKey(down)
+        capsInterceptor.onKeyState = { [weak self] down, timestamp in
+            self?.handleLocalKey(down, timestamp: timestamp)
         }
         capsInterceptor.onStatusChange = { [weak self] in
             guard let self else { return }
@@ -2707,6 +2784,7 @@ final class SlockController {
             if self.capsInterceptor.isActive != self.captureWasActive {
                 self.captureWasActive = self.capsInterceptor.isActive
                 if self.captureWasActive { self.led.set(false) }
+                else { self.clearRemoteKey() }
             }
             self.changed()
         }
@@ -2926,9 +3004,7 @@ final class SlockController {
             capsInterceptor.requestPermissionAndStart()
         } else {
             handleLocalKey(false)
-            remoteKeyDown = false
-            lastRemoteKeySeen = nil
-            if capsInterceptor.isActive { led.set(false) }
+            clearRemoteKey()
             capsInterceptor.stop()
         }
         changed()
@@ -2986,7 +3062,7 @@ final class SlockController {
             }
         }
         stopRemoteTalk(immediate: true)
-        if capsInterceptor.isActive { led.set(false) }
+        clearRemoteKey()
         capsInterceptor.stop()
         transport.stop()
     }
@@ -3018,6 +3094,8 @@ final class SlockController {
             "Key messages received: \(receivedKeyMessages)",
             "Peer HELLOs received: \(receivedPeerHellos)",
             "Last peer key state: \(lastPeerKeyState.map { $0 ? "down" : "up" } ?? "none")",
+            "Light playback: \(lightTimeline.latest == nil ? "Immediate state sync" : "Timestamped rhythm (1 s buffer)")",
+            "Pending light transitions: \(lightTimeline.pendingCount)",
             "System Caps Lock on: \(CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift))",
             "Caps error: \(capsInterceptor.lastError ?? "none")",
             "LED mode: \(led.mode.rawValue)",
@@ -3036,7 +3114,7 @@ final class SlockController {
 
         if message.kind == .hello {
             if message.needsHelloReply {
-                let now = ProcessInfo.processInfo.systemUptime
+                let now = now()
                 if now - (lastHandshakeReply[sender] ?? -10) >= 1 {
                     if lastHandshakeReply.count >= 32 { lastHandshakeReply.removeAll() }
                     lastHandshakeReply[sender] = now
@@ -3050,7 +3128,7 @@ final class SlockController {
                 // An outgoing invitation is retried only after this fresh handshake.
                 stopLocalTalk()
                 stopRemoteTalk(immediate: true)
-                updateRemoteKey(false)
+                clearRemoteKey()
             }
             retryOutgoingPairRequest(force: true)
             retryOutgoingPTTInvite(force: true)
@@ -3100,14 +3178,19 @@ final class SlockController {
             receivedPeerHellos += 1
             if message.payload.count == 9, let revoked = message.payload.uint64(at: 1) {
                 applyPTTRevocation(revoked)
-                updateRemoteKey(message.payload[0] != 0)
+                receiveRemoteKeySnapshot(message.payload[0] != 0)
             }
         case .keyState:
-            markPeerSeen()
-            if let value = message.payload.first {
+            if let event = KeyLightEvent.read(message.payload) {
+                markPeerSeen()
                 receivedKeyMessages += 1
-                lastPeerKeyState = value != 0
-                updateRemoteKey(value != 0)
+                lastPeerKeyState = event.down
+                receiveRemoteKeyEvent(event)
+            } else if message.payload.count == 1, let value = message.payload.first, value <= 1 {
+                markPeerSeen()
+                receivedKeyMessages += 1
+                lastPeerKeyState = value == 1
+                receiveRemoteKeySnapshot(value == 1)
             }
         case .profile:
             break
@@ -3162,7 +3245,7 @@ final class SlockController {
         changed()
     }
 
-    private func handleLocalKey(_ down: Bool) {
+    private func handleLocalKey(_ down: Bool, timestamp: UInt64? = nil) {
         guard !down || capsInterceptor.isActive else { return }
         guard localKeyDown != down else { return }
         localKeyDown = down
@@ -3172,7 +3255,9 @@ final class SlockController {
         // changed its own Caps Lock LED before the remapped event arrived.
         if capsInterceptor.isActive { led.set(remoteKeyDown) }
         if let peer = peerStore.peerPublicKey {
-            send(kind: .keyState, payload: Data([down ? UInt8(1) : UInt8(0)]), to: peer)
+            let payload = timestamp.map { KeyLightEvent(down: down, timestamp: $0).payload }
+                ?? Data([down ? UInt8(1) : UInt8(0)])
+            send(kind: .keyState, payload: payload, to: peer)
         }
         if down {
             if peerStore.pttEnabled, peerOnline, transportState == .connected, !remoteTalking {
@@ -3185,16 +3270,82 @@ final class SlockController {
         changed()
     }
 
-    private func updateRemoteKey(_ down: Bool) {
-        guard capsInterceptor.isActive else {
-            remoteKeyDown = false
-            lastRemoteKeySeen = nil
-            return
-        }
+    private func applyRemoteKey(_ down: Bool) {
+        guard capsInterceptor.isActive else { return }
         remoteKeyDown = down
-        lastRemoteKeySeen = down ? ProcessInfo.processInfo.systemUptime : nil
         led.set(down)
     }
+
+    private func cancelLightPlayback() {
+        lightGeneration = UUID()
+        lightTimer?.cancel()
+        lightTimer = nil
+        lightTimeline.reset()
+    }
+
+    private func clearRemoteKey() {
+        cancelLightPlayback()
+        remoteKeyDown = false
+        lastRemoteKeySeen = nil
+        if capsInterceptor.isActive { led.set(false) }
+    }
+
+    private func receiveRemoteKeySnapshot(_ down: Bool) {
+        guard capsInterceptor.isActive else { return }
+        lastRemoteKeySeen = now()
+        // HELLOs and one-byte held-key refreshes carry no transition timing.
+        // A matching snapshot renews the lease without skipping buffered edges.
+        if let latest = lightTimeline.latest, latest.down == down { return }
+        cancelLightPlayback()
+        applyRemoteKey(down)
+    }
+
+    private func receiveRemoteKeyEvent(_ event: KeyLightEvent) {
+        guard capsInterceptor.isActive else { return }
+        let receivedAt = now()
+        lastRemoteKeySeen = receivedAt
+        guard lightTimeline.append(event, receivedAt: receivedAt) else {
+            clearRemoteKey()
+            return
+        }
+        scheduleLightPlayback()
+    }
+
+    private func scheduleLightPlayback() {
+        lightTimer?.cancel()
+        lightTimer = nil
+        lightGeneration = UUID()
+        guard let deadline = lightTimeline.nextDeadline else { return }
+        let generation = lightGeneration
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: .main)
+        timer.schedule(deadline: .now() + max(0, deadline - now()), leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in
+            guard let self, self.lightGeneration == generation else { return }
+            self.playDueLightEvent()
+        }
+        lightTimer = timer
+        timer.resume()
+    }
+
+    private func playDueLightEvent() {
+        let time = now()
+        guard capsInterceptor.isActive, let lastRemoteKeySeen,
+              time - lastRemoteKeySeen <= SlockConfig.remoteKeyTimeout else {
+            clearRemoteKey()
+            changed()
+            return
+        }
+        if let event = lightTimeline.takeDue(at: time) {
+            applyRemoteKey(event.down)
+            changed()
+        }
+        scheduleLightPlayback()
+    }
+
+    #if CAPSLINK_TESTING
+    func advanceLightPlayback() { playDueLightEvent() }
+    func advanceMaintenance() { tick() }
+    #endif
 
     private func startLocalTalk() {
         guard !localTalking,
@@ -3290,7 +3441,7 @@ final class SlockController {
             remoteTalkID = talkID
             remoteTalking = true
             remoteTalkEnding = false
-            lastRemoteTalkSeen = ProcessInfo.processInfo.systemUptime
+            lastRemoteTalkSeen = now()
             playback.beginTalk()
         } catch {
             lastError = "Could not start PTT playback: \(error.localizedDescription)"
@@ -3303,7 +3454,7 @@ final class SlockController {
               talkID == remoteTalkID,
               payload.count > 8 else { return }
         markPeerSeen()
-        lastRemoteTalkSeen = ProcessInfo.processInfo.systemUptime
+        lastRemoteTalkSeen = now()
         audioPlayback?.receiveBatch(Data(payload.dropFirst(8)))
     }
 
@@ -3339,7 +3490,7 @@ final class SlockController {
 
     private func retryOutgoingPairRequest(force: Bool = false) {
         guard transportState == .connected, let target = outgoingPairPublicKey else { return }
-        let now = ProcessInfo.processInfo.systemUptime
+        let now = now()
         guard force || (now - lastPairRequestSent) >= 10 else { return }
         lastPairRequestSent = now
         send(kind: .pairRequest, payload: PeerProfile.payload(peerStore.ownNickname), to: target)
@@ -3349,7 +3500,7 @@ final class SlockController {
         guard transportState == .connected,
               outgoingPTTInvite,
               let peer = peerStore.peerPublicKey else { return }
-        let now = ProcessInfo.processInfo.systemUptime
+        let now = now()
         guard force || (now - lastPTTInviteSent) >= 10 else { return }
         lastPTTInviteSent = now
         if let invitation = peerStore.ptt.outgoing { sendPTT(.pttInvite, id: invitation, to: peer) }
@@ -3357,7 +3508,7 @@ final class SlockController {
 
     private func sendHello(force: Bool = false) {
         guard transportState == .connected, let peer = peerStore.peerPublicKey else { return }
-        let now = ProcessInfo.processInfo.systemUptime
+        let now = now()
         guard force || (now - lastHelloSent) >= SlockConfig.helloInterval else { return }
         lastHelloSent = now
         send(kind: .hello, payload: helloPayload(for: peer), to: peer)
@@ -3403,7 +3554,7 @@ final class SlockController {
     }
 
     private func tick() {
-        let now = ProcessInfo.processInfo.systemUptime
+        let now = now()
         sendHello()
         retryOutgoingPairRequest()
         retryOutgoingPTTInvite()
@@ -3412,9 +3563,9 @@ final class SlockController {
             send(kind: .keyState, payload: Data([UInt8(1)]), to: peer)
         }
 
-        if remoteKeyDown, let last = lastRemoteKeySeen,
+        if let last = lastRemoteKeySeen,
            (now - last) > SlockConfig.remoteKeyTimeout {
-            updateRemoteKey(false)
+            clearRemoteKey()
         }
 
         if remoteTalking, let last = lastRemoteTalkSeen,
@@ -3429,7 +3580,7 @@ final class SlockController {
             peerOnline = false
         }
         if wasOnline && !peerOnline {
-            updateRemoteKey(false)
+            clearRemoteKey()
             stopRemoteTalk(immediate: true)
             stopLocalTalk()
         }
@@ -3437,14 +3588,14 @@ final class SlockController {
     }
 
     private func markPeerSeen() {
-        lastPeerSeen = ProcessInfo.processInfo.systemUptime
+        lastPeerSeen = now()
         peerOnline = true
     }
 
     private func clearPeer() {
         stopLocalTalk()
         stopRemoteTalk(immediate: true)
-        updateRemoteKey(false)
+        clearRemoteKey()
         peerStore.peerPublicKey = nil
         incomingPairPublicKey = nil
         outgoingPairPublicKey = nil

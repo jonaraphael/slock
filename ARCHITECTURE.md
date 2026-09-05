@@ -158,7 +158,7 @@ secrecy if a private identity key is later compromised.
 ```text
 PAIR_REQUEST / PAIR_ACCEPT / PAIR_REJECT
 HELLO
-KEY_STATE(up|down)
+KEY_STATE(up|down [, capture_timestamp_ns])
 PTT_INVITE(invitation_id) / PTT_ACCEPT(invitation_id) / PTT_REJECT(invitation_id)
 PTT_DISABLE(agreement_id)
 UNPAIR
@@ -177,10 +177,36 @@ already consented, and retry that ID until acknowledged. Declined invitations ar
 remembered and rejected again if the sender retries after a lost response. Menu
 actions retain the invitation ID that was displayed.
 
-A held key is refreshed once per second. The light expires after 2.5 seconds and
+A physical transition carries its original `CGEvent` timestamp, captured before
+deferred controller work: one state byte followed by an eight-byte big-endian
+nanosecond timestamp. Only timestamp differences matter; the two clocks need no
+synchronization. The receiver starts playback with a one-second buffer and
+preserves each source interval below one second, including dark gaps. Intervals
+of one second or more refill the buffer, with a minimum playback duration of one
+second, so longer holds and pauses absorb drift. A one-shot dispatch timer with
+one-millisecond leeway drives each edge, independently of the maintenance tick.
+Late timer wakeups shift the remaining queue instead of compressing queued pulses.
+Delays beyond the buffer and hardware/OS scheduling stalls can still stretch an
+interval that has already started; the light is not a hard real-time output.
+
+This adds eight bytes per physical transition and no packets. Older protocol-2
+receivers read the leading state byte immediately; new receivers accept legacy
+one-byte key states immediately. Upgrade both Macs to preserve rhythm in both
+directions. Held-key refreshes stay one byte and HELLO stays unchanged. Matching
+snapshots renew freshness without jumping ahead of buffered edges; a conflicting
+snapshot clears the queue and resynchronizes immediately. PTT still follows the
+local key immediately and does not use the LED playback buffer.
+
+The replay queue is capped at 256 edges and 2.5 seconds of scheduled lead.
+Discontinuous timestamps, repeated transition states, or excess backlog clear
+the queue and light. Disconnect, a fresh peer session, capture stop, unpairing,
+shutdown, and stale input also cancel pending playback, preventing delayed relights.
+
+A held key is refreshed once per second. Key input expires after 2.5 seconds and
 presence after 25 seconds, checked by a one-second timer in common run-loop modes
 (so expiry can occur up to one additional second later). All elapsed-time checks
-use system uptime. Transport failure releases audio and remote key state immediately.
+use system uptime. Each playback callback also checks freshness before lighting.
+Transport failure releases audio and remote key state immediately.
 
 MQTT validates subscription acknowledgement, limits packet size and queued work,
 serializes writes, and reconnects on a stalled handshake, send queue, or missing
@@ -346,14 +372,18 @@ on encrypted_packet(packet):
     switch message:
         PAIR_REQUEST: expose Accept / Reject menu items
         PAIR_ACCEPT: persist peer
-        HELLO: mark online and resynchronize remote key
-        KEY_STATE: set physical LED and refresh watchdog
+        HELLO: mark online; refresh matching state or resynchronize a mismatch
+        KEY_STATE: refresh watchdog; queue timestamped edges or apply legacy state
         PTT_INVITE: expose Accept / Reject menu items
         PTT_ACCEPT: enable PTT
         TALK_START: arbitrate floor; initialize playback
         AUDIO: decode packet batch and enqueue audio
         TALK_STOP: drain playback and release floor
         UNPAIR: clear peer, PTT, audio, and LED
+
+on light_playback_deadline:
+    if input is stale: cancel pending edges and turn LED off
+    otherwise: apply the next edge and schedule the following interval
 
 once_per_second:
     if local key is held:

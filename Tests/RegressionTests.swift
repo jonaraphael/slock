@@ -82,6 +82,16 @@ private final class FakeLEDOutput: CapsLEDOutput {
 }
 
 private final class TestMac {
+    final class Clock {
+        var usesSystemTime = false
+        private var fixedTime: TimeInterval = 100
+        var time: TimeInterval {
+            get { usesSystemTime ? ProcessInfo.processInfo.systemUptime : fixedTime }
+            set { fixedTime = newValue }
+        }
+        var lightWrites: [(time: TimeInterval, down: Bool)] = []
+    }
+    let clock = Clock()
     let defaults = MemoryPreferences()
     let hid = FakeHID()
     let relay = FakeRelay()
@@ -95,16 +105,23 @@ private final class TestMac {
         peerStore = PeerStore(defaults: defaults)
         peerStore.peerPublicKey = peer
         let interceptor = CapsInterceptor(testDefaults: defaults, process: hid.run)
-        let capture = capture, playback = playback
+        let capture = capture, playback = playback, clock = clock
         controller = SlockController(identity: identity, peerStore: peerStore, capsInterceptor: interceptor,
-            led: CapsLED(directWriter: { _ in true }), transport: relay,
+            led: CapsLED(directWriter: { down in
+                clock.lightWrites.append((clock.time, down))
+                return true
+            }), transport: relay,
             makeCapture: { capture }, makePlayback: { playback }, checkAudio: {},
-            requestMicrophone: requestMicrophone)
+            requestMicrophone: requestMicrophone, now: { clock.time })
         interceptor.start()
     }
 
     deinit { controller.shutdown() }
-    func key(_ down: Bool) { controller.capsInterceptor.onKeyState?(down) }
+    func key(_ down: Bool, timestamp: UInt64? = nil) { controller.capsInterceptor.onKeyState?(down, timestamp) }
+    func advance(to time: TimeInterval) {
+        clock.time = time
+        controller.advanceLightPlayback()
+    }
 }
 
 private func exchange(_ a: TestMac, _ b: TestMac) throws {
@@ -329,6 +346,114 @@ enum RegressionTests {
             try check(b.controller.diagnostics().contains("Key messages queued: 2"), "queued key counter missing")
             try check(a.controller.diagnostics().contains("Key messages received: 2"), "received key counter missing")
             try check(a.controller.diagnostics().contains("Last peer key state: up"), "last received key state missing")
+        }
+        test("timestamped controllers preserve short ON and OFF lengths despite delivery jitter") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            b.key(true, timestamp: 10_000_000_000); try exchange(a, b)
+            try check(!a.controller.led.isOn, "press skipped the rhythm buffer")
+            a.clock.time = 100.7
+            b.key(false, timestamp: 10_100_000_000); try exchange(a, b)
+            a.clock.time = 100.71
+            b.key(true, timestamp: 10_300_000_000); try exchange(a, b)
+            b.key(false, timestamp: 10_350_000_000); try exchange(a, b)
+            a.advance(to: 101)
+            try check(a.controller.led.isOn && !b.controller.led.isOn, "wrong keyboard or missing first flash")
+            a.advance(to: 101.099)
+            try check(a.controller.led.isOn, "100 ms flash ended early")
+            a.advance(to: 101.1)
+            try check(!a.controller.led.isOn, "100 ms flash followed the 700 ms packet gap")
+            a.advance(to: 101.299)
+            try check(!a.controller.led.isOn, "200 ms OFF gap was compressed")
+            a.advance(to: 101.3)
+            try check(a.controller.led.isOn, "second flash missed its deadline")
+            a.advance(to: 101.35)
+            try check(!a.controller.led.isOn, "50 ms flash did not end")
+            try check(b.controller.diagnostics().contains("Key messages queued: 4"), "timing added network messages")
+            try check(a.controller.diagnostics().contains("Pending light transitions: 0"), "playback queue did not drain")
+        }
+        test("held-key refreshes and HELLOs do not jump buffered edges") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            b.key(true, timestamp: 1_000_000_000); try exchange(a, b)
+            b.controller.advanceMaintenance(); try exchange(a, b)
+            try check(!a.controller.led.isOn, "held refresh bypassed the buffer")
+            a.advance(to: 101)
+            try check(a.controller.led.isOn, "refresh erased the pending press")
+            // Long holds remain lit through the original one-byte refresh cadence.
+            a.clock.time = 102
+            b.controller.advanceMaintenance(); try exchange(a, b)
+            a.clock.time = 103
+            a.controller.advanceMaintenance()
+            try check(a.controller.led.isOn, "fresh long hold expired")
+            b.key(false, timestamp: 5_000_000_000); try exchange(a, b)
+            b.relay.start(); try exchange(a, b)
+            try check(a.controller.led.isOn, "HELLO jumped the buffered release")
+            a.advance(to: 104)
+            try check(!a.controller.led.isOn, "long hold did not release")
+        }
+        test("disconnect, pause, unpair, shutdown and expiry cancel pending light playback") {
+            for action in 0..<5 {
+                let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+                a.relay.start(); b.relay.start(); try exchange(a, b)
+                b.key(true, timestamp: 1_000_000_000); try exchange(a, b)
+                switch action {
+                case 0: a.relay.onStateChange?(.error("offline"))
+                case 1: a.controller.setCaptureEnabled(false)
+                case 2: a.controller.unpair()
+                case 3: a.controller.shutdown()
+                default: a.clock.time = 103; a.controller.advanceMaintenance()
+                }
+                a.advance(to: 104)
+                try check(!a.controller.remoteKeyDown && !a.controller.led.isOn, "cancelled press replayed: \(action)")
+                try check(a.controller.diagnostics().contains("Pending light transitions: 0"), "cancelled queue survived: \(action)")
+            }
+        }
+        test("legacy releases still cancel a buffered press immediately") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            b.key(true, timestamp: 1_000_000_000); try exchange(a, b)
+            b.key(false); try exchange(a, b)
+            a.advance(to: 101)
+            try check(!a.controller.led.isOn && !a.controller.remoteKeyDown, "emergency release left a queued press")
+        }
+        test("light freshness is measured at receipt, not delayed playback") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            b.key(true, timestamp: 1_000_000_000); try exchange(a, b)
+            a.advance(to: 101)
+            try check(a.controller.led.isOn, "buffered press did not play")
+            a.clock.time = 102.6
+            a.controller.advanceMaintenance()
+            try check(!a.controller.led.isOn, "playback extended the stale-key lease")
+        }
+        test("a fresh peer session cannot replay the old session's buffered light") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            b.key(true, timestamp: 1_000_000_000); try exchange(a, b)
+            let restarted = TestMac(bob, peer: alice.publicKey)
+            // The handshake response throttle permits the new boot after a second.
+            a.clock.time = 101.01
+            restarted.relay.start(); try exchange(a, restarted)
+            a.advance(to: 101.01)
+            try check(!a.controller.led.isOn, "old session's press survived the fresh handshake")
+            try check(a.controller.diagnostics().contains("Pending light transitions: 0"), "old session kept its queue")
+        }
+        test("the real playback timer delivers buffered edges without a maintenance tick") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.clock.usesSystemTime = true; b.clock.usesSystemTime = true
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            a.clock.lightWrites.removeAll()
+            let started = a.clock.time
+            b.key(true, timestamp: 1_000_000_000)
+            b.key(false, timestamp: 1_060_000_000)
+            try exchange(a, b)
+            let limit = Date().addingTimeInterval(3)
+            while a.clock.lightWrites.count < 2, Date() < limit { drainMainQueue() }
+            try check(a.clock.lightWrites.map(\.down) == [true, false], "timer failed to emit the pulse")
+            let writes = a.clock.lightWrites
+            try check(writes[0].time - started >= 0.999, "timer skipped the playback buffer")
+            try check(writes[1].time - writes[0].time >= 0.059, "timer compressed the 60 ms pulse")
         }
         test("simultaneous PTT holds choose one speaker and transfer only after playback drains") {
             let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
@@ -708,18 +833,20 @@ enum RegressionTests {
         test("queued key presses cannot survive a tap release or capture restart") {
             let delivery = CapturedKeyDelivery()
             var states: [Bool] = []
-            delivery.handler = { states.append($0) }
-            delivery.enqueue(true)
+            var timestamps: [UInt64?] = []
+            delivery.handler = { states.append($0); timestamps.append($1) }
+            delivery.enqueue(true, timestamp: 10)
             delivery.release()
             drainMainQueue()
             try check(states == [false], "old press relatched after tap disable")
-            delivery.enqueue(true)
+            delivery.enqueue(true, timestamp: 20)
             delivery.reset()
-            delivery.handler = { states.append($0) }
+            delivery.handler = { states.append($0); timestamps.append($1) }
             drainMainQueue()
             try check(states == [false], "old press reached the new capture session")
-            delivery.enqueue(true); delivery.enqueue(false); drainMainQueue()
+            delivery.enqueue(true, timestamp: 100); delivery.enqueue(false, timestamp: 250); drainMainQueue()
             try check(states == [false, true, false], "valid key transitions lost their ordering")
+            try check(timestamps == [nil, 100, 250], "queue delivery replaced event timestamps")
         }
         test("identity persists with private permissions and corrupt keys are not replaced") {
             let location = root.appendingPathComponent("alice")
