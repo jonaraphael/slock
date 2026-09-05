@@ -18,7 +18,7 @@ enum SlockConfig {
     static let appName = "slock"
     // Keep identity keys and the single-instance lock in their existing location.
     static let storageName = "CapsLink"
-    static let appVersion = "0.2.6"
+    static let appVersion = "0.2.7"
     static let protocolVersion: UInt8 = 2
     static let brokerURL = URL(string: "wss://test.mosquitto.org:8081/mqtt")!
     static let topicPrefix = "capslink/v2/inbox/"
@@ -475,9 +475,47 @@ extension UserDefaults: Preferences {}
 struct PeerProfile: Codable {
     let nickname: String
 
+    static let maximumCharacters = 48
+    static let maximumScalars = 192
+
+    // Peer-supplied names are shown in menus and confirmation dialogs. Remove
+    // everything that can reorder, hide or split displayed text: controls,
+    // format characters (bidirectional overrides, zero-width characters), line
+    // and paragraph separators, and private/surrogate code points. Collapse
+    // every run of whitespace so a name cannot imitate a menu separator. Only
+    // the joiners used by emoji and some scripts are kept, and a name with no
+    // visible character is treated as empty. Names are still not verification.
     static func clean(_ value: String) -> String {
-        String(value.components(separatedBy: .controlCharacters).joined(separator: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines).prefix(48))
+        var output = String.UnicodeScalarView()
+        var pendingSpace = false
+        var visible = false
+        for scalar in value.unicodeScalars {
+            switch scalar.properties.generalCategory {
+            case .control, .format, .lineSeparator, .paragraphSeparator, .spaceSeparator:
+                let joiner = scalar == "\u{200C}" || scalar == "\u{200D}"
+                if joiner, visible { output.append(scalar) } else { pendingSpace = visible }
+            case .surrogate, .privateUse:
+                pendingSpace = visible
+            case .nonspacingMark, .enclosingMark, .spacingMark:
+                guard visible else { continue }
+                fallthrough
+            default:
+                if pendingSpace { output.append(" "); pendingSpace = false }
+                output.append(scalar)
+                visible = true
+            }
+        }
+        guard visible else { return "" }
+        var cleaned = String(String(output).prefix(maximumCharacters))
+        if cleaned.unicodeScalars.count > maximumScalars {
+            cleaned = String(String.UnicodeScalarView(cleaned.unicodeScalars.prefix(maximumScalars)))
+        }
+        // Trimming a joiner or mark left behind by truncation keeps the tail visible.
+        while let last = cleaned.unicodeScalars.last,
+              last == "\u{200C}" || last == "\u{200D}" || last.properties.generalCategory == .spaceSeparator {
+            cleaned.unicodeScalars.removeLast()
+        }
+        return cleaned
     }
 
     static func payload(_ nickname: String) -> Data {
@@ -554,7 +592,11 @@ final class PeerStore {
 
     init(defaults: Preferences = UserDefaults.standard) {
         self.defaults = defaults
-        peerPublicKey = defaults.data(forKey: peerKey)
+        // Only a well-formed X25519 public key can be the paired peer; anything
+        // else in preferences is treated as unpaired rather than sent to the relay.
+        peerPublicKey = defaults.data(forKey: peerKey).flatMap {
+            $0.count == 32 && (try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: $0)) != nil ? $0 : nil
+        }
         ptt = PTTConsent(
             active: defaults.string(forKey: "CapsLink.pttAgreement").flatMap(UInt64.init),
             outgoing: defaults.string(forKey: "CapsLink.pttOutgoing").flatMap(UInt64.init),
@@ -564,7 +606,10 @@ final class PeerStore {
         if let data = defaults.data(forKey: "slock.recentPeers"),
            let saved = try? JSONDecoder().decode([RecentPeer].self, from: data) {
             var seen = Set<Data>()
-            recent = saved.filter { $0.publicKey.count == 32 && seen.insert($0.publicKey).inserted }.map {
+            recent = saved.filter {
+                $0.publicKey.count == 32 && (try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: $0.publicKey)) != nil
+                    && seen.insert($0.publicKey).inserted
+            }.map {
                 RecentPeer(publicKey: $0.publicKey, ownNickname: PeerProfile.clean($0.ownNickname),
                            localNickname: PeerProfile.clean($0.localNickname))
             }
@@ -2169,6 +2214,28 @@ func audioError(_ message: String) -> NSError {
     appError("slock.Audio", message)
 }
 
+// Only aggregate levels are retained, never microphone samples or recordings.
+struct AudioSignalLevel {
+    private(set) var sampleCount = 0
+    private(set) var peak: Float = 0
+
+    mutating func observe(_ samples: UnsafeBufferPointer<Int16>) {
+        sampleCount += samples.count
+        for sample in samples { peak = max(peak, abs(Float(sample)) / 32_768) }
+    }
+
+    mutating func observe(_ samples: UnsafeBufferPointer<Float>) {
+        sampleCount += samples.count
+        for sample in samples where sample.isFinite { peak = max(peak, abs(sample)) }
+    }
+
+    var summary: String {
+        guard sampleCount > 0 else { return "no PCM samples" }
+        guard peak > 0 else { return "\(sampleCount) samples, digital silence" }
+        return "\(sampleCount) samples, peak \(String(format: "%.1f", 20 * log10(peak))) dBFS"
+    }
+}
+
 final class OpusEncoder {
     private let inputFormat: AVAudioFormat
     private let outputFormat: AVAudioFormat
@@ -2330,16 +2397,26 @@ final class OpusDecoder {
 
 protocol VoiceCapture: AnyObject {
     var onError: ((String) -> Void)? { get set }
+    var diagnostics: String { get }
     func start(onBatch: @escaping (Data) -> Void) throws
     func stop()
 }
 
 protocol VoicePlayback: AnyObject {
     var onError: ((String) -> Void)? { get set }
+    var diagnostics: String { get }
     func beginTalk()
     func receiveBatch(_ batch: Data)
     func endTalk(completion: @escaping () -> Void)
     func stopImmediately()
+}
+
+extension VoiceCapture {
+    var diagnostics: String { "Capture diagnostics unavailable" }
+}
+
+extension VoicePlayback {
+    var diagnostics: String { "Playback diagnostics unavailable" }
 }
 
 final class AudioCapture: VoiceCapture {
@@ -2358,6 +2435,16 @@ final class AudioCapture: VoiceCapture {
     private var generation = UUID()
     private let pendingInput = DispatchSemaphore(value: 8)
     private var configurationObserver: NSObjectProtocol?
+    private var signalLevel = AudioSignalLevel()
+    private var generatedBatches = 0
+    private var inputFormatDescription = "not started"
+
+    var diagnostics: String {
+        queue.sync {
+            "Capture (latest talk): input \(inputFormatDescription); \(signalLevel.summary); "
+                + "batches generated \(generatedBatches); engine running \(engine.isRunning)"
+        }
+    }
 
     init() throws {
         guard let target = AVAudioFormat(
@@ -2398,6 +2485,9 @@ final class AudioCapture: VoiceCapture {
         queue.sync {
             self.generation = generation
             self.converter = converter
+            signalLevel = AudioSignalLevel()
+            generatedBatches = 0
+            inputFormatDescription = "\(hardwareFormat.channelCount) ch @ \(hardwareFormat.sampleRate) Hz"
             callback = onBatch
             pcmAccumulator.removeAll(keepingCapacity: true)
             packetBatch.removeAll(keepingCapacity: true)
@@ -2466,6 +2556,7 @@ final class AudioCapture: VoiceCapture {
         guard status != .error, output.frameLength > 0,
               let samples = output.int16ChannelData?[0] else { return }
 
+        signalLevel.observe(UnsafeBufferPointer(start: samples, count: Int(output.frameLength)))
         pcmAccumulator.append(
             Data(bytes: samples, count: Int(output.frameLength) * MemoryLayout<Int16>.size)
         )
@@ -2489,6 +2580,7 @@ final class AudioCapture: VoiceCapture {
     private func flushBatch() {
         guard batchCount > 0, let callback else { return }
         let batch = packetBatch
+        generatedBatches += 1
         packetBatch.removeAll(keepingCapacity: true)
         batchCount = 0
         DispatchQueue.main.async { callback(batch) }
@@ -2534,6 +2626,17 @@ final class AudioPlayback: VoicePlayback {
     private var generation = UUID()
     private var onDrain: (() -> Void)?
     private let pendingBatches = DispatchSemaphore(value: 8)
+    private var signalLevel = AudioSignalLevel()
+    private var decodedPackets = 0
+    private var playedBuffers = 0
+
+    var diagnostics: String {
+        queue.sync {
+            "Playback (latest talk): \(signalLevel.summary); packets decoded \(decodedPackets); "
+                + "buffers played \(playedBuffers); queued \(queuedBuffers); "
+                + "engine running \(engine.isRunning); player playing \(player.isPlaying)"
+        }
+    }
 
     init() throws {
         decoder = try OpusDecoder()
@@ -2550,6 +2653,9 @@ final class AudioPlayback: VoicePlayback {
             self.decoder.reset()
             self.queuedBuffers = 0
             self.started = false
+            self.signalLevel = AudioSignalLevel()
+            self.decodedPackets = 0
+            self.playedBuffers = 0
             _ = self.ensureEngine()
         }
     }
@@ -2574,12 +2680,17 @@ final class AudioPlayback: VoicePlayback {
                 do {
                     guard self.queuedBuffers < 24 else { break }
                     let pcm = try self.decoder.decode(packet)
+                    self.decodedPackets += 1
+                    if let samples = pcm.floatChannelData?[0] {
+                        self.signalLevel.observe(UnsafeBufferPointer(start: samples, count: Int(pcm.frameLength)))
+                    }
                     let generation = self.generation
                     self.player.scheduleBuffer(pcm, completionCallbackType: .dataPlayedBack) { [weak self] _ in
                         guard let self else { return }
                         self.queue.async {
                             guard self.generation == generation else { return }
                             self.queuedBuffers -= 1
+                            self.playedBuffers += 1
                             self.finishDrainIfNeeded()
                         }
                     }
@@ -2702,11 +2813,17 @@ final class SlockController {
     private var captureWasActive = false
     private var lastLoggedCaptureStatus: String?
     private var lastLoggedLinkStatus: String?
+    private var lastLoggedVoiceStatus: String?
     private var localPressCount = 0
     private var sentKeyMessages = 0
     private var receivedKeyMessages = 0
     private var receivedPeerHellos = 0
     private var lastPeerKeyState: Bool?
+    private var sentAudioBatches = 0
+    private var receivedAudioBatches = 0
+    private var acceptedAudioBatches = 0
+    private var receivedTalkStarts = 0
+    private var lastAudioError: String?
     private var lastHandshakeReply: [Data: TimeInterval] = [:]
     fileprivate(set) var lastError: String?
 
@@ -3050,7 +3167,7 @@ final class SlockController {
             try checkAudio()
             return true
         } catch {
-            lastError = "PTT is unavailable: \(error.localizedDescription)"
+            recordAudioError("PTT is unavailable: \(error.localizedDescription)")
             changed()
             return false
         }
@@ -3100,6 +3217,7 @@ final class SlockController {
 
     func clearError() {
         lastError = nil
+        lastAudioError = nil
         changed()
     }
 
@@ -3127,6 +3245,14 @@ final class SlockController {
     }
 
     func diagnostics() -> String {
+        let microphonePermission: String
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized: microphonePermission = "authorized"
+        case .denied: microphonePermission = "denied"
+        case .restricted: microphonePermission = "restricted"
+        case .notDetermined: microphonePermission = "not requested"
+        @unknown default: microphonePermission = "unknown"
+        }
         let architecture: String
         #if arch(arm64)
         architecture = "arm64"
@@ -3143,6 +3269,12 @@ final class SlockController {
             "Peer online: \(peerOnline)",
             "Peer paused: \(peerPaused)",
             "PTT enabled: \(pttEnabled)",
+            "Microphone permission: \(microphonePermission)",
+            "Voice state: local key \(localKeyDown ? "down" : "up"), transmitting \(localTalking), receiving \(remoteTalking), draining \(remoteTalkEnding)",
+            "Voice totals (this launch): talk starts received \(receivedTalkStarts), audio batches queued \(sentAudioBatches), received \(receivedAudioBatches), accepted \(acceptedAudioBatches)",
+            audioCapture?.diagnostics ?? "Capture: not created",
+            audioPlayback?.diagnostics ?? "Playback: not created",
+            "Last audio error: \(lastAudioError ?? "none")",
             "Accessibility trusted: \(capsInterceptor.permissionGranted)",
             "Input Monitoring allowed: \(CGPreflightListenEventAccess())",
             "Caps capture requested: \(capsInterceptor.isRequested)",
@@ -3446,7 +3578,7 @@ final class SlockController {
             let talkID = randomUInt64()
             capture.onError = { [weak self] message in
                 guard let self, self.localTalkID == talkID else { return }
-                self.lastError = "Audio capture: \(message)"
+                self.recordAudioError("Audio capture: \(message)")
                 self.stopLocalTalk()
                 self.changed()
             }
@@ -3475,7 +3607,7 @@ final class SlockController {
                 send(kind: .talkStop, payload: payload, to: peer)
             }
             localTalkID = nil
-            lastError = "Could not start PTT: \(error.localizedDescription)"
+            recordAudioError("Could not start PTT: \(error.localizedDescription)")
         }
     }
 
@@ -3502,6 +3634,7 @@ final class SlockController {
     }
 
     private func handleRemoteTalkStart(_ payload: Data) {
+        receivedTalkStarts += 1
         guard peerStore.pttEnabled, capsInterceptor.isActive, transportState == .connected,
               payload.count == 8, let talkID = payload.uint64(at: 0), talkID != 0,
               let peer = peerStore.peerPublicKey else { return }
@@ -3517,7 +3650,7 @@ final class SlockController {
             let playback = try audioPlayback ?? makePlayback()
             playback.onError = { [weak self] message in
                 guard let self, self.remoteTalkID == talkID else { return }
-                self.lastError = "Audio playback: \(message)"
+                self.recordAudioError("Audio playback: \(message)")
                 self.stopRemoteTalk(immediate: true)
                 self.changed()
             }
@@ -3528,16 +3661,18 @@ final class SlockController {
             lastRemoteTalkSeen = now()
             playback.beginTalk()
         } catch {
-            lastError = "Could not start PTT playback: \(error.localizedDescription)"
+            recordAudioError("Could not start PTT playback: \(error.localizedDescription)")
         }
     }
 
     private func handleRemoteAudio(_ payload: Data) {
+        receivedAudioBatches += 1
         guard peerStore.pttEnabled, capsInterceptor.isActive, transportState == .connected,
               remoteTalking, !remoteTalkEnding,
               let talkID = payload.uint64(at: 0),
               talkID == remoteTalkID,
               payload.count > 8 else { return }
+        acceptedAudioBatches += 1
         markPeerSeen()
         lastRemoteTalkSeen = now()
         audioPlayback?.receiveBatch(Data(payload.dropFirst(8)))
@@ -3638,6 +3773,7 @@ final class SlockController {
                 payload: packet
             )
             if kind == .keyState { sentKeyMessages += 1 }
+            if kind == .audio { sentAudioBatches += 1 }
         } catch {
             lastError = error.localizedDescription
             changed()
@@ -3721,6 +3857,17 @@ final class SlockController {
 
     private func changed() {
         if logsStatus {
+            let voiceStatus = "peer=\(peerShortID ?? "none") ptt=\(pttEnabled) "
+                + "transmitting=\(localTalking) receiving=\(remoteTalking) draining=\(remoteTalkEnding) "
+                + "audioError=\(lastAudioError ?? "none")"
+            // Log only voice transitions, not every packet or microphone buffer.
+            if voiceStatus != lastLoggedVoiceStatus {
+                lastLoggedVoiceStatus = voiceStatus
+                NSLog("Voice link: %@; batches queued=%d received=%d accepted=%d; %@; %@", voiceStatus,
+                      sentAudioBatches, receivedAudioBatches, acceptedAudioBatches,
+                      audioCapture?.diagnostics ?? "Capture: not created",
+                      audioPlayback?.diagnostics ?? "Playback: not created")
+            }
             let status = "transport=\(transportState.text) paired=\(peerPublicKey != nil) online=\(peerOnline) "
                 + "peerPaused=\(peerPaused) "
                 + "capture=\(capsInterceptor.isActive) led=\(led.mode.rawValue) "
@@ -3731,6 +3878,11 @@ final class SlockController {
             }
         }
         DispatchQueue.main.async { [weak self] in self?.onStateChange?() }
+    }
+
+    private func recordAudioError(_ message: String) {
+        lastAudioError = message
+        lastError = message
     }
 }
 

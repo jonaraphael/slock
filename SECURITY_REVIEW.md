@@ -86,3 +86,31 @@ restricted sandbox's codec and icon conversion failures were not counted as
 passes. No tests captured the user's keyboard or microphone or connected to the
 public relay. The audit did not install, restart or publish the app; the subsequent v0.2.6
 release is a separate publication step.
+
+## Follow-up review — 2026-09-05 (pre-announcement)
+
+A second pass over the v0.2.6 source, tests, scripts, workflows, tracked assets and
+full Git history before wider public sharing. The earlier findings remain fixed.
+No new high- or medium-severity code findings were identified.
+
+| Severity | Finding | Patch |
+| --- | --- | --- |
+| Low | Peer-supplied nicknames removed only Unicode control characters. Bidirectional overrides, zero-width and line/paragraph separator characters survived and could reorder or hide text in “Review Pair Request from …”, the Switch confirmation and Recent. | Names are sanitized by Unicode category: controls, format characters, line/paragraph separators, surrogates and private-use code points are removed; whitespace runs collapse; names with no visible character become empty; length is bounded to 48 characters and 192 scalars. Emoji joiners are preserved. Nine nickname tests cover the new rules. |
+| Low | The saved peer key and Recent entries were used for routing and key agreement without checking that they were well-formed public keys. | Keys that are not 32-byte X25519 public keys are treated as unpaired or dropped on load, with a regression test. This is defense in depth; preferences are already local, user-owned state. |
+
+Repository checks: all blobs in the 21 local commits were scanned for credential
+patterns and private-key blocks (none found); no absolute local paths are tracked;
+`.gitignore` excludes builds, `.env` files and key material. `dist/` builds and
+`.DS_Store` files exist locally but are untracked. Commit authorship uses a personal
+email address, which is normal for GitHub but is visible to anyone who clones.
+`docs/images/firefly-concept.png` is unreferenced and carries a C2PA provenance
+manifest naming an OpenAI image-generation service; it contains no personal data.
+Event-tap and controller logs record state changes and counters only, never
+keystrokes or audio. GitHub settings: public, secret scanning and push protection
+enabled, workflow tokens read-only, both workflows pinned to commit SHAs. The main
+branch is still unprotected.
+
+Launch constraints unchanged from the first review: an unauthenticated public
+testing relay whose operator discourages reliance on it, ad-hoc signing without
+notarization, and no forward secrecy. A wider audience will increase load on the
+shared relay; that is an operational limit, not a code defect.

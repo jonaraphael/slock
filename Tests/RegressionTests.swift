@@ -67,8 +67,9 @@ private final class FakeCapture: VoiceCapture {
 private final class FakePlayback: VoicePlayback {
     var onError: ((String) -> Void)?
     var onDrain: (() -> Void)?
+    var batches: [Data] = []
     func beginTalk() { onDrain = nil }
-    func receiveBatch(_ batch: Data) {}
+    func receiveBatch(_ batch: Data) { batches.append(batch) }
     func endTalk(completion: @escaping () -> Void) { onDrain = completion }
     func stopImmediately() { onDrain = nil }
     func finish() { let callback = onDrain; onDrain = nil; callback?() }
@@ -797,6 +798,35 @@ enum RegressionTests {
             a.capture.onError?("current conversion error")
             try check(!a.capture.running && a.controller.diagnostics().contains("current conversion error"), "current error was ignored or missing from diagnostics")
         }
+        test("voice diagnostics distinguish missing, delivered and rejected audio in both directions") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            a.peerStore.ptt.active = 42; b.peerStore.ptt.active = 42
+            a.key(true); try exchange(a, b)
+            try check(b.controller.diagnostics().contains("talk starts received 1, audio batches queued 0, received 0, accepted 0"),
+                      "a talk start was mistaken for audio delivery")
+            let batch = Data([0, 2, 3, 4])
+            a.capture.onBatch?(batch); try exchange(a, b)
+            try check(b.playback.batches == [batch], "the receiver lost the audio batch")
+            try check(a.controller.diagnostics().contains("audio batches queued 1"), "transmitted batch was not counted")
+            try check(b.controller.diagnostics().contains("received 1, accepted 1"), "delivered batch was not counted")
+            // A playback failure ends this receiver's talk. Later packets from
+            // the still-held sender must remain visible as rejected traffic.
+            b.playback.onError?("output disconnected")
+            a.capture.onBatch?(batch); try exchange(a, b)
+            try check(b.playback.batches == [batch], "audio continued after playback failed")
+            try check(b.controller.diagnostics().contains("received 2, accepted 1"), "discarded audio was invisible")
+            b.controller.acceptPTTInvite(expected: 999) { _ in }
+            try check(b.controller.lastError?.contains("invitation changed") == true, "test did not replace the app error")
+            try check(b.controller.diagnostics().contains("Last audio error: Audio playback: output disconnected"),
+                      "another error erased the cause of silent playback")
+            a.key(false); drainMainQueue(); try exchange(a, b)
+            b.key(true); try exchange(a, b)
+            b.capture.onBatch?(batch); try exchange(a, b)
+            try check(a.playback.batches == [batch], "reverse-direction audio failed")
+            b.controller.clearError()
+            try check(b.controller.diagnostics().contains("Last audio error: none"), "Clear Error retained the audio error")
+        }
         test("pair changes clear consent and persisted revocations reload") {
             let preferences = MemoryPreferences()
             let peer = PeerStore(defaults: preferences)
@@ -1343,6 +1373,29 @@ enum RegressionTests {
                 try check(index == 0 ? (pcm.frameLength > 0 && pcm.frameLength <= 320) : pcm.frameLength == 320,
                           "unexpected decoded frame size: \(pcm.frameLength)")
             }
+        }
+        test("audio levels distinguish no capture, digital silence and nonzero native Opus audio") {
+            var inputLevel = AudioSignalLevel(), outputLevel = AudioSignalLevel()
+            try check(inputLevel.summary == "no PCM samples", "empty capture was called silence")
+            [Int16](repeating: 0, count: 320).withUnsafeBufferPointer { inputLevel.observe($0) }
+            try check(inputLevel.summary.contains("digital silence"), "silent capture was not identified")
+            let encoder = try OpusEncoder(), decoder = try OpusDecoder()
+            for frame in 0..<12 {
+                let samples: [Int16] = (0..<320).map { index in
+                    Int16(8_000 * sin(2 * Double.pi * 440 * Double(frame * 320 + index) / 16_000))
+                }
+                samples.withUnsafeBufferPointer { inputLevel.observe($0) }
+                let packet = try encoder.encode(samples.withUnsafeBytes { Data($0) })
+                let pcm = try decoder.decode(packet)
+                if let samples = pcm.floatChannelData?[0] {
+                    outputLevel.observe(UnsafeBufferPointer(start: samples, count: Int(pcm.frameLength)))
+                }
+            }
+            try check(inputLevel.peak > 0.2 && outputLevel.peak > 0.1, "nonzero signal did not survive the native codec")
+            try check(outputLevel.summary.contains("dBFS"), "decoded level was not reported")
+            var negativeFullScale = AudioSignalLevel()
+            [Int16.min].withUnsafeBufferPointer { negativeFullScale.observe($0) }
+            try check(negativeFullScale.peak == 1, "negative full-scale input overflowed")
         }
         print("\(count - failures)/\(count) tests passed")
         if failures > 0 { exit(1) }

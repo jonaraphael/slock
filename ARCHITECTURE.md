@@ -254,8 +254,13 @@ metadata with the current peer or a peer selected by a local outgoing request.
 Receiving an unsolicited request does not send the recipient's name back; local
 acceptance sends it in `PAIR_ACCEPT`. Saving nicknames also respects this boundary.
 Only authenticated messages from the paired peer or a pending request can update
-names. An empty nickname explicitly removes a previously supplied name. HELLO's
-existing nine-byte payload remains unchanged; older peers ignore PROFILE.
+names. An empty nickname explicitly removes a previously supplied name. Before a
+name is stored or displayed, control, format (including bidirectional overrides
+and zero-width characters), line/paragraph separator, surrogate and private-use
+code points are removed, whitespace runs collapse to one space, names with no
+visible character become empty, and length is bounded to 48 characters and 192
+scalars. Emoji joiners are kept. HELLO's existing nine-byte payload remains
+unchanged; older peers ignore PROFILE.
 
 Recent peers are stored locally by full public key, newest established pairing
 first. Pending or declined requests never enter that list. Display names prefer

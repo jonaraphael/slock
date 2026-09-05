@@ -99,6 +99,36 @@ private func exchange(_ a: NickMac, _ b: NickMac) throws {
             try expect(PeerProfile.read(Data()) == nil && PeerProfile.read(Data(repeating: 32, count: 1025)) == nil, "invalid profile accepted")
             try expect(PeerProfile.clean(String(repeating: "x", count: 100)).count == 48, "name length not bounded")
         }
+        test("displayed names cannot reorder, hide or split text") {
+            try expect(PeerProfile.clean("\u{202E}Alice") == "Alice", "right-to-left override survived")
+            try expect(PeerProfile.clean("Ali\u{202A}ce\u{202C}") == "Ali ce", "embedding controls survived")
+            try expect(PeerProfile.clean("Al\u{200B}ice\u{FEFF}") == "Al ice", "zero-width characters survived")
+            try expect(PeerProfile.clean("Studio\u{2028}Mac\u{2029}") == "Studio Mac", "line separators survived")
+            try expect(PeerProfile.clean("Studio \t\u{00A0}\u{3000} Mac") == "Studio Mac", "whitespace runs not collapsed")
+            try expect(PeerProfile.clean("\u{200D}\u{200D}\u{E000}\u{0301}") == "", "invisible-only name was kept")
+            try expect(PeerProfile.clean("\u{0301}Alice") == "Alice", "leading combining mark kept")
+            try expect(PeerProfile.clean("👨\u{200D}👩\u{200D}👧 Family") == "👨\u{200D}👩\u{200D}👧 Family", "emoji sequence broken")
+            try expect(PeerProfile.clean("Ren\u{00E9}e \u{2764}\u{FE0F}") == "Ren\u{00E9}e \u{2764}\u{FE0F}", "ordinary text changed")
+            let zalgo = "a" + String(repeating: "\u{0300}", count: 600) + "b"
+            try expect(PeerProfile.clean(zalgo).unicodeScalars.count <= PeerProfile.maximumScalars, "combining-mark flood not bounded")
+            try expect(PeerProfile.clean(zalgo).unicodeScalars.first == "a", "bounded name lost its visible start")
+            let name = PeerProfile.clean("Alice\u{202E}")
+            try expect(name == "Alice" && PeerProfile.clean(name) == name, "cleaning is not idempotent")
+        }
+        test("malformed saved peer keys are treated as unpaired instead of used for routing") {
+            for bytes in [Data(count: 31), Data(count: 33), Data()] {
+                let prefs = NickPreferences()
+                prefs.set(bytes, forKey: "CapsLink.peerPublicKey")
+                prefs.set(try JSONEncoder().encode([RecentPeer(publicKey: bytes, ownNickname: "Bad", localNickname: "")]),
+                          forKey: "slock.recentPeers")
+                let store = PeerStore(defaults: prefs)
+                try expect(store.peerPublicKey == nil, "\(bytes.count)-byte peer key accepted")
+                try expect(store.recent.isEmpty, "\(bytes.count)-byte recent key accepted")
+            }
+            let prefs = NickPreferences()
+            prefs.set(bob.publicKey, forKey: "CapsLink.peerPublicKey")
+            try expect(PeerStore(defaults: prefs).peerPublicKey == bob.publicKey, "valid peer key rejected")
+        }
         test("an unsolicited request cannot read the recipient's name before acceptance") {
             let a = NickMac(alice, name: "Alice's Mac"), b = NickMac(bob, name: "Bob's Mac")
             try a.controller.pair(using: bob.pairingCode, localNickname: "My private alias")

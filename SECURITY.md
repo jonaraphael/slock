@@ -21,8 +21,10 @@ older binaries are not automatically patched.
   disconnect, consent withdrawal and re-pairing stop the relevant audio paths.
 - Verify the complete `CL1.…` code or the entire 128-bit fingerprint over a trusted
   channel before accepting. Nicknames, recent-peer suffixes and older versions'
-  short display IDs are not proof of identity. A pairing code is a public key,
-  not a secret invitation token; strangers can send pairing requests.
+  short display IDs are not proof of identity. Displayed names are stripped of
+  control, formatting and bidirectional characters so they cannot reorder or
+  hide dialog text. A pairing code is a public key, not a secret invitation
+  token; strangers can send pairing requests.
 - Key states, nickname messages and Opus audio use X25519, HKDF-SHA256 and
   ChaCha20-Poly1305. Fresh challenges and increasing sequences reject replayed
   commands. A recipient's nickname is disclosed after local acceptance or a
