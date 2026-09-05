@@ -25,9 +25,16 @@ A small macOS menu-bar app. No account required. Built for Apple Silicon and Int
 1. Download and unzip **slock.app.zip** on each Mac.
 2. Move **slock.app** to **Applications**, then open it. Keep it there so permissions
    and the login item use a stable path.
-3. Allow **Accessibility** access when asked. Look for slock’s firefly icon in
-   the menu bar.
-4. Choose **Resume Slock** if capture is inactive. The menu shows **Pause Slock**
+3. Follow **Set up slock**, which opens automatically when required keyboard
+   permissions are missing. Enable slock in both **Accessibility** and **Input
+   Monitoring** under System Settings → Privacy & Security. The guide explains
+   each permission and requests them in order. If macOS does not show a dialog,
+   use the guide’s **Enable** buttons to open the corresponding settings.
+4. If slock is missing from either list, click **+** and select the app you
+   installed. **Show App in Finder** reveals the running copy. If an old entry is
+   already enabled, remove it and add this copy again. Quit and reopen slock if
+   macOS asks.
+5. Choose **Resume Slock** if capture is inactive. The menu shows **Pause Slock**
    while the key is captured. Hold **Option** while the menu is open and choose
    **Test Caps Lock Light** to check your keyboard.
 
@@ -35,12 +42,14 @@ Requires **macOS 13 or later** and an internet connection. The prototype is
 ad-hoc signed and **not notarized**, so macOS may block its first launch. Follow
 [Apple’s instructions for opening an app from an unidentified developer](https://support.apple.com/en-us/102445).
 
-slock asks for Accessibility access **at most once**. Later activation attempts,
-restarts, and updates check quietly. If access is missing, use **Open Accessibility
-Settings…**, remove any stale slock entry, and add the copy in Applications. Then
-choose **Retry Capture**; requested capture also starts automatically when access
-is granted. **Resume Slock** means the key is not currently captured. If requested
-capture cannot start, **Retry Capture** and permission recovery actions appear.
+slock requests each macOS keyboard permission automatically once. The setup guide
+still opens on launch if capture is requested and either permission is missing,
+including after a reinstall or update. Choose **Permissions…** to reopen it at
+any time and explicitly retry. Capture starts only after both permissions are
+granted; granting access while Slock is paused keeps it paused. If macOS still
+reports incomplete event access, quit and reopen slock. **Resume Slock** means the
+key is not currently captured; **Retry Capture** and permission recovery actions
+appear when requested capture cannot start.
 
 ## Connect two Macs
 
@@ -86,6 +95,7 @@ Enabled** to disable voice for both peers. Audio uses end-to-end encrypted Opus.
 | Menu item | What it does |
 | --- | --- |
 | **Pause Slock / Resume Slock** | Restores normal Caps Lock behavior, or gives slock control of the key. |
+| **Permissions…** | Opens setup guidance and controls for Accessibility and Input Monitoring. |
 | **Launch at Login** | Starts slock when you sign in. Enabled on first launch when macOS allows it. |
 | **Unpair…** | Removes the peer and stops key mirroring and voice. |
 | **Quit slock** | Stops capture, restores the previous keyboard mapping, and exits. |

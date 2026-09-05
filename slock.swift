@@ -18,7 +18,7 @@ enum SlockConfig {
     static let appName = "slock"
     // Keep identity keys and the single-instance lock in their existing location.
     static let storageName = "CapsLink"
-    static let appVersion = "0.2.3"
+    static let appVersion = "0.2.4"
     static let protocolVersion: UInt8 = 2
     static let brokerURL = URL(string: "wss://test.mosquitto.org:8081/mqtt")!
     static let topicPrefix = "capslink/v2/inbox/"
@@ -1122,11 +1122,9 @@ final class CapsInterceptor {
     private let defaults: Preferences
     private let process: (String, [String]) throws -> (Int32, String, String)
     private var trustCheck: () -> Bool = { AXIsProcessTrusted() }
-    private var permissionPrompt: () -> Void = {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(options)
+    private var listenCheck: () -> Bool = {
+        CGPreflightListenEventAccess() && HIDEventAccess.current() == .granted
     }
-    private let permissionPromptKey = "CapsLink.didRequestAccessibility"
     private var createsEventTap = true
     private var verifyTap: () throws -> Void = KeyboardTapAccess.verifyCurrentProcess
     private var readLock: () -> Bool = {
@@ -1141,14 +1139,6 @@ final class CapsInterceptor {
          process: @escaping (String, [String]) throws -> (Int32, String, String) = runProcess) {
         self.defaults = defaults
         self.process = process
-        // Older installs already requested permission before this marker existed.
-        // Keep upgrades quiet, including when macOS no longer trusts a new build.
-        if defaults.object(forKey: permissionPromptKey) == nil,
-           defaults.object(forKey: "CapsLink.captureEnabled") != nil
-            || defaults.object(forKey: "CapsLink.didConfigureLaunchAtLogin") != nil {
-            defaults.set(true, forKey: permissionPromptKey)
-            defaults.synchronize()
-        }
         restoreStaleMappingIfNeeded()
     }
 
@@ -1158,11 +1148,11 @@ final class CapsInterceptor {
                      readLock: @escaping () -> Bool = { false },
                      writeLock: @escaping (Bool) -> Bool = { _ in true },
                      trustCheck: @escaping () -> Bool = { true },
-                     verifyTap: @escaping () throws -> Void = {},
-                     permissionPrompt: @escaping () -> Void = {}) {
+                     listenCheck: @escaping () -> Bool = { true },
+                     verifyTap: @escaping () throws -> Void = {}) {
         self.init(defaults: testDefaults, process: process)
         self.trustCheck = trustCheck
-        self.permissionPrompt = permissionPrompt
+        self.listenCheck = listenCheck
         self.verifyTap = verifyTap
         createsEventTap = false
         self.readLock = readLock
@@ -1174,18 +1164,16 @@ final class CapsInterceptor {
         isRequested = true
         guard !isActive else { return }
         permissionGranted = trustCheck()
-        if defaults.object(forKey: permissionPromptKey) == nil {
-            // Persist before asking so denial, relaunches, and repeated activation
-            // cannot bring the system permission UI back automatically.
-            defaults.set(true, forKey: permissionPromptKey)
-            defaults.synchronize()
-            if !permissionGranted { permissionPrompt() }
-        }
-        if !permissionGranted {
+        // The setup window owns prompting, after the app has visible UI. Capture
+        // only observes grants and must not remap the key until both are ready.
+        if !permissionGranted || !listenCheck() {
+            lastError = permissionGranted ? "Input Monitoring permission is required. Open Permissions… to finish setup." : nil
             permissionTimer?.invalidate()
             permissionTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] timer in
                 guard let self else { return }
-                if self.trustCheck() {
+                self.permissionGranted = self.trustCheck()
+                self.lastError = self.permissionGranted ? "Input Monitoring permission is required. Open Permissions… to finish setup." : nil
+                if self.permissionGranted && self.listenCheck() {
                     timer.invalidate()
                     self.permissionTimer = nil
                     self.permissionGranted = true
@@ -1207,7 +1195,7 @@ final class CapsInterceptor {
             guard !recoveryFailed else { onStatusChange?(); return }
         }
         permissionGranted = trustCheck()
-        guard permissionGranted else {
+        guard permissionGranted && listenCheck() else {
             requestPermissionAndStart()
             return
         }
@@ -1527,6 +1515,82 @@ enum HIDEventAccess: String {
         case kIOHIDAccessTypeDenied: return .denied
         default: return .unknown
         }
+    }
+}
+
+enum KeyboardPermission: CaseIterable {
+    case accessibility, inputMonitoring
+
+    var requestKey: String {
+        switch self {
+        case .accessibility: return "CapsLink.didRequestAccessibility"
+        case .inputMonitoring: return "CapsLink.didRequestInputMonitoring"
+        }
+    }
+
+    var settingsURL: URL {
+        let pane = self == .accessibility ? "Privacy_Accessibility" : "Privacy_ListenEvent"
+        return URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)")!
+    }
+}
+
+struct KeyboardPermissionState: Equatable {
+    var accessibility: Bool
+    var inputMonitoring: Bool
+    var isReady: Bool { accessibility && inputMonitoring }
+    var firstMissing: KeyboardPermission? {
+        if !accessibility { return .accessibility }
+        return inputMonitoring ? nil : .inputMonitoring
+    }
+}
+
+final class KeyboardPermissionSetup {
+    private let defaults: Preferences
+    private let check: () -> KeyboardPermissionState
+    private let prompt: (KeyboardPermission) -> Void
+
+    init(defaults: Preferences = UserDefaults.standard,
+         check: @escaping () -> KeyboardPermissionState = {
+             KeyboardPermissionState(accessibility: AXIsProcessTrusted(),
+                                     inputMonitoring: CGPreflightListenEventAccess() && HIDEventAccess.current() == .granted)
+         },
+         prompt: @escaping (KeyboardPermission) -> Void = { permission in
+             switch permission {
+             case .accessibility:
+                 let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+                 _ = AXIsProcessTrustedWithOptions(options)
+             case .inputMonitoring:
+                 _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+             }
+         }) {
+        self.defaults = defaults
+        self.check = check
+        self.prompt = prompt
+    }
+
+    var state: KeyboardPermissionState { check() }
+
+    func shouldShowOnLaunch(captureRequested: Bool) -> Bool {
+        // A saved request is not a grant: reinstalls and ad-hoc signed updates
+        // can leave permission records behind without trusting this executable.
+        captureRequested && !state.isReady
+    }
+
+    func requestNextAutomatically() {
+        guard let permission = state.firstMissing,
+              defaults.object(forKey: permission.requestKey) as? Bool != true else { return }
+        _ = request(permission)
+    }
+
+    @discardableResult
+    func request(_ permission: KeyboardPermission) -> Bool {
+        let wasRequested = defaults.object(forKey: permission.requestKey) as? Bool == true
+        defaults.set(true, forKey: permission.requestKey)
+        defaults.synchronize()
+        // These APIs request approval asynchronously; their return values are
+        // not evidence that setup completed. Always recheck the actual grants.
+        prompt(permission)
+        return wasRequested
     }
 }
 
@@ -3233,6 +3297,160 @@ final class PairingForm: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
+final class PermissionSetupWindow: NSWindowController, NSWindowDelegate {
+    private let setup: KeyboardPermissionSetup
+    private let onReady: () -> Void
+    private let readyMessage: () -> String
+    private let accessibilityStatus = NSTextField(labelWithString: "Required — not enabled")
+    private let monitoringStatus = NSTextField(labelWithString: "Required — not enabled")
+    private let progress = NSTextField(wrappingLabelWithString:
+        "Caps Lock sharing needs both permissions. macOS may open a dialog; the Enable buttons also take you to Settings.")
+    private let closeButton = NSButton(title: "Later", target: nil, action: nil)
+    private var timer: Timer?
+    private var wasReady = false
+    private var pendingExplicitPermission: KeyboardPermission?
+
+    init(setup: KeyboardPermissionSetup, onReady: @escaping () -> Void,
+         readyMessage: @escaping () -> String) {
+        self.setup = setup
+        self.onReady = onReady
+        self.readyMessage = readyMessage
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 600),
+                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "Set up slock"
+        window.isReleasedWhenClosed = false
+        super.init(window: window)
+        window.delegate = self
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 18
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let content = window.contentView!
+        content.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24),
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 24),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -24)
+        ])
+        func add(_ view: NSView) {
+            stack.addArrangedSubview(view)
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        let title = NSTextField(labelWithString: "Give slock access to your keyboard")
+        title.font = .systemFont(ofSize: 21, weight: .semibold)
+        add(title)
+        add(NSTextField(wrappingLabelWithString:
+            "Enable both permissions so slock can send your Caps Lock presses and light up your keyboard when your partner presses theirs."))
+
+        func permissionRow(title: String, explanation: String, status: NSTextField,
+                           buttonTitle: String, action: Selector) -> NSStackView {
+            let heading = NSTextField(labelWithString: title)
+            heading.font = .boldSystemFont(ofSize: 14)
+            let detail = NSTextField(wrappingLabelWithString: explanation)
+            detail.preferredMaxLayoutWidth = 340
+            let labels = NSStackView(views: [heading, detail, status])
+            labels.orientation = .vertical
+            labels.alignment = .leading
+            labels.spacing = 4
+            let button = NSButton(title: buttonTitle, target: self, action: action)
+            button.bezelStyle = .rounded
+            button.setContentHuggingPriority(.required, for: .horizontal)
+            let row = NSStackView(views: [labels, button])
+            row.orientation = .horizontal
+            row.alignment = .centerY
+            row.spacing = 16
+            return row
+        }
+        add(permissionRow(title: "1. Accessibility",
+                          explanation: "Lets slock capture Caps Lock and prevent normal capitals while it is active.",
+                          status: accessibilityStatus, buttonTitle: "Enable Accessibility…",
+                          action: #selector(requestAccessibility)))
+        add(permissionRow(title: "2. Input Monitoring",
+                          explanation: "Lets slock receive keyboard events and control the Caps Lock light.",
+                          status: monitoringStatus, buttonTitle: "Enable Input Monitoring…",
+                          action: #selector(requestMonitoring)))
+        let instructions = NSTextField(wrappingLabelWithString:
+            "In System Settings → Privacy & Security, turn on slock in both lists. If it is missing, click + and choose this copy of slock.app. If an old entry is already on, remove it and add this copy again. Quit and reopen slock if macOS asks.")
+        instructions.textColor = .secondaryLabelColor
+        add(instructions)
+        add(progress)
+        let showApp = NSButton(title: "Show App in Finder", target: self, action: #selector(showAppInFinder))
+        showApp.bezelStyle = .rounded
+        closeButton.target = self
+        closeButton.action = #selector(dismissSetup)
+        closeButton.bezelStyle = .rounded
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let buttons = NSStackView(views: [showApp, spacer, closeButton])
+        buttons.orientation = .horizontal
+        buttons.spacing = 12
+        add(buttons)
+        content.layoutSubtreeIfNeeded()
+        window.setContentSize(NSSize(width: 600, height: max(460, stack.fittingSize.height + 48)))
+        window.center()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func present() {
+        wasReady = false
+        pendingExplicitPermission = nil
+        showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        window?.displayIfNeeded()
+        timer?.invalidate()
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.refresh() }
+        self.timer = timer
+        RunLoop.main.add(timer, forMode: .common)
+        // Put the explanation on screen before invoking macOS permission UI.
+        DispatchQueue.main.async { [weak self] in self?.refresh() }
+    }
+
+    private func refresh() {
+        guard window?.isVisible == true else { return }
+        let state = setup.state
+        accessibilityStatus.stringValue = state.accessibility ? "Enabled" : "Required — not enabled"
+        monitoringStatus.stringValue = state.inputMonitoring ? "Enabled" : "Required — not enabled"
+        accessibilityStatus.textColor = state.accessibility ? .systemGreen : .secondaryLabelColor
+        monitoringStatus.textColor = state.inputMonitoring ? .systemGreen : .secondaryLabelColor
+        if state.isReady && !wasReady { onReady() }
+        wasReady = state.isReady
+        progress.stringValue = state.isReady ? readyMessage()
+            : "Caps Lock sharing needs both permissions. macOS may open a dialog; the Enable buttons also take you to Settings."
+        closeButton.title = state.isReady ? "Done" : "Later"
+        if let pending = pendingExplicitPermission {
+            guard pending == .accessibility ? state.accessibility : state.inputMonitoring else { return }
+            pendingExplicitPermission = nil
+        }
+        setup.requestNextAutomatically()
+    }
+
+    private func request(_ permission: KeyboardPermission) {
+        // A prior denial can suppress the native dialog. An explicit retry
+        // always has a Settings fallback, even if macOS keeps its old entry.
+        pendingExplicitPermission = permission
+        setup.request(permission)
+        NSWorkspace.shared.open(permission.settingsURL)
+        refresh()
+    }
+
+    @objc private func requestAccessibility() { request(.accessibility) }
+    @objc private func requestMonitoring() { request(.inputMonitoring) }
+    @objc private func showAppInFinder() {
+        NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+    }
+    @objc private func dismissSetup() { close() }
+
+    func windowWillClose(_ notification: Notification) {
+        timer?.invalidate()
+        timer = nil
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var menu: NSMenu!
@@ -3240,6 +3458,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var instanceLock: SingleInstanceLock?
     private var optionOnlyItems: [NSMenuItem] = []
     private var menuModifierTimer: Timer?
+    private let permissionSetup = KeyboardPermissionSetup()
+    private var permissionWindow: PermissionSetupWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -3260,10 +3480,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateStatusItem()
         enableLaunchAtLoginByDefault()
         updateStatusItem()
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.permissionSetup.shouldShowOnLaunch(
+                captureRequested: self.controller.capsInterceptor.isRequested) else { return }
+            self.showPermissions()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         menuModifierTimer?.invalidate()
+        permissionWindow?.close()
         controller?.shutdown()
     }
 
@@ -3374,6 +3600,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             add("Resume Slock", #selector(resumeSlock))
         }
+        add("Permissions…", #selector(showPermissions))
         if capturePending {
             add("Retry Capture", #selector(retryCapture))
             add("Open Accessibility Settings…", #selector(openAccessibilitySettings))
@@ -3554,10 +3781,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func resumeSlock() {
         controller.setCaptureEnabled(true)
+        if !permissionSetup.state.isReady { showPermissions() }
     }
 
     @objc private func retryCapture() {
         controller.retryCapture()
+        if !permissionSetup.state.isReady { showPermissions() }
+    }
+
+    @objc private func showPermissions() {
+        if permissionWindow == nil {
+            permissionWindow = PermissionSetupWindow(setup: permissionSetup, onReady: { [weak self] in
+                self?.controller.retryCapture()
+                self?.controller.retryLED()
+            }, readyMessage: { [weak self] in
+                guard let self else { return "Both permissions are enabled." }
+                if self.controller.capsInterceptor.isActive {
+                    return "Both permissions are enabled and Caps Lock capture is active."
+                }
+                if !self.controller.capsInterceptor.isRequested {
+                    return "Both permissions are enabled. Slock remains paused; choose Resume Slock when ready."
+                }
+                return "Both permissions are enabled. \(self.controller.capsInterceptor.lastError ?? "Quit and reopen slock if capture remains inactive.")"
+            })
+        }
+        permissionWindow?.present()
     }
 
     @objc private func openAccessibilitySettings() {

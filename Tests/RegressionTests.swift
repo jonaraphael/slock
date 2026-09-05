@@ -386,51 +386,125 @@ enum RegressionTests {
                 try mustThrow { _ = try CapsInterceptor.parseMappings(text) }
             }
         }
-        test("Accessibility prompts only once across activation attempts and relaunches") {
-            let prefs = MemoryPreferences(), hid = FakeHID()
-            var prompts = 0
-            let capture = CapsInterceptor(testDefaults: prefs, process: hid.run,
-                                          trustCheck: { false }, permissionPrompt: { prompts += 1 })
-            capture.requestPermissionAndStart()
-            capture.requestPermissionAndStart()
-            capture.stop()
-            capture.requestPermissionAndStart()
-            capture.stop()
-            let relaunched = CapsInterceptor(testDefaults: prefs, process: hid.run,
-                                             trustCheck: { false }, permissionPrompt: { prompts += 1 })
-            relaunched.requestPermissionAndStart()
-            relaunched.stop()
-            try check(prompts == 1, "permission UI reopened after the first request")
-            try check(hid.writes.isEmpty, "untrusted capture changed the keyboard mapping")
-        }
-        test("existing installs do not prompt again when upgraded") {
-            for legacyKey in ["CapsLink.captureEnabled", "CapsLink.didConfigureLaunchAtLogin"] {
+        test("capture cannot remap Caps Lock until both keyboard permissions are granted") {
+            for (trusted, listening) in [(false, false), (true, false), (false, true)] {
                 let prefs = MemoryPreferences(), hid = FakeHID()
-                prefs.set(false, forKey: legacyKey)
-                var prompts = 0
                 let capture = CapsInterceptor(testDefaults: prefs, process: hid.run,
-                                              trustCheck: { false }, permissionPrompt: { prompts += 1 })
+                                              trustCheck: { trusted }, listenCheck: { listening })
+                defer { capture.stop() }
                 capture.requestPermissionAndStart()
-                capture.stop()
-                try check(prompts == 0, "upgrade prompted again for \(legacyKey)")
+                try check(capture.isRequested && !capture.isActive, "missing permission claimed active capture")
+                capture.start()
+                try check(!capture.isActive && hid.writes.isEmpty, "direct start bypassed a missing permission")
+                try check(prefs.string(forKey: "CapsLink.staleOriginalMapping") == nil,
+                          "missing permission claimed keyboard recovery ownership")
             }
         }
-        test("permission granted later enables capture without another prompt") {
+        test("capture automatically resumes after both keyboard grants arrive") {
             let prefs = MemoryPreferences(), hid = FakeHID()
-            var trusted = true
-            var prompts = 0
+            var trusted = false, listening = false
             let capture = CapsInterceptor(testDefaults: prefs, process: hid.run,
-                                          trustCheck: { trusted }, permissionPrompt: { prompts += 1 })
+                                          trustCheck: { trusted }, listenCheck: { listening })
+            defer { capture.stop() }
             capture.requestPermissionAndStart()
-            try check(capture.isActive, "trusted capture did not start")
-            capture.stop()
-            trusted = false
-            capture.requestPermissionAndStart()
-            try check(!capture.isActive && prompts == 0, "revoked permission reopened the prompt")
             trusted = true
             capture.requestPermissionAndStart()
-            try check(capture.isActive && prompts == 0, "capture did not resume quietly")
+            try check(!capture.isActive && hid.writes.isEmpty, "Accessibility alone started capture")
+            listening = true
+            let deadline = Date().addingTimeInterval(2.5)
+            while !capture.isActive && Date() < deadline { drainMainQueue() }
+            try check(capture.isActive && capture.lastError == nil, "permission polling did not resume capture")
+            try check(hid.writes.count == 1, "permission recovery remapped Caps Lock more than once")
+        }
+        test("paused capture stays paused when keyboard permissions arrive") {
+            let prefs = MemoryPreferences(), hid = FakeHID()
+            var grants = KeyboardPermissionState(accessibility: false, inputMonitoring: false)
+            var prompts: [KeyboardPermission] = []
+            let setup = KeyboardPermissionSetup(defaults: prefs, check: { grants }, prompt: { prompts.append($0) })
+            let capture = CapsInterceptor(testDefaults: prefs, process: hid.run,
+                                          trustCheck: { grants.accessibility }, listenCheck: { grants.inputMonitoring })
+            defer { capture.stop() }
+            capture.requestPermissionAndStart()
             capture.stop()
+            try check(!setup.shouldShowOnLaunch(captureRequested: capture.isRequested), "paused launch opened setup")
+            grants = KeyboardPermissionState(accessibility: true, inputMonitoring: true)
+            RunLoop.main.run(until: Date().addingTimeInterval(1.7))
+            try check(!capture.isRequested && !capture.isActive && hid.writes.isEmpty,
+                      "a pending permission timer resumed paused capture")
+            try check(prompts.isEmpty, "paused setup requested permission")
+        }
+        test("permission setup requests each missing permission once in order across relaunches") {
+            let prefs = MemoryPreferences()
+            var grants = KeyboardPermissionState(accessibility: false, inputMonitoring: false)
+            var prompts: [KeyboardPermission] = []
+            let setup = KeyboardPermissionSetup(defaults: prefs, check: { grants }, prompt: { prompts.append($0) })
+            setup.requestNextAutomatically()
+            setup.requestNextAutomatically()
+            try check(prompts == [.accessibility], "requested monitoring before Accessibility was granted")
+            let relaunched = KeyboardPermissionSetup(defaults: prefs, check: { grants }, prompt: { prompts.append($0) })
+            relaunched.requestNextAutomatically()
+            try check(prompts == [.accessibility], "relaunch duplicated an unresolved Accessibility request")
+            grants.accessibility = true
+            relaunched.requestNextAutomatically()
+            relaunched.requestNextAutomatically()
+            try check(prompts == [.accessibility, .inputMonitoring], "did not request Input Monitoring exactly once")
+            let relaunchedAgain = KeyboardPermissionSetup(defaults: prefs, check: { grants }, prompt: { prompts.append($0) })
+            relaunchedAgain.requestNextAutomatically()
+            try check(prompts.count == 2, "relaunch duplicated an unresolved Input Monitoring request")
+        }
+        test("requesting a keyboard permission never assumes it was granted") {
+            let prefs = MemoryPreferences()
+            var grants = KeyboardPermissionState(accessibility: false, inputMonitoring: false)
+            let setup = KeyboardPermissionSetup(defaults: prefs, check: { grants }, prompt: { _ in })
+            setup.request(.accessibility)
+            try check(!setup.state.isReady && setup.state.firstMissing == .accessibility,
+                      "requesting Accessibility marked it as granted")
+            grants.accessibility = true
+            setup.request(.inputMonitoring)
+            try check(!setup.state.isReady && setup.state.firstMissing == .inputMonitoring,
+                      "requesting Input Monitoring marked it as granted")
+            try check(setup.shouldShowOnLaunch(captureRequested: true), "pending grants hid setup")
+        }
+        test("retained request flags and legacy preferences cannot hide missing keyboard grants") {
+            for legacyKey in ["CapsLink.captureEnabled", "CapsLink.didConfigureLaunchAtLogin"] {
+                let prefs = MemoryPreferences()
+                prefs.set(true, forKey: legacyKey)
+                for permission in KeyboardPermission.allCases { prefs.set(true, forKey: permission.requestKey) }
+                for grants in [KeyboardPermissionState(accessibility: false, inputMonitoring: false),
+                               KeyboardPermissionState(accessibility: true, inputMonitoring: false),
+                               KeyboardPermissionState(accessibility: false, inputMonitoring: true)] {
+                    var prompts: [KeyboardPermission] = []
+                    let setup = KeyboardPermissionSetup(defaults: prefs, check: { grants }, prompt: { prompts.append($0) })
+                    try check(setup.shouldShowOnLaunch(captureRequested: true), "retained \(legacyKey) hid setup")
+                    setup.requestNextAutomatically()
+                    try check(prompts.isEmpty, "retained request flags repeated a native prompt automatically")
+                }
+            }
+        }
+        test("explicit keyboard permission retries work after a previous request") {
+            let prefs = MemoryPreferences()
+            var prompts: [KeyboardPermission] = []
+            let setup = KeyboardPermissionSetup(defaults: prefs,
+                check: { KeyboardPermissionState(accessibility: false, inputMonitoring: false) },
+                prompt: { prompts.append($0) })
+            for permission in KeyboardPermission.allCases {
+                try check(!setup.request(permission), "first request was reported as a retry")
+                try check(setup.request(permission), "prior request did not expose the Settings fallback")
+            }
+            try check(prompts == [.accessibility, .accessibility, .inputMonitoring, .inputMonitoring],
+                      "saved request flags suppressed explicit retry")
+        }
+        test("already granted keyboard permissions keep launch and automatic requests quiet") {
+            let prefs = MemoryPreferences()
+            var prompts: [KeyboardPermission] = []
+            let setup = KeyboardPermissionSetup(defaults: prefs,
+                check: { KeyboardPermissionState(accessibility: true, inputMonitoring: true) },
+                prompt: { prompts.append($0) })
+            try check(setup.state.isReady && setup.state.firstMissing == nil, "ready state still listed a missing permission")
+            try check(!setup.shouldShowOnLaunch(captureRequested: true), "ready launch opened setup")
+            setup.requestNextAutomatically()
+            setup.requestNextAutomatically()
+            try check(prompts.isEmpty, "ready setup opened a native permission prompt")
         }
         test("capture rejects a successful hidutil command that did not install the mapping") {
             let prefs = MemoryPreferences(), hid = FakeHID()
