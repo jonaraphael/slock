@@ -4,7 +4,7 @@
 
 # slock
 
-A one-bit peer-to-peer messaging service...
+A one-bit peer-to-peer messaging service... Inside your capslock.
 
 [![Download slock for macOS](https://img.shields.io/badge/Download_slock-macOS_13%2B-111111?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/jonaraphael/slock/releases/latest/download/slock.app.zip)
 
