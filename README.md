@@ -25,7 +25,7 @@ A small macOS menu-bar app. No account required. Built for Apple Silicon and Int
 1. Download and unzip **slock.app.zip** on each Mac.
 2. Move **slock.app** to **Applications**, then open it. Keep it there so permissions
    and the login item use a stable path.
-3. Follow **Set up slock**, which opens automatically when required keyboard
+3. Follow **Permissions Required**, which opens automatically when required keyboard
    permissions are missing. Enable slock in both **Accessibility** and **Input
    Monitoring** under System Settings → Privacy & Security. The guide explains
    each permission and requests them in order. If macOS does not show a dialog,
@@ -44,12 +44,21 @@ ad-hoc signed and **not notarized**, so macOS may block its first launch. Follow
 
 slock requests each macOS keyboard permission automatically once. The setup guide
 still opens on launch if capture is requested and either permission is missing,
-including after a reinstall or update. Choose **Permissions…** to reopen it at
-any time and explicitly retry. Capture starts only after both permissions are
+including after a reinstall or update. The red **Permissions Required** menu item
+opens the guide while access is missing and disappears when the current mode has
+all its grants. Capture starts only after both keyboard permissions are
 granted; granting access while Slock is paused keeps it paused. If macOS still
 reports incomplete event access, quit and reopen slock. **Resume Slock** means the
-key is not currently captured; **Retry Capture** and permission recovery actions
-appear when requested capture cannot start.
+key is not currently captured; choosing it retries capture.
+
+Push-to-talk also requires Microphone access. The guide adds that permission after
+you choose to enable PTT, or if an enabled PTT session loses microphone access.
+An incoming invitation alone does not request your microphone. **Use lights only**
+turns off PTT and removes that requirement. Microphone can be approved in its macOS
+dialog; keyboard approval is managed in System Settings. slock requests Input
+Monitoring through Apple's registration API and waits for it before opening the
+pane. If macOS already grants the required access, no additional list entry is
+needed. macOS may still require you to add the app manually or reopen it.
 
 ## Connect two Macs
 
@@ -95,7 +104,7 @@ Enabled** to disable voice for both peers. Audio uses end-to-end encrypted Opus.
 | Menu item | What it does |
 | --- | --- |
 | **Pause Slock / Resume Slock** | Restores normal Caps Lock behavior, or gives slock control of the key. |
-| **Permissions…** | Opens setup guidance and controls for Accessibility and Input Monitoring. |
+| **Permissions Required** | Appears in red only while the current mode lacks access; opens the setup guide for keyboard permissions and, for PTT, Microphone. |
 | **Launch at Login** | Starts slock when you sign in. Enabled on first launch when macOS allows it. |
 | **Unpair…** | Removes the peer and stops key mirroring and voice. |
 | **Quit slock** | Stops capture, restores the previous keyboard mapping, and exits. |
@@ -103,7 +112,8 @@ Enabled** to disable voice for both peers. Audio uses end-to-end encrypted Opus.
 Hold **Option** while the menu is open to reveal **This Mac**, **Test Caps Lock
 Light**, and **Diagnostics…**. Release Option to hide them again.
 
-Dit’s tail glows yellow-green while you hold your key, confirming the outgoing
+Dit’s tail turns red whenever a required permission is missing, taking priority
+over other activity. Otherwise it glows yellow-green while you hold your key, confirming the outgoing
 light signal without lighting your own keyboard. An incoming press leaves Dit’s
 tail hollow because your keyboard light carries that signal. While you are not
 sending, red means a pairing request or PTT invitation needs attention. The
@@ -154,7 +164,8 @@ Diagnostics** to share the checks below:
   app launch; queued messages do not prove delivery.
 - **HID listening access**, **LED devices**, and **LED error** distinguish missing
   permission from a keyboard that cannot control its light. Grant Input Monitoring
-  access if requested, then choose **Retry Keyboard Light**.
+  access through **Permissions Required** if requested. The guide retries keyboard
+  capture and the light when the required grants are ready.
 
 The LED driver waits for keyboard permission before opening devices and recreates
 failed device objects on retry. Granting permission after launch no longer leaves
@@ -164,7 +175,7 @@ still require reopening the app when macOS reports incomplete event access.
 | Problem | Check |
 | --- | --- |
 | Caps Lock still capitalizes, shows a blue indicator, or leaves the light on | Diagnostics must show **Accessibility trusted: true** and **Caps capture active: true**. If capture is active and the issue persists, record the diagnostics and keyboard model. |
-| Accessibility appears enabled, but capture is inactive after an update | Choose **Open Accessibility Settings…**, remove the old slock entry, and add the current app from Applications. Return to slock and choose **Retry Capture**. Ad-hoc signed rebuilds can require renewed permission. |
+| Accessibility appears enabled, but capture is inactive after an update | Open **Permissions Required** if visible and use **Enable Accessibility…** to remove the old slock entry and add the current app from Applications. Choose **Resume Slock** to retry, or reopen the app if macOS requests it. Ad-hoc signed rebuilds can require renewed permission. |
 | Permission is granted, but key presses are not captured | Check **Privacy & Security → Input Monitoring** and any Caps Lock reassignment under **Keyboard → Keyboard Shortcuts → Modifier Keys**. |
 | Input Monitoring appears enabled, but Dit never responds | A stale permission entry from an older build can block keyboard events even with Accessibility granted. Remove the old Input Monitoring entry and reopen the installed app. If the stale entry persists, run `tccutil reset ListenEvent com.jonaraphael.CapsLink`, then reopen slock. This resets only slock’s Input Monitoring record. |
 | The keyboard light changes independently of the peer | Check for another Caps Lock utility. Apps or scripts watching the same Caps→F18 mapping can independently control the LED. |

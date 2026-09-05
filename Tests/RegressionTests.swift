@@ -1,6 +1,7 @@
 import Foundation
 import Darwin
 import CoreGraphics
+import AppKit
 
 private struct Failure: Error { let message: String }
 private func check(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {
@@ -310,6 +311,64 @@ enum RegressionTests {
             try check(!a.controller.outgoingPTTInvite && !b.controller.incomingPTTInvite, "lost rejection revived a declined invitation")
             try check(PeerStore(defaults: b.defaults).ptt.revoked == invitation, "declined invitation was forgotten at restart")
         }
+        test("an unsolicited PTT invitation does not require or request microphone access") {
+            var recipientRequests = 0
+            let a = TestMac(alice, peer: bob.publicKey)
+            let b = TestMac(bob, peer: alice.publicKey, requestMicrophone: {
+                recipientRequests += 1
+                $0(false)
+            })
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            a.controller.invitePTT { _ in }
+            try exchange(a, b)
+            try check(b.controller.incomingPTTInvite, "recipient did not receive the invitation")
+            try check(recipientRequests == 0 && !b.controller.requiresMicrophonePermission,
+                      "remote invitation requested local microphone permission without acceptance")
+            try check(a.controller.requiresMicrophonePermission,
+                      "locally requested outgoing PTT omitted its microphone requirement")
+        }
+        test("denied local PTT requests remain visible until returning to lights only") {
+            for accepting in [false, true] {
+                var requests = 0
+                let mac = TestMac(alice, peer: bob.publicKey, requestMicrophone: {
+                    requests += 1
+                    $0(false)
+                })
+                var result: Bool?
+                if accepting {
+                    mac.peerStore.ptt.incoming = 41
+                    mac.controller.acceptPTTInvite(expected: 41) { result = $0 }
+                } else {
+                    mac.controller.invitePTT { result = $0 }
+                }
+                try check(requests == 1 && result == false && mac.controller.requiresMicrophonePermission,
+                          "denied local PTT action lost its required-permission indicator")
+                try check(!mac.controller.pttEnabled && !mac.controller.outgoingPTTInvite && !mac.capture.running,
+                          "denied access enabled PTT or the microphone")
+                mac.controller.disablePTT()
+                try check(!mac.controller.requiresMicrophonePermission && mac.controller.lastError == nil,
+                          "returning to lights only retained the microphone warning")
+            }
+        }
+        test("returning to lights only cancels a pending microphone approval") {
+            var grant: ((Bool) -> Void)?
+            let mac = TestMac(alice, peer: bob.publicKey, requestMicrophone: { grant = $0 })
+            mac.controller.invitePTT { _ in }
+            try check(mac.controller.requiresMicrophonePermission, "pending local PTT omitted its requirement")
+            mac.controller.disablePTT()
+            grant?(true)
+            try check(!mac.controller.requiresMicrophonePermission && !mac.controller.outgoingPTTInvite
+                      && !mac.controller.pttEnabled && !mac.capture.running,
+                      "late approval revived PTT after choosing lights only")
+        }
+        test("saved active PTT requires microphone permission while lights only does not") {
+            let mac = TestMac(alice, peer: bob.publicKey)
+            try check(!mac.controller.requiresMicrophonePermission, "lights only required microphone access")
+            mac.peerStore.ptt = PTTConsent(active: 41)
+            try check(mac.controller.requiresMicrophonePermission, "saved active PTT omitted microphone access")
+            mac.controller.disablePTT()
+            try check(!mac.controller.requiresMicrophonePermission, "disabled agreement still required microphone access")
+        }
         test("two controllers pair only after approval and relay held keys") {
             let a = TestMac(alice), b = TestMac(bob)
             a.relay.start(); b.relay.start()
@@ -481,7 +540,7 @@ enum RegressionTests {
                 }
             }
         }
-        test("explicit keyboard permission retries work after a previous request") {
+        test("explicit permission retries work after a previous request") {
             let prefs = MemoryPreferences()
             var prompts: [KeyboardPermission] = []
             let setup = KeyboardPermissionSetup(defaults: prefs,
@@ -491,8 +550,96 @@ enum RegressionTests {
                 try check(!setup.request(permission), "first request was reported as a retry")
                 try check(setup.request(permission), "prior request did not expose the Settings fallback")
             }
-            try check(prompts == [.accessibility, .accessibility, .inputMonitoring, .inputMonitoring],
+            try check(prompts == [.accessibility, .accessibility, .inputMonitoring, .inputMonitoring,
+                                  .microphone, .microphone],
                       "saved request flags suppressed explicit retry")
+        }
+        test("permission requirements follow lights only and PTT mode changes") {
+            var grants = KeyboardPermissionState(accessibility: true, inputMonitoring: true)
+            var prompts: [KeyboardPermission] = []
+            let setup = KeyboardPermissionSetup(defaults: MemoryPreferences(), check: { grants },
+                                                prompt: { prompts.append($0) })
+            try check(setup.state.isReady && setup.state.firstMissing == nil,
+                      "lights only was blocked by an unapproved microphone")
+            setup.requestNextAutomatically()
+            try check(prompts.isEmpty, "lights only prompted for the microphone")
+            setup.microphoneRequired = true
+            try check(!setup.state.isReady && setup.state.firstMissing == .microphone,
+                      "PTT did not identify the missing microphone grant")
+            setup.requestNextAutomatically()
+            setup.requestNextAutomatically()
+            try check(prompts == [.microphone] && !setup.state.isReady,
+                      "microphone request repeated automatically or implied approval")
+            grants.microphone = true
+            try check(setup.state.isReady && setup.state.firstMissing == nil,
+                      "granted microphone did not finish PTT permissions")
+            grants.microphone = false
+            try check(!setup.state.isReady, "microphone revocation did not invalidate PTT permissions")
+            setup.microphoneRequired = false
+            try check(setup.state.isReady, "switching back to lights only retained the microphone requirement")
+        }
+        test("overlapping permission requests neither duplicate nor stack native prompts") {
+            var grants = KeyboardPermissionState(accessibility: false, inputMonitoring: false)
+            var prompts: [KeyboardPermission] = []
+            var finish: (() -> Void)?
+            var callbacks: [String] = []
+            let setup = KeyboardPermissionSetup(defaults: MemoryPreferences(), check: { grants },
+                request: { permission, completion in prompts.append(permission); finish = completion })
+            setup.request(.accessibility) { callbacks.append("first") }
+            setup.request(.accessibility) { callbacks.append("duplicate") }
+            setup.request(.inputMonitoring) { callbacks.append("overlap") }
+            grants.accessibility = true
+            setup.requestNextAutomatically()
+            try check(prompts == [.accessibility] && setup.requestingPermission == .accessibility,
+                      "overlapping attempts opened more than one native prompt")
+            try check(callbacks.isEmpty && !setup.hasRequested(.inputMonitoring),
+                      "an overlapping request claimed to finish or consumed its future request")
+            finish?()
+            try check(callbacks == ["first", "duplicate"] && setup.requestingPermission == nil,
+                      "shared request did not finish its callers exactly once")
+            setup.requestNextAutomatically()
+            try check(prompts == [.accessibility, .inputMonitoring]
+                      && setup.requestingPermission == .inputMonitoring,
+                      "next permission did not start after the previous request finished")
+            finish?()
+        }
+        test("asynchronous request completion does not imply a permission grant") {
+            let grants = KeyboardPermissionState(accessibility: true, inputMonitoring: false)
+            var finish: (() -> Void)?
+            var completed = false
+            let setup = KeyboardPermissionSetup(defaults: MemoryPreferences(), check: { grants },
+                request: { _, completion in finish = completion })
+            setup.request(.inputMonitoring) { completed = true }
+            try check(setup.requestingPermission == .inputMonitoring && !setup.state.isReady,
+                      "pending request claimed permission was ready")
+            finish?()
+            try check(completed && setup.requestingPermission == nil && !setup.state.isReady
+                      && setup.state.firstMissing == .inputMonitoring,
+                      "completed native request was treated as an approval")
+        }
+        test("Permissions Required menu item is red and follows grants and mode changes") {
+            let item = NSMenuItem(title: "Permissions…", action: nil, keyEquivalent: "")
+            var state = KeyboardPermissionState(accessibility: false, inputMonitoring: true)
+            PermissionMenu.update(item, state: state)
+            try check(item.title == "Permissions Required" && !item.isHidden,
+                      "missing keyboard permission did not expose the single required item")
+            let color = item.attributedTitle?.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
+            try check(color == .systemRed, "required menu item was not red")
+            state.accessibility = true
+            PermissionMenu.update(item, state: state)
+            try check(item.isHidden, "ready lights-only mode retained the permission item")
+            state.microphoneRequired = true
+            PermissionMenu.update(item, state: state)
+            try check(!item.isHidden, "PTT mode hid a missing microphone grant")
+            state.microphone = true
+            PermissionMenu.update(item, state: state)
+            try check(item.isHidden, "fully approved PTT retained the permission item")
+            state.microphone = false
+            PermissionMenu.update(item, state: state)
+            try check(!item.isHidden, "revoked microphone did not restore the permission item")
+            state.microphoneRequired = false
+            PermissionMenu.update(item, state: state)
+            try check(item.isHidden, "leaving PTT did not hide an irrelevant microphone requirement")
         }
         test("already granted keyboard permissions keep launch and automatic requests quiet") {
             let prefs = MemoryPreferences()
@@ -614,6 +761,18 @@ enum RegressionTests {
                       "notification tail state")
             try check(FireflyIcon.tailState(localActive: true, attention: true) == .outgoing,
                       "outgoing key did not get tail priority")
+        }
+        test("Dit's red permission tail takes priority over outgoing activity") {
+            for localActive in [false, true] {
+                for attention in [false, true] {
+                    try check(FireflyIcon.tailState(localActive: localActive, attention: attention,
+                                                   permissionsRequired: true) == .notification,
+                              "missing permissions failed to select the red tail")
+                }
+            }
+            try check(FireflyIcon.tailState(localActive: true, attention: false,
+                                           permissionsRequired: false) == .outgoing,
+                      "satisfied permissions prevented the outgoing tail")
         }
         test("a second stop never overwrites mappings changed after capture stopped") {
             let prefs = MemoryPreferences(), hid = FakeHID()

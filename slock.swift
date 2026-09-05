@@ -18,7 +18,7 @@ enum SlockConfig {
     static let appName = "slock"
     // Keep identity keys and the single-instance lock in their existing location.
     static let storageName = "CapsLink"
-    static let appVersion = "0.2.4"
+    static let appVersion = "0.2.5"
     static let protocolVersion: UInt8 = 2
     static let brokerURL = URL(string: "wss://test.mosquitto.org:8081/mqtt")!
     static let topicPrefix = "capslink/v2/inbox/"
@@ -1167,12 +1167,12 @@ final class CapsInterceptor {
         // The setup window owns prompting, after the app has visible UI. Capture
         // only observes grants and must not remap the key until both are ready.
         if !permissionGranted || !listenCheck() {
-            lastError = permissionGranted ? "Input Monitoring permission is required. Open Permissions… to finish setup." : nil
+            lastError = permissionGranted ? "Input Monitoring permission is required. Choose Permissions Required to finish setup." : nil
             permissionTimer?.invalidate()
             permissionTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] timer in
                 guard let self else { return }
                 self.permissionGranted = self.trustCheck()
-                self.lastError = self.permissionGranted ? "Input Monitoring permission is required. Open Permissions… to finish setup." : nil
+                self.lastError = self.permissionGranted ? "Input Monitoring permission is required. Choose Permissions Required to finish setup." : nil
                 if self.permissionGranted && self.listenCheck() {
                     timer.invalidate()
                     self.permissionTimer = nil
@@ -1519,17 +1519,23 @@ enum HIDEventAccess: String {
 }
 
 enum KeyboardPermission: CaseIterable {
-    case accessibility, inputMonitoring
+    case accessibility, inputMonitoring, microphone
 
     var requestKey: String {
         switch self {
         case .accessibility: return "CapsLink.didRequestAccessibility"
         case .inputMonitoring: return "CapsLink.didRequestInputMonitoring"
+        case .microphone: return "CapsLink.didRequestMicrophone"
         }
     }
 
     var settingsURL: URL {
-        let pane = self == .accessibility ? "Privacy_Accessibility" : "Privacy_ListenEvent"
+        let pane: String
+        switch self {
+        case .accessibility: pane = "Privacy_Accessibility"
+        case .inputMonitoring: pane = "Privacy_ListenEvent"
+        case .microphone: pane = "Privacy_Microphone"
+        }
         return URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)")!
     }
 }
@@ -1537,38 +1543,85 @@ enum KeyboardPermission: CaseIterable {
 struct KeyboardPermissionState: Equatable {
     var accessibility: Bool
     var inputMonitoring: Bool
-    var isReady: Bool { accessibility && inputMonitoring }
+    var microphone = false
+    var microphoneRequired = false
+    var isReady: Bool { accessibility && inputMonitoring && (!microphoneRequired || microphone) }
     var firstMissing: KeyboardPermission? {
         if !accessibility { return .accessibility }
-        return inputMonitoring ? nil : .inputMonitoring
+        if !inputMonitoring { return .inputMonitoring }
+        return microphoneRequired && !microphone ? .microphone : nil
+    }
+
+    func isGranted(_ permission: KeyboardPermission) -> Bool {
+        switch permission {
+        case .accessibility: return accessibility
+        case .inputMonitoring: return inputMonitoring
+        case .microphone: return microphone
+        }
     }
 }
 
 final class KeyboardPermissionSetup {
+    typealias Request = (KeyboardPermission, @escaping () -> Void) -> Void
+    private static let inputRequestQueue = DispatchQueue(label: "slock.input-permission")
     private let defaults: Preferences
     private let check: () -> KeyboardPermissionState
-    private let prompt: (KeyboardPermission) -> Void
+    private let prompt: Request
+    private var completions: [() -> Void] = []
+    private(set) var requestingPermission: KeyboardPermission?
+    var microphoneRequired = false
 
     init(defaults: Preferences = UserDefaults.standard,
          check: @escaping () -> KeyboardPermissionState = {
              KeyboardPermissionState(accessibility: AXIsProcessTrusted(),
-                                     inputMonitoring: CGPreflightListenEventAccess() && HIDEventAccess.current() == .granted)
+                                     inputMonitoring: CGPreflightListenEventAccess() && HIDEventAccess.current() == .granted,
+                                     microphone: AVCaptureDevice.authorizationStatus(for: .audio) == .authorized)
          },
-         prompt: @escaping (KeyboardPermission) -> Void = { permission in
+         request: @escaping Request = { permission, completion in
              switch permission {
              case .accessibility:
                  let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
                  _ = AXIsProcessTrustedWithOptions(options)
+                 DispatchQueue.main.async(execute: completion)
              case .inputMonitoring:
-                 _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+                 // IOHIDRequestAccess waits for TCC. Keep the guide responsive
+                 // and let the native request finish before opening Settings.
+                 KeyboardPermissionSetup.inputRequestQueue.async {
+                     _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+                     DispatchQueue.main.async(execute: completion)
+                 }
+             case .microphone:
+                 guard AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined else {
+                     completion()
+                     return
+                 }
+                 AVCaptureDevice.requestAccess(for: .audio) { _ in
+                     DispatchQueue.main.async(execute: completion)
+                 }
              }
          }) {
         self.defaults = defaults
         self.check = check
-        self.prompt = prompt
+        self.prompt = request
     }
 
-    var state: KeyboardPermissionState { check() }
+    convenience init(defaults: Preferences, check: @escaping () -> KeyboardPermissionState,
+                     prompt: @escaping (KeyboardPermission) -> Void) {
+        self.init(defaults: defaults, check: check, request: { permission, completion in
+            prompt(permission)
+            completion()
+        })
+    }
+
+    var state: KeyboardPermissionState {
+        var state = check()
+        state.microphoneRequired = microphoneRequired
+        return state
+    }
+
+    func hasRequested(_ permission: KeyboardPermission) -> Bool {
+        defaults.object(forKey: permission.requestKey) as? Bool == true
+    }
 
     func shouldShowOnLaunch(captureRequested: Bool) -> Bool {
         // A saved request is not a grant: reinstalls and ad-hoc signed updates
@@ -1577,20 +1630,42 @@ final class KeyboardPermissionSetup {
     }
 
     func requestNextAutomatically() {
-        guard let permission = state.firstMissing,
-              defaults.object(forKey: permission.requestKey) as? Bool != true else { return }
+        guard requestingPermission == nil, let permission = state.firstMissing,
+              !hasRequested(permission) else { return }
         _ = request(permission)
     }
 
     @discardableResult
-    func request(_ permission: KeyboardPermission) -> Bool {
-        let wasRequested = defaults.object(forKey: permission.requestKey) as? Bool == true
+    func request(_ permission: KeyboardPermission, completion: @escaping () -> Void = {}) -> Bool {
+        let wasRequested = hasRequested(permission)
+        if let requestingPermission {
+            if requestingPermission == permission { completions.append(completion) }
+            return wasRequested
+        }
+        requestingPermission = permission
+        completions = [completion]
         defaults.set(true, forKey: permission.requestKey)
         defaults.synchronize()
-        // These APIs request approval asynchronously; their return values are
-        // not evidence that setup completed. Always recheck the actual grants.
-        prompt(permission)
+        // A completed request is not evidence of approval. Observe the actual
+        // grants before updating the menu or starting keyboard/voice capture.
+        prompt(permission) { [weak self] in
+            guard let self else { return }
+            self.requestingPermission = nil
+            let callbacks = self.completions
+            self.completions.removeAll()
+            for callback in callbacks { callback() }
+        }
         return wasRequested
+    }
+}
+
+enum PermissionMenu {
+    static let title = "Permissions Required"
+
+    static func update(_ item: NSMenuItem, state: KeyboardPermissionState) {
+        item.title = title
+        item.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: NSColor.systemRed])
+        item.isHidden = state.isReady
     }
 }
 
@@ -2301,6 +2376,9 @@ final class SlockController {
     private(set) var incomingLocalNickname: String?
     var incomingPTTInvite: Bool { peerStore.ptt.incoming != nil }
     var outgoingPTTInvite: Bool { peerStore.ptt.outgoing != nil }
+    private var microphonePermissionPending = false
+    private static let microphonePermissionError = "Microphone permission is required for PTT."
+    var requiresMicrophonePermission: Bool { pttEnabled || outgoingPTTInvite || microphonePermissionPending }
     private var consentGeneration = UUID()
     private var captureWasActive = false
     private var lastLoggedCaptureStatus: String?
@@ -2516,18 +2594,20 @@ final class SlockController {
     func invitePTT(completion: @escaping (Bool) -> Void) {
         guard let peer = peerStore.peerPublicKey else { completion(false); return }
         guard preparePTT() else { completion(false); return }
+        microphonePermissionPending = true
         consentGeneration = UUID()
         let generation = consentGeneration
         requestMicrophone { [weak self] granted in
             guard let self else { return }
             guard self.peerStore.peerPublicKey == peer, self.consentGeneration == generation else { return }
             if granted {
+                self.microphonePermissionPending = false
                 self.peerStore.ptt.invite()
                 self.lastPTTInviteSent = -.infinity
                 self.retryOutgoingPTTInvite(force: true)
                 self.lastError = nil
             } else {
-                self.lastError = "Microphone permission is required for PTT."
+                self.lastError = Self.microphonePermissionError
             }
             self.changed()
             completion(granted)
@@ -2543,6 +2623,7 @@ final class SlockController {
             return
         }
         guard preparePTT() else { completion(false); return }
+        microphonePermissionPending = true
         consentGeneration = UUID()
         let generation = consentGeneration
         requestMicrophone { [weak self] granted in
@@ -2550,13 +2631,14 @@ final class SlockController {
             guard self.peerStore.peerPublicKey == peer, self.consentGeneration == generation,
                   self.peerStore.ptt.incoming == invitation else { return }
             if granted {
+                self.microphonePermissionPending = false
                 self.peerStore.ptt.accept(invitation)
                 self.sendPTT(.pttAccept, id: invitation, to: peer)
                 self.lastError = nil
             } else {
                 self.peerStore.ptt.reject(invitation)
                 self.sendPTT(.pttReject, id: invitation, to: peer)
-                self.lastError = "Microphone permission is required for PTT."
+                self.lastError = Self.microphonePermissionError
             }
             self.changed()
             completion(granted)
@@ -2567,12 +2649,15 @@ final class SlockController {
         guard let peer = peerStore.peerPublicKey, let invitation = peerStore.ptt.incoming,
               invitation == expected else { return }
         consentGeneration = UUID()
+        microphonePermissionPending = false
         peerStore.ptt.reject(invitation)
         sendPTT(.pttReject, id: invitation, to: peer)
         changed()
     }
 
     func disablePTT() {
+        if lastError == Self.microphonePermissionError { lastError = nil }
+        microphonePermissionPending = false
         consentGeneration = UUID()
         peerStore.ptt.disable()
         if let peer = peerStore.peerPublicKey, let revoked = peerStore.ptt.revoked {
@@ -2581,6 +2666,13 @@ final class SlockController {
         lastPTTInviteSent = -.infinity
         stopLocalTalk()
         stopRemoteTalk(immediate: true)
+        changed()
+    }
+
+    func microphonePermissionRecovered() {
+        guard microphonePermissionPending else { return }
+        microphonePermissionPending = false
+        if lastError == Self.microphonePermissionError { lastError = nil }
         changed()
     }
 
@@ -3123,6 +3215,7 @@ final class SlockController {
     }
 
     private func clearPeer() {
+        microphonePermissionPending = false
         stopLocalTalk()
         stopRemoteTalk(immediate: true)
         updateRemoteKey(false)
@@ -3182,7 +3275,8 @@ enum FireflyIcon {
     static let outgoing = makeImage(tail: .outgoing)
     static let notification = makeImage(tail: .notification)
 
-    static func tailState(localActive: Bool, attention: Bool) -> TailState {
+    static func tailState(localActive: Bool, attention: Bool, permissionsRequired: Bool = false) -> TailState {
+        if permissionsRequired { return .notification }
         if localActive { return .outgoing }
         if attention { return .notification }
         return .idle
@@ -3301,29 +3395,43 @@ final class PermissionSetupWindow: NSWindowController, NSWindowDelegate {
     private let setup: KeyboardPermissionSetup
     private let onReady: () -> Void
     private let readyMessage: () -> String
+    private let refreshRequirements: () -> Void
+    private let useLightsOnly: () -> Void
     private let accessibilityStatus = NSTextField(labelWithString: "Required — not enabled")
     private let monitoringStatus = NSTextField(labelWithString: "Required — not enabled")
+    private let microphoneStatus = NSTextField(labelWithString: "Required — not enabled")
+    private let titleLabel = NSTextField(labelWithString: "Give slock access to your keyboard")
+    private let introduction = NSTextField(wrappingLabelWithString: "")
     private let progress = NSTextField(wrappingLabelWithString:
-        "Caps Lock sharing needs both permissions. macOS may open a dialog; the Enable buttons also take you to Settings.")
+        "Enable the required permissions below. macOS may open a dialog; the Enable buttons also take you to Settings.")
     private let closeButton = NSButton(title: "Later", target: nil, action: nil)
+    private let lightsOnlyButton = NSButton(title: "Use lights only", target: nil, action: nil)
+    private var permissionButtons: [KeyboardPermission: NSButton] = [:]
+    private var microphoneRow: NSView?
+    private var contentStack: NSStackView?
     private var timer: Timer?
     private var wasReady = false
     private var pendingExplicitPermission: KeyboardPermission?
 
     init(setup: KeyboardPermissionSetup, onReady: @escaping () -> Void,
-         readyMessage: @escaping () -> String) {
+         readyMessage: @escaping () -> String, refreshRequirements: @escaping () -> Void = {},
+         useLightsOnly: @escaping () -> Void = {}) {
         self.setup = setup
         self.onReady = onReady
         self.readyMessage = readyMessage
+        self.refreshRequirements = refreshRequirements
+        self.useLightsOnly = useLightsOnly
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 600),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        window.title = "Set up slock"
+        window.title = "Permissions Required"
         window.isReleasedWhenClosed = false
         super.init(window: window)
         window.delegate = self
 
         let stack = NSStackView()
+        contentStack = stack
         stack.orientation = .vertical
+        stack.detachesHiddenViews = true
         stack.alignment = .leading
         stack.spacing = 18
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -3339,14 +3447,13 @@ final class PermissionSetupWindow: NSWindowController, NSWindowDelegate {
             stack.addArrangedSubview(view)
             view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
-        let title = NSTextField(labelWithString: "Give slock access to your keyboard")
-        title.font = .systemFont(ofSize: 21, weight: .semibold)
-        add(title)
-        add(NSTextField(wrappingLabelWithString:
-            "Enable both permissions so slock can send your Caps Lock presses and light up your keyboard when your partner presses theirs."))
+        titleLabel.font = .systemFont(ofSize: 21, weight: .semibold)
+        add(titleLabel)
+        introduction.stringValue = "Enable keyboard access so slock can send your Caps Lock presses and control your keyboard light."
+        add(introduction)
 
         func permissionRow(title: String, explanation: String, status: NSTextField,
-                           buttonTitle: String, action: Selector) -> NSStackView {
+                           buttonTitle: String, action: Selector, permission: KeyboardPermission) -> NSStackView {
             let heading = NSTextField(labelWithString: title)
             heading.font = .boldSystemFont(ofSize: 14)
             let detail = NSTextField(wrappingLabelWithString: explanation)
@@ -3356,6 +3463,7 @@ final class PermissionSetupWindow: NSWindowController, NSWindowDelegate {
             labels.alignment = .leading
             labels.spacing = 4
             let button = NSButton(title: buttonTitle, target: self, action: action)
+            permissionButtons[permission] = button
             button.bezelStyle = .rounded
             button.setContentHuggingPriority(.required, for: .horizontal)
             let row = NSStackView(views: [labels, button])
@@ -3367,13 +3475,20 @@ final class PermissionSetupWindow: NSWindowController, NSWindowDelegate {
         add(permissionRow(title: "1. Accessibility",
                           explanation: "Lets slock capture Caps Lock and prevent normal capitals while it is active.",
                           status: accessibilityStatus, buttonTitle: "Enable Accessibility…",
-                          action: #selector(requestAccessibility)))
+                          action: #selector(requestAccessibility), permission: .accessibility))
         add(permissionRow(title: "2. Input Monitoring",
                           explanation: "Lets slock receive keyboard events and control the Caps Lock light.",
                           status: monitoringStatus, buttonTitle: "Enable Input Monitoring…",
-                          action: #selector(requestMonitoring)))
+                          action: #selector(requestMonitoring), permission: .inputMonitoring))
+        let microphoneRow = permissionRow(title: "3. Microphone",
+            explanation: "Lets slock send your voice while you hold Caps Lock with push-to-talk enabled.",
+            status: microphoneStatus, buttonTitle: "Enable Microphone…",
+            action: #selector(requestMicrophone), permission: .microphone)
+        self.microphoneRow = microphoneRow
+        microphoneRow.isHidden = !setup.microphoneRequired
+        add(microphoneRow)
         let instructions = NSTextField(wrappingLabelWithString:
-            "In System Settings → Privacy & Security, turn on slock in both lists. If it is missing, click + and choose this copy of slock.app. If an old entry is already on, remove it and add this copy again. Quit and reopen slock if macOS asks.")
+            "Enable only the permissions marked Required. Keyboard approval is managed in System Settings → Privacy & Security. If slock is missing, click + and choose this copy of the app. If an old entry is already on, remove it and add this copy again. Reopen slock if macOS asks.")
         instructions.textColor = .secondaryLabelColor
         add(instructions)
         add(progress)
@@ -3382,12 +3497,17 @@ final class PermissionSetupWindow: NSWindowController, NSWindowDelegate {
         closeButton.target = self
         closeButton.action = #selector(dismissSetup)
         closeButton.bezelStyle = .rounded
+        lightsOnlyButton.target = self
+        lightsOnlyButton.action = #selector(switchToLightsOnly)
+        lightsOnlyButton.bezelStyle = .rounded
+        lightsOnlyButton.isHidden = !setup.microphoneRequired
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let buttons = NSStackView(views: [showApp, spacer, closeButton])
+        let buttons = NSStackView(views: [showApp, spacer, lightsOnlyButton, closeButton])
         buttons.orientation = .horizontal
         buttons.spacing = 12
         add(buttons)
+        updateContents(state: setup.state)
         content.layoutSubtreeIfNeeded()
         window.setContentSize(NSSize(width: 600, height: max(460, stack.fittingSize.height + 48)))
         window.center()
@@ -3410,20 +3530,50 @@ final class PermissionSetupWindow: NSWindowController, NSWindowDelegate {
         DispatchQueue.main.async { [weak self] in self?.refresh() }
     }
 
-    private func refresh() {
-        guard window?.isVisible == true else { return }
-        let state = setup.state
+    private func updateContents(state: KeyboardPermissionState) {
+        microphoneRow?.isHidden = !state.microphoneRequired
+        lightsOnlyButton.isHidden = !state.microphoneRequired
+        titleLabel.stringValue = state.microphoneRequired ? "Permissions for push-to-talk" : "Give slock access to your keyboard"
+        introduction.stringValue = state.microphoneRequired
+            ? "Push-to-talk needs keyboard access and your microphone. Enable each required permission to share light and voice."
+            : "Enable keyboard access so slock can send your Caps Lock presses and control your keyboard light."
         accessibilityStatus.stringValue = state.accessibility ? "Enabled" : "Required — not enabled"
         monitoringStatus.stringValue = state.inputMonitoring ? "Enabled" : "Required — not enabled"
+        microphoneStatus.stringValue = state.microphone ? "Enabled" : "Required — not enabled"
         accessibilityStatus.textColor = state.accessibility ? .systemGreen : .secondaryLabelColor
         monitoringStatus.textColor = state.inputMonitoring ? .systemGreen : .secondaryLabelColor
+        microphoneStatus.textColor = state.microphone ? .systemGreen : .secondaryLabelColor
+        for (permission, button) in permissionButtons {
+            let granted = state.isGranted(permission)
+            button.isEnabled = !granted && setup.requestingPermission == nil
+            if granted { button.title = "Enabled" }
+            else if setup.requestingPermission == permission { button.title = "Requesting…" }
+            else {
+                switch permission {
+                case .accessibility: button.title = "Enable Accessibility…"
+                case .inputMonitoring: button.title = "Enable Input Monitoring…"
+                case .microphone: button.title = "Enable Microphone…"
+                }
+            }
+        }
+        progress.stringValue = state.isReady ? readyMessage()
+            : "Enable the required permissions below. macOS may open a dialog; the Enable buttons also take you to Settings."
+        closeButton.title = state.isReady ? "Done" : "Later"
+        if let stack = contentStack {
+            window?.contentView?.layoutSubtreeIfNeeded()
+            window?.setContentSize(NSSize(width: 600, height: max(460, stack.fittingSize.height + 48)))
+        }
+    }
+
+    private func refresh() {
+        guard window?.isVisible == true else { return }
+        refreshRequirements()
+        let state = setup.state
         if state.isReady && !wasReady { onReady() }
         wasReady = state.isReady
-        progress.stringValue = state.isReady ? readyMessage()
-            : "Caps Lock sharing needs both permissions. macOS may open a dialog; the Enable buttons also take you to Settings."
-        closeButton.title = state.isReady ? "Done" : "Later"
+        updateContents(state: state)
         if let pending = pendingExplicitPermission {
-            guard pending == .accessibility ? state.accessibility : state.inputMonitoring else { return }
+            guard state.isGranted(pending) else { return }
             pendingExplicitPermission = nil
         }
         setup.requestNextAutomatically()
@@ -3432,14 +3582,27 @@ final class PermissionSetupWindow: NSWindowController, NSWindowDelegate {
     private func request(_ permission: KeyboardPermission) {
         // A prior denial can suppress the native dialog. An explicit retry
         // always has a Settings fallback, even if macOS keeps its old entry.
+        guard setup.requestingPermission == nil, !setup.state.isGranted(permission) else { return }
         pendingExplicitPermission = permission
-        setup.request(permission)
-        NSWorkspace.shared.open(permission.settingsURL)
+        let wasRequested = setup.hasRequested(permission)
+        setup.request(permission) { [weak self] in
+            guard let self, self.window?.isVisible == true else { return }
+            if !self.setup.state.isGranted(permission), permission != .microphone || wasRequested {
+                NSWorkspace.shared.open(permission.settingsURL)
+            }
+            self.refresh()
+        }
         refresh()
     }
 
     @objc private func requestAccessibility() { request(.accessibility) }
     @objc private func requestMonitoring() { request(.inputMonitoring) }
+    @objc private func requestMicrophone() { request(.microphone) }
+    @objc private func switchToLightsOnly() {
+        useLightsOnly()
+        pendingExplicitPermission = nil
+        refresh()
+    }
     @objc private func showAppInFinder() {
         NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
     }
@@ -3460,6 +3623,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var menuModifierTimer: Timer?
     private let permissionSetup = KeyboardPermissionSetup()
     private var permissionWindow: PermissionSetupWindow?
+    private var permissionsRequiredItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -3493,6 +3657,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller?.shutdown()
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        updateStatusItem()
+    }
+
+    private func permissionState() -> KeyboardPermissionState {
+        permissionSetup.microphoneRequired = controller.requiresMicrophonePermission
+        return permissionSetup.state
+    }
+
     func menuNeedsUpdate(_ menu: NSMenu) {
         rebuildMenu()
     }
@@ -3523,6 +3696,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateStatusItem() {
         guard let button = statusItem?.button, let controller else { return }
+        let permissions = permissionState()
+        if let item = permissionsRequiredItem { PermissionMenu.update(item, state: permissions) }
         let needsAttention: Bool
         switch controller.attention {
         case .pairing, .ptt:
@@ -3532,16 +3707,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let tail = FireflyIcon.tailState(
             localActive: controller.localKeyDown || controller.localTalking,
-            attention: needsAttention
+            attention: needsAttention,
+            permissionsRequired: !permissions.isReady
         )
         button.image = FireflyIcon.image(tail: tail)
         button.title = ""
-        button.toolTip = "slock — \(controller.statusText)"
+        button.toolTip = "slock — \(permissions.isReady ? controller.statusText : PermissionMenu.title)"
     }
 
     private func rebuildMenu() {
         menu.removeAllItems()
         optionOnlyItems.removeAll()
+        permissionsRequiredItem = nil
         addDisabled("slock — \(controller.statusText)")
         optionOnlyItems.append(addDisabled("This Mac: \(controller.identity.shortID)"))
         menu.addItem(.separator())
@@ -3594,24 +3771,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
         let captureActive = controller.capsInterceptor.isActive
-        let capturePending = controller.capsInterceptor.isRequested && !captureActive
         if captureActive {
             add("Pause Slock", #selector(pauseSlock))
         } else {
             add("Resume Slock", #selector(resumeSlock))
         }
-        add("Permissions…", #selector(showPermissions))
-        if capturePending {
-            add("Retry Capture", #selector(retryCapture))
-            add("Open Accessibility Settings…", #selector(openAccessibilitySettings))
-        }
-        if capturePending || controller.led.mode == .permissionRequired {
-            add("Open Input Monitoring Settings…", #selector(openInputMonitoringSettings))
-        }
-        if controller.capsInterceptor.isActive,
-           controller.led.mode == .permissionRequired || controller.led.mode == .unavailable {
-            add("Retry Keyboard Light", #selector(retryLED))
-        }
+        let permissions = add(PermissionMenu.title, #selector(showPermissions))
+        PermissionMenu.update(permissions, state: permissionState())
+        permissionsRequiredItem = permissions
         let login = add("Launch at Login", #selector(toggleLaunchAtLogin))
         login.state = launchAtLoginEnabled ? .on : .off
         if SMAppService.mainApp.status == .requiresApproval {
@@ -3746,6 +3913,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func invitePTT() {
         controller.invitePTT { [weak self] granted in
             if !granted {
+                if let self, self.controller.requiresMicrophonePermission, !self.permissionState().isReady {
+                    self.showPermissions()
+                    return
+                }
                 self?.showAlert(
                     title: "Could not enable push-to-talk",
                     message: self?.controller.lastError ?? "Enable slock under System Settings → Privacy & Security → Microphone, then try again."
@@ -3758,6 +3929,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let expected = item.representedObject as? NSNumber else { return }
         controller.acceptPTTInvite(expected: expected.uint64Value) { [weak self] granted in
             if !granted {
+                if let self, self.controller.requiresMicrophonePermission, !self.permissionState().isReady {
+                    self.showPermissions()
+                    return
+                }
                 self?.showAlert(
                     title: "Could not enable push-to-talk",
                     message: self?.controller.lastError ?? "Enable slock under System Settings → Privacy & Security → Microphone, then accept again."
@@ -3781,41 +3956,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func resumeSlock() {
         controller.setCaptureEnabled(true)
-        if !permissionSetup.state.isReady { showPermissions() }
-    }
-
-    @objc private func retryCapture() {
-        controller.retryCapture()
-        if !permissionSetup.state.isReady { showPermissions() }
+        if !permissionState().isReady { showPermissions() }
     }
 
     @objc private func showPermissions() {
+        _ = permissionState()
         if permissionWindow == nil {
             permissionWindow = PermissionSetupWindow(setup: permissionSetup, onReady: { [weak self] in
+                if let self, self.permissionSetup.state.microphone {
+                    self.controller.microphonePermissionRecovered()
+                }
                 self?.controller.retryCapture()
                 self?.controller.retryLED()
             }, readyMessage: { [weak self] in
-                guard let self else { return "Both permissions are enabled." }
+                guard let self else { return "All required permissions are enabled." }
                 if self.controller.capsInterceptor.isActive {
-                    return "Both permissions are enabled and Caps Lock capture is active."
+                    return "All required permissions are enabled and Caps Lock capture is active."
                 }
                 if !self.controller.capsInterceptor.isRequested {
-                    return "Both permissions are enabled. Slock remains paused; choose Resume Slock when ready."
+                    return "All required permissions are enabled. Slock remains paused; choose Resume Slock when ready."
                 }
-                return "Both permissions are enabled. \(self.controller.capsInterceptor.lastError ?? "Quit and reopen slock if capture remains inactive.")"
+                return "All required permissions are enabled. \(self.controller.capsInterceptor.lastError ?? "Quit and reopen slock if capture remains inactive.")"
+            }, refreshRequirements: { [weak self] in
+                _ = self?.permissionState()
+            }, useLightsOnly: { [weak self] in
+                self?.controller.disablePTT()
             })
         }
         permissionWindow?.present()
-    }
-
-    @objc private func openAccessibilitySettings() {
-        guard let settings = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else { return }
-        NSWorkspace.shared.open(settings)
-    }
-
-    @objc private func openInputMonitoringSettings() {
-        guard let settings = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") else { return }
-        NSWorkspace.shared.open(settings)
     }
 
     @objc private func toggleLaunchAtLogin() {
@@ -3832,10 +4000,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func testLED() {
         controller.selfTestLED()
-    }
-
-    @objc private func retryLED() {
-        controller.retryLED()
     }
 
     @objc private func showDiagnostics() {
