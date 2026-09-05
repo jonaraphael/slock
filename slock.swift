@@ -28,6 +28,7 @@ enum SlockConfig {
     static let helloInterval: TimeInterval = 10
     static let onlineTimeout: TimeInterval = 25
     static let remoteKeyTimeout: TimeInterval = 2.5
+    static let lightPlaybackDelay: TimeInterval = 1
     static let remoteTalkTimeout: TimeInterval = 5
 }
 
@@ -136,6 +137,325 @@ func runProcess(_ executable: String, _ arguments: [String]) throws -> (Int32, S
 
 func appError(_ domain: String, _ message: String, code: Int = 1) -> NSError {
     NSError(domain: domain, code: code, userInfo: [NSLocalizedDescriptionKey: message])
+}
+
+// MARK: - Release updates
+
+struct ReleaseVersion: Comparable {
+    let major: Int
+    let minor: Int
+    let patch: Int
+
+    init?(_ tag: String) {
+        let text = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+        let parts = text.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3 else { return nil }
+        let numbers = parts.compactMap { part -> Int? in
+            guard !part.isEmpty, part.utf8.allSatisfy({ (48...57).contains($0) }),
+                  part.count == 1 || part.first != "0" else { return nil }
+            return Int(part)
+        }
+        guard numbers.count == 3 else { return nil }
+        major = numbers[0]
+        minor = numbers[1]
+        patch = numbers[2]
+    }
+
+    static func < (lhs: Self, rhs: Self) -> Bool {
+        (lhs.major, lhs.minor, lhs.patch) < (rhs.major, rhs.minor, rhs.patch)
+    }
+}
+
+struct SlockUpdate: Equatable {
+    let tag: String
+
+    static func available(in data: Data, currentVersion: String) throws -> SlockUpdate? {
+        struct Release: Decodable {
+            let tag_name: String
+            let draft: Bool
+            let prerelease: Bool
+        }
+        let release = try JSONDecoder().decode(Release.self, from: data)
+        guard !release.draft, !release.prerelease,
+              let remote = ReleaseVersion(release.tag_name),
+              let local = ReleaseVersion(currentVersion), remote > local else { return nil }
+        return SlockUpdate(tag: release.tag_name)
+    }
+}
+
+// Owned and called by the main thread. Network work never blocks menu tracking.
+final class UpdateChecker {
+    typealias Completion = (Data?, URLResponse?, Error?) -> Void
+    typealias Fetch = (URLRequest, @escaping Completion) -> Void
+    static let checkInterval: TimeInterval = 60 * 60
+    static let retryInterval: TimeInterval = 5 * 60
+    static let latestReleaseURL = URL(string: "https://api.github.com/repos/jonaraphael/slock/releases/latest")!
+
+    private(set) var availableUpdate: SlockUpdate?
+    var onChange: (() -> Void)?
+    private let currentVersion: String
+    private let fetch: Fetch
+    private let now: () -> Date
+    private var nextCheck = Date.distantPast
+    private var checking = false
+
+    init(currentVersion: String = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+             ?? SlockConfig.appVersion,
+         now: @escaping () -> Date = Date.init,
+         fetch: @escaping Fetch = { request, completion in
+             URLSession.shared.dataTask(with: request, completionHandler: completion).resume()
+         }) {
+        self.currentVersion = currentVersion
+        self.now = now
+        self.fetch = fetch
+    }
+
+    func checkIfNeeded() {
+        guard !checking, now() >= nextCheck else { return }
+        checking = true
+        var request = URLRequest(url: Self.latestReleaseURL, cachePolicy: .reloadIgnoringLocalCacheData,
+                                 timeoutInterval: 15)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("2026-03-10", forHTTPHeaderField: "X-GitHub-Api-Version")
+        request.setValue("slock/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+        fetch(request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.checking = false
+                self.nextCheck = self.now().addingTimeInterval(Self.retryInterval)
+                // Keep a known update through temporary network/rate-limit failures.
+                guard error == nil, let http = response as? HTTPURLResponse else { return }
+                let update: SlockUpdate?
+                if http.statusCode == 404 {
+                    update = nil
+                } else if http.statusCode == 200, let data {
+                    do { update = try SlockUpdate.available(in: data, currentVersion: self.currentVersion) }
+                    catch { return }
+                } else {
+                    return
+                }
+                self.nextCheck = self.now().addingTimeInterval(Self.checkInterval)
+                guard update != self.availableUpdate else { return }
+                self.availableUpdate = update
+                self.onChange?()
+            }
+        }
+    }
+}
+
+// The replacement is staged beside the installed app so renames stay on one volume.
+struct PreparedUpdate {
+    let directory: URL
+    let destination: URL
+    var app: URL { directory.appendingPathComponent("slock.app") }
+    var backup: URL { directory.appendingPathComponent("previous.app") }
+    var helper: URL { directory.appendingPathComponent("install-update") }
+
+    func launchHelper() throws {
+        let process = Process()
+        process.executableURL = helper
+        process.arguments = ["--slock-install-update", String(getpid()), directory.path, destination.path]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+    }
+
+    func install(relaunch: (URL) throws -> Void = { url in
+        let (status, _, error) = try runProcess("/usr/bin/open", ["-n", url.path])
+        guard status == 0 else { throw appError("slock.Update", "Could not reopen slock: \(error)") }
+    }) throws {
+        let fm = FileManager.default
+        do { try fm.moveItem(at: destination, to: backup) }
+        catch { try? relaunch(destination); throw error }
+        do {
+            try fm.moveItem(at: app, to: destination)
+            try relaunch(destination)
+        } catch {
+            let installError = error
+            do {
+                if fm.fileExists(atPath: destination.path) { try fm.moveItem(at: destination, to: app) }
+                try fm.moveItem(at: backup, to: destination)
+            } catch {
+                throw appError("slock.Update", "The update could not be installed or restored. Your previous app is at \(backup.path). \(error.localizedDescription)")
+            }
+            try? relaunch(destination)
+            throw installError
+        }
+        try? fm.removeItem(at: directory)
+    }
+}
+
+enum UpdateInstaller {
+    static func verifyChecksum(_ checksumData: Data, archive: URL) throws {
+        guard let checksums = String(data: checksumData, encoding: .utf8) else {
+            throw appError("slock.Update", "The release checksum file is invalid.")
+        }
+        let matches = checksums.split(whereSeparator: \.isNewline).compactMap { line -> String? in
+            let fields = line.split(whereSeparator: \.isWhitespace)
+            guard fields.count == 2, fields[1] == "slock.app.zip", fields[0].count == 64,
+                  fields[0].utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return nil }
+            return String(fields[0])
+        }
+        guard matches.count == 1 else { throw appError("slock.Update", "The release is missing its app checksum.") }
+        let actual = SHA256.hash(data: try Data(contentsOf: archive, options: .mappedIfSafe))
+            .map { String(format: "%02x", $0) }.joined()
+        guard actual == matches[0] else { throw appError("slock.Update", "The download failed its checksum check. Please try again.") }
+    }
+
+    static func validateBundle(_ app: URL, expectedTag: String,
+                               verifySignature: (URL) throws -> Void = { url in
+        let (status, _, error) = try runProcess("/usr/bin/codesign", ["--verify", "--deep", "--strict", url.path])
+        guard status == 0 else { throw appError("slock.Update", "The downloaded app failed signature verification: \(error)") }
+    }) throws {
+        let data = try Data(contentsOf: app.appendingPathComponent("Contents/Info.plist"))
+        guard let info = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              info["CFBundleIdentifier"] as? String == "com.jonaraphael.CapsLink",
+              info["CFBundleExecutable"] as? String == "slock",
+              let version = info["CFBundleShortVersionString"] as? String,
+              let expected = ReleaseVersion(expectedTag), ReleaseVersion(version) == expected,
+              FileManager.default.isExecutableFile(atPath: app.appendingPathComponent("Contents/MacOS/slock").path) else {
+            throw appError("slock.Update", "The download is not the expected slock release.")
+        }
+        try verifySignature(app)
+    }
+
+    static func prepare(_ update: SlockUpdate, currentApp: URL, executable: URL,
+                        status: @escaping (String) -> Void) async throws -> PreparedUpdate {
+        let fm = FileManager.default
+        let destination = currentApp.resolvingSymlinksInPath()
+        guard destination.pathExtension == "app" else {
+            throw appError("slock.Update", "Run slock from slock.app to install an update.")
+        }
+        let directory = destination.deletingLastPathComponent().appendingPathComponent(".slock-update-\(UUID())")
+        do { try fm.createDirectory(at: directory, withIntermediateDirectories: false,
+                                   attributes: [.posixPermissions: 0o700]) }
+        catch {
+            throw appError("slock.Update", "slock cannot update in this location. Move slock.app to a writable Applications folder and try again. \(error.localizedDescription)")
+        }
+        let prepared = PreparedUpdate(directory: directory, destination: destination)
+        var keep = false
+        defer { if !keep { try? fm.removeItem(at: directory) } }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 300
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let base = URL(string: "https://github.com/jonaraphael/slock/releases/download/\(update.tag)/")!
+        let (checksumData, checksumResponse) = try await session.data(from: base.appendingPathComponent("SHA256SUMS"))
+        guard (checksumResponse as? HTTPURLResponse)?.statusCode == 200, checksumData.count <= 4096 else {
+            throw appError("slock.Update", "The release checksum is unavailable. Please try again later.")
+        }
+        let (archive, response) = try await session.download(from: base.appendingPathComponent("slock.app.zip"))
+        defer { try? fm.removeItem(at: archive) }
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw appError("slock.Update", "The app download is unavailable. Please try again later.")
+        }
+        try Task.checkCancellation()
+        status("Verifying update…")
+        try verifyChecksum(checksumData, archive: archive)
+        let (listingStatus, listing, _) = try runProcess("/usr/bin/unzip", ["-Z1", archive.path])
+        guard listingStatus == 0, validArchivePaths(listing) else {
+            throw appError("slock.Update", "The app archive contains unexpected files.")
+        }
+        let (unzipStatus, _, unzipError) = try runProcess("/usr/bin/ditto", ["-x", "-k", archive.path, directory.path])
+        guard unzipStatus == 0 else { throw appError("slock.Update", "Could not unpack the update: \(unzipError)") }
+        try validateBundle(prepared.app, expectedTag: update.tag)
+        try fm.copyItem(at: executable, to: prepared.helper)
+        try Task.checkCancellation()
+        keep = true
+        return prepared
+    }
+
+    static func validArchivePaths(_ listing: String) -> Bool {
+        let paths = listing.split(whereSeparator: \.isNewline)
+        return !paths.isEmpty && paths.allSatisfy { path in
+            !path.hasPrefix("/") && !path.split(separator: "/").contains("..")
+                && (path == "slock.app/" || path.hasPrefix("slock.app/") || path.hasPrefix("__MACOSX/"))
+        }
+    }
+
+    // This process has no keyboard capture or identity lock. The old app exits
+    // normally first, restoring its mapping and closing microphone/relay access.
+    static func runHelperIfRequested() -> Bool {
+        let args = CommandLine.arguments
+        guard args.dropFirst().first == "--slock-install-update" else { return false }
+        guard args.count == 5, let parent = Int32(args[2]), parent > 1 else { return true }
+        let prepared = PreparedUpdate(directory: URL(fileURLWithPath: args[3]),
+                                      destination: URL(fileURLWithPath: args[4]))
+        do {
+            let deadline = Date().addingTimeInterval(30)
+            while kill(parent, 0) == 0 || errno == EPERM {
+                guard Date() < deadline else { throw appError("slock.Update", "slock did not quit in time. Please try the update again.") }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            try prepared.install()
+        } catch {
+            NSApplication.shared.setActivationPolicy(.accessory)
+            let alert = NSAlert()
+            alert.messageText = "Could not update slock"
+            alert.informativeText = error.localizedDescription
+            alert.addButton(withTitle: "OK")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+            // Keep the directory if rollback failed; it holds the previous app.
+            if !FileManager.default.fileExists(atPath: prepared.backup.path) {
+                try? FileManager.default.removeItem(at: prepared.directory)
+            }
+        }
+        return true
+    }
+}
+
+// State is confined to the main queue; the detached task only delivers results
+// there. Keep AppKit's existing delegate/callback model without actor hopping.
+final class AppUpdater: @unchecked Sendable {
+    private(set) var status: String?
+    var onChange: (() -> Void)?
+    var onError: ((Error) -> Void)?
+    var onReadyToRelaunch: (() -> Void)?
+    private var task: Task<Void, Never>?
+
+    func install(_ update: SlockUpdate) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard status == nil, let executable = Bundle.main.executableURL else { return }
+        status = "Downloading update…"
+        onChange?()
+        let app = Bundle.main.bundleURL
+        task = Task.detached(priority: .utility) { [weak self] in
+            do {
+                let prepared = try await UpdateInstaller.prepare(update, currentApp: app, executable: executable) { text in
+                    DispatchQueue.main.async { self?.status = text; self?.onChange?() }
+                }
+                DispatchQueue.main.async {
+                    guard let self else { try? FileManager.default.removeItem(at: prepared.directory); return }
+                    do {
+                        try prepared.launchHelper()
+                        self.status = "Restarting slock…"
+                        self.onChange?()
+                        self.onReadyToRelaunch?()
+                    } catch {
+                        try? FileManager.default.removeItem(at: prepared.directory)
+                        self.failed(error)
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async { self?.failed(error) }
+            }
+        }
+    }
+
+    func cancel() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        task?.cancel()
+    }
+
+    private func failed(_ error: Error) {
+        status = nil
+        task = nil
+        onChange?()
+        onError?(error)
+    }
 }
 
 // MARK: - Identity and peer storage
@@ -373,6 +693,7 @@ enum WireKind: UInt8 {
     case hello = 10
     case keyState = 11
     case profile = 12
+    case captureState = 13
     case pttInvite = 20
     case pttAccept = 21
     case pttReject = 22
@@ -536,6 +857,76 @@ final class SecureWire {
         } catch {
             return nil
         }
+    }
+}
+
+// MARK: - Key rhythm playback
+
+struct KeyLightEvent {
+    let down: Bool
+    // CGEvent's monotonic timestamp, in nanoseconds. Only differences are used;
+    // the Macs' clocks never need to agree.
+    let timestamp: UInt64
+
+    var payload: Data {
+        var data = Data([down ? UInt8(1) : UInt8(0)])
+        data.appendUInt64(timestamp)
+        return data
+    }
+
+    static func read(_ payload: Data) -> KeyLightEvent? {
+        guard payload.count == 9, let state = payload.first, state <= 1,
+              let timestamp = payload.uint64(at: 1) else { return nil }
+        return KeyLightEvent(down: state == 1, timestamp: timestamp)
+    }
+}
+
+struct KeyLightTimeline {
+    private struct Pending {
+        let event: KeyLightEvent
+        var deadline: TimeInterval
+    }
+
+    private var pending: [Pending] = []
+    private var previousDeadline: TimeInterval?
+    private(set) var latest: KeyLightEvent?
+    var nextDeadline: TimeInterval? { pending.first?.deadline }
+    var pendingCount: Int { pending.count }
+
+    mutating func reset() { self = KeyLightTimeline() }
+
+    // Preserve every subsecond interval, including OFF gaps. Refill the buffer
+    // during longer intervals, where the duration is deliberately flexible.
+    // False means corrupt/discontinuous input or an excessive replay backlog.
+    mutating func append(_ event: KeyLightEvent, receivedAt now: TimeInterval) -> Bool {
+        var deadline = now + SlockConfig.lightPlaybackDelay
+        if let latest, let previousDeadline {
+            guard event.timestamp > latest.timestamp, event.down != latest.down else { return false }
+            let interval = Double(event.timestamp - latest.timestamp) / 1_000_000_000
+            if interval < 1 {
+                deadline = previousDeadline + interval
+            } else {
+                deadline = max(previousDeadline + 1, deadline)
+            }
+        }
+        guard pending.count < 256, deadline - now <= SlockConfig.remoteKeyTimeout else { return false }
+        pending.append(Pending(event: event, deadline: deadline))
+        latest = event
+        previousDeadline = deadline
+        return true
+    }
+
+    mutating func takeDue(at now: TimeInterval) -> KeyLightEvent? {
+        guard let first = pending.first, first.deadline <= now else { return nil }
+        pending.removeFirst()
+        // A late timer/packet must never cause a burst of catch-up flashes.
+        // Shift remaining playback so already queued short intervals survive.
+        let lateness = now - first.deadline
+        if lateness > 0 {
+            for index in pending.indices { pending[index].deadline += lateness }
+            if let previousDeadline { self.previousDeadline = previousDeadline + lateness }
+        }
+        return first.event
     }
 }
 
@@ -955,20 +1346,20 @@ private var cleanupArg3: UnsafeMutablePointer<CChar>?
 // Tap callbacks must defer expensive controller work, but queued presses must
 // never survive a disabled tap or be delivered to a later capture session.
 final class CapturedKeyDelivery {
-    var handler: ((Bool) -> Void)?
+    var handler: ((Bool, UInt64?) -> Void)?
     private var generation = UUID()
 
-    func enqueue(_ down: Bool) {
+    func enqueue(_ down: Bool, timestamp: UInt64) {
         let generation = generation
         DispatchQueue.main.async { [weak self] in
             guard let self, self.generation == generation else { return }
-            self.handler?(down)
+            self.handler?(down, timestamp)
         }
     }
 
     func release() {
         generation = UUID()
-        handler?(false)
+        handler?(false, nil)
     }
 
     func reset() {
@@ -1051,14 +1442,14 @@ private func capsEventTapCallback(
             let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
             if !isRepeat, !globalCapsIsDown {
                 globalCapsIsDown = true
-                globalCapsDelivery.enqueue(true)
+                globalCapsDelivery.enqueue(true, timestamp: event.timestamp)
             }
             return nil
         }
         if type == .keyUp {
             if globalCapsIsDown {
                 globalCapsIsDown = false
-                globalCapsDelivery.enqueue(false)
+                globalCapsDelivery.enqueue(false, timestamp: event.timestamp)
             }
             return nil
         }
@@ -1106,11 +1497,12 @@ enum KeyboardTapAccess {
 final class CapsInterceptor {
     typealias HIDMap = (src: UInt64, dst: UInt64)
 
-    var onKeyState: ((Bool) -> Void)?
+    var onKeyState: ((Bool, UInt64?) -> Void)?
     var onStatusChange: (() -> Void)?
 
     private(set) var isActive = false
     private(set) var permissionGranted = false
+    var inputMonitoringPermissionGranted: Bool { listenCheck() }
     private(set) var lastError: String?
     private(set) var originalMappings: [HIDMap] = []
 
@@ -1271,7 +1663,7 @@ final class CapsInterceptor {
         globalCapsDelivery.release()
         if globalCapsIsDown {
             globalCapsIsDown = false
-            onKeyState?(false)
+            onKeyState?(false, nil)
         }
         if let json = defaults.string(forKey: staleMappingKey) {
             do {
@@ -1320,7 +1712,7 @@ final class CapsInterceptor {
         eventTap = tap
         runLoopSource = source
         globalCapsEventTap = tap
-        globalCapsDelivery.handler = { [weak self] down in self?.onKeyState?(down) }
+        globalCapsDelivery.handler = { [weak self] down, timestamp in self?.onKeyState?(down, timestamp) }
         globalCapsClearLock = { [weak self] in
             guard let self else { return }
             if !self.writeLock(false) {
@@ -2358,7 +2750,11 @@ final class SlockController {
     private let checkAudio: () throws -> Void
     private let requestMicrophone: (@escaping (Bool) -> Void) -> Void
     private let logsStatus: Bool
+    private let now: () -> TimeInterval
     private var timer: Timer?
+    private var lightTimer: DispatchSourceTimer?
+    private var lightTimeline = KeyLightTimeline()
+    private var lightGeneration = UUID()
     private var audioCapture: VoiceCapture?
     private var audioPlayback: VoicePlayback?
 
@@ -2366,6 +2762,7 @@ final class SlockController {
     private(set) var localKeyDown = false
     private(set) var remoteKeyDown = false
     private(set) var peerOnline = false
+    private(set) var peerPaused = false
     private(set) var localTalking = false
     private(set) var remoteTalking = false
     private(set) var incomingPairPublicKey: Data?
@@ -2377,6 +2774,7 @@ final class SlockController {
     var incomingPTTInvite: Bool { peerStore.ptt.incoming != nil }
     var outgoingPTTInvite: Bool { peerStore.ptt.outgoing != nil }
     private var microphonePermissionPending = false
+    private var microphonePermissionInvitation: UInt64?
     private static let microphonePermissionError = "Microphone permission is required for PTT."
     var requiresMicrophonePermission: Bool { pttEnabled || outgoingPTTInvite || microphonePermissionPending }
     private var consentGeneration = UUID()
@@ -2418,7 +2816,8 @@ final class SlockController {
          makeCapture: @escaping () throws -> VoiceCapture = { try AudioCapture() },
          makePlayback: @escaping () throws -> VoicePlayback = { try AudioPlayback() },
          checkAudio: @escaping () throws -> Void = { _ = try OpusEncoder(); _ = try OpusDecoder() },
-         requestMicrophone: @escaping (@escaping (Bool) -> Void) -> Void = SlockController.ensureMicrophonePermission) {
+         requestMicrophone: @escaping (@escaping (Bool) -> Void) -> Void = SlockController.ensureMicrophonePermission,
+         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.identity = identity
         self.peerStore = peerStore
         self.capsInterceptor = capsInterceptor
@@ -2428,6 +2827,7 @@ final class SlockController {
         self.makePlayback = makePlayback
         self.checkAudio = checkAudio
         self.requestMicrophone = requestMicrophone
+        self.now = now
         logsStatus = startServices
         wire = SecureWire(identity: identity)
 
@@ -2440,8 +2840,9 @@ final class SlockController {
                 self.retryOutgoingPTTInvite(force: true)
             } else {
                 self.peerOnline = false
+                self.peerPaused = false
                 self.lastPeerSeen = nil
-                self.updateRemoteKey(false)
+                self.clearRemoteKey()
                 self.stopLocalTalk()
                 self.stopRemoteTalk(immediate: true)
             }
@@ -2450,8 +2851,8 @@ final class SlockController {
         transport.onMessage = { [weak self] _, packet in
             self?.receive(packet)
         }
-        capsInterceptor.onKeyState = { [weak self] down in
-            self?.handleLocalKey(down)
+        capsInterceptor.onKeyState = { [weak self] down, timestamp in
+            self?.handleLocalKey(down, timestamp: timestamp)
         }
         capsInterceptor.onStatusChange = { [weak self] in
             guard let self else { return }
@@ -2466,6 +2867,8 @@ final class SlockController {
             if self.capsInterceptor.isActive != self.captureWasActive {
                 self.captureWasActive = self.capsInterceptor.isActive
                 if self.captureWasActive { self.led.set(false) }
+                else { self.clearRemoteKey() }
+                self.sendCaptureState()
             }
             self.changed()
         }
@@ -2493,21 +2896,30 @@ final class SlockController {
     }
 
     var statusText: String {
-        if let lastError { return "Error: \(lastError)" }
-        if !capsInterceptor.isRequested, !capsInterceptor.isActive { return "Caps Lock capture inactive" }
-        if !capsInterceptor.permissionGranted { return "Accessibility permission required" }
-        if !capsInterceptor.isActive { return capsInterceptor.lastError ?? "Caps Lock capture inactive" }
-        if incomingPairPublicKey != nil { return "Pair request waiting" }
-        if incomingPTTInvite { return "PTT invitation waiting" }
-        if let outgoingPairPublicKey { return "Pairing request sent to \(peerName(outgoingPairPublicKey))" }
-        if peerStore.peerPublicKey == nil { return "Not paired" }
-        if transportState != .connected { return transportState.text }
-        if localTalking { return "Transmitting" }
-        if remoteTalking { return "Receiving" }
-        if !peerOnline { return "Paired · peer offline" }
-        if led.mode == .permissionRequired { return "Connected · keyboard light needs permission" }
-        if led.mode == .unavailable { return "Connected · keyboard light unavailable" }
-        return peerStore.pttEnabled ? "Connected · PTT enabled" : "Connected"
+        if lastError != nil { return "Error" }
+        if !capsInterceptor.isRequested, !capsInterceptor.isActive { return "Paused" }
+        if !capsInterceptor.permissionGranted { return "Permission Required • Accessibility" }
+        if !capsInterceptor.isActive {
+            if !capsInterceptor.inputMonitoringPermissionGranted { return "Permission Required • Input Monitoring" }
+            return "Error"
+        }
+        if incomingPairPublicKey != nil { return "Pairing • Request Received" }
+        if incomingPTTInvite { return "Paired • PTT Invitation Received" }
+        if outgoingPairPublicKey != nil { return "Pairing • Request Sent" }
+        guard let peerPublicKey = peerStore.peerPublicKey else { return "Unpaired" }
+        switch transportState {
+        case .stopped: return "Paired • Offline"
+        case .connecting: return "Paired • Connecting"
+        case .error: return "Error"
+        case .connected: break
+        }
+        if peerPaused { return "Paired • Paused" }
+        if localTalking { return "Paired • Transmitting" }
+        if remoteTalking { return "Paired • Receiving" }
+        if !peerOnline { return "Paired • Offline" }
+        if led.mode == .permissionRequired { return "Paired • Light Permission Required" }
+        if led.mode == .unavailable { return "Paired • Light Unavailable" }
+        return "Paired • \(peerName(peerPublicKey))"
     }
 
     func suppliedNickname(for key: Data) -> String {
@@ -2595,6 +3007,7 @@ final class SlockController {
         guard let peer = peerStore.peerPublicKey else { completion(false); return }
         guard preparePTT() else { completion(false); return }
         microphonePermissionPending = true
+        microphonePermissionInvitation = nil
         consentGeneration = UUID()
         let generation = consentGeneration
         requestMicrophone { [weak self] granted in
@@ -2624,12 +3037,18 @@ final class SlockController {
         }
         guard preparePTT() else { completion(false); return }
         microphonePermissionPending = true
+        microphonePermissionInvitation = invitation
         consentGeneration = UUID()
         let generation = consentGeneration
         requestMicrophone { [weak self] granted in
             guard let self else { return }
-            guard self.peerStore.peerPublicKey == peer, self.consentGeneration == generation,
-                  self.peerStore.ptt.incoming == invitation else { return }
+            guard self.peerStore.peerPublicKey == peer, self.consentGeneration == generation else { return }
+            guard self.peerStore.ptt.incoming == invitation else {
+                self.cancelMicrophonePermissionRequest()
+                self.changed()
+                return
+            }
+            self.microphonePermissionInvitation = nil
             if granted {
                 self.microphonePermissionPending = false
                 self.peerStore.ptt.accept(invitation)
@@ -2648,17 +3067,14 @@ final class SlockController {
     func rejectPTTInvite(expected: UInt64) {
         guard let peer = peerStore.peerPublicKey, let invitation = peerStore.ptt.incoming,
               invitation == expected else { return }
-        consentGeneration = UUID()
-        microphonePermissionPending = false
+        cancelMicrophonePermissionRequest()
         peerStore.ptt.reject(invitation)
         sendPTT(.pttReject, id: invitation, to: peer)
         changed()
     }
 
     func disablePTT() {
-        if lastError == Self.microphonePermissionError { lastError = nil }
-        microphonePermissionPending = false
-        consentGeneration = UUID()
+        cancelMicrophonePermissionRequest()
         peerStore.ptt.disable()
         if let peer = peerStore.peerPublicKey, let revoked = peerStore.ptt.revoked {
             sendPTT(.pttDisable, id: revoked, to: peer)
@@ -2669,11 +3085,30 @@ final class SlockController {
         changed()
     }
 
-    func microphonePermissionRecovered() {
-        guard microphonePermissionPending else { return }
+    func permissionState(grants: KeyboardPermissionState) -> KeyboardPermissionState {
+        // Reconcile grants on ordinary status refresh, even after the guide was
+        // closed. Only a transition emits a change, so that refresh is finite.
+        if grants.microphone && microphonePermissionPending {
+            microphonePermissionPending = false
+            if lastError == Self.microphonePermissionError { lastError = nil }
+            changed()
+        }
+        var state = grants
+        state.microphoneRequired = requiresMicrophonePermission
+        return state
+    }
+
+    private func cancelMicrophonePermissionRequest() {
+        consentGeneration = UUID()
         microphonePermissionPending = false
+        microphonePermissionInvitation = nil
         if lastError == Self.microphonePermissionError { lastError = nil }
-        changed()
+    }
+
+    private func cancelStaleMicrophonePermissionInvitation() {
+        guard let invitation = microphonePermissionInvitation,
+              peerStore.ptt.incoming != invitation else { return }
+        cancelMicrophonePermissionRequest()
     }
 
     private func sendPTT(_ kind: WireKind, id: UInt64, to peer: Data) {
@@ -2699,9 +3134,7 @@ final class SlockController {
             capsInterceptor.requestPermissionAndStart()
         } else {
             handleLocalKey(false)
-            remoteKeyDown = false
-            lastRemoteKeySeen = nil
-            if capsInterceptor.isActive { led.set(false) }
+            clearRemoteKey()
             capsInterceptor.stop()
         }
         changed()
@@ -2759,7 +3192,7 @@ final class SlockController {
             }
         }
         stopRemoteTalk(immediate: true)
-        if capsInterceptor.isActive { led.set(false) }
+        clearRemoteKey()
         capsInterceptor.stop()
         transport.stop()
     }
@@ -2779,6 +3212,7 @@ final class SlockController {
             "Peer: \(peerShortID ?? "none")",
             "Transport: \(transportState.text)",
             "Peer online: \(peerOnline)",
+            "Peer paused: \(peerPaused)",
             "PTT enabled: \(pttEnabled)",
             "Accessibility trusted: \(capsInterceptor.permissionGranted)",
             "Input Monitoring allowed: \(CGPreflightListenEventAccess())",
@@ -2791,6 +3225,8 @@ final class SlockController {
             "Key messages received: \(receivedKeyMessages)",
             "Peer HELLOs received: \(receivedPeerHellos)",
             "Last peer key state: \(lastPeerKeyState.map { $0 ? "down" : "up" } ?? "none")",
+            "Light playback: \(lightTimeline.latest == nil ? "Immediate state sync" : "Timestamped rhythm (1 s buffer)")",
+            "Pending light transitions: \(lightTimeline.pendingCount)",
             "System Caps Lock on: \(CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift))",
             "Caps error: \(capsInterceptor.lastError ?? "none")",
             "LED mode: \(led.mode.rawValue)",
@@ -2809,7 +3245,7 @@ final class SlockController {
 
         if message.kind == .hello {
             if message.needsHelloReply {
-                let now = ProcessInfo.processInfo.systemUptime
+                let now = now()
                 if now - (lastHandshakeReply[sender] ?? -10) >= 1 {
                     if lastHandshakeReply.count >= 32 { lastHandshakeReply.removeAll() }
                     lastHandshakeReply[sender] = now
@@ -2818,12 +3254,13 @@ final class SlockController {
             }
             guard message.sessionConfirmed else { return }
             if message.newSession, peerStore.peerPublicKey == sender {
+                peerPaused = false
                 consentGeneration = UUID()
                 peerStore.ptt.incoming = nil
                 // An outgoing invitation is retried only after this fresh handshake.
                 stopLocalTalk()
                 stopRemoteTalk(immediate: true)
-                updateRemoteKey(false)
+                clearRemoteKey()
             }
             retryOutgoingPairRequest(force: true)
             retryOutgoingPTTInvite(force: true)
@@ -2873,14 +3310,27 @@ final class SlockController {
             receivedPeerHellos += 1
             if message.payload.count == 9, let revoked = message.payload.uint64(at: 1) {
                 applyPTTRevocation(revoked)
-                updateRemoteKey(message.payload[0] != 0)
+                receiveRemoteKeySnapshot(message.payload[0] != 0)
             }
-        case .keyState:
+            // Refresh after every confirmed HELLO so lost pause/resume updates
+            // recover without changing the legacy HELLO payload.
+            sendCaptureState()
+        case .captureState:
+            guard message.payload.count == 1, let active = message.payload.first, active <= 1 else { return }
             markPeerSeen()
-            if let value = message.payload.first {
+            peerPaused = active == 0
+            if peerPaused { clearRemoteKey() }
+        case .keyState:
+            if let event = KeyLightEvent.read(message.payload) {
+                markPeerSeen()
                 receivedKeyMessages += 1
-                lastPeerKeyState = value != 0
-                updateRemoteKey(value != 0)
+                lastPeerKeyState = event.down
+                receiveRemoteKeyEvent(event)
+            } else if message.payload.count == 1, let value = message.payload.first, value <= 1 {
+                markPeerSeen()
+                receivedKeyMessages += 1
+                lastPeerKeyState = value == 1
+                receiveRemoteKeySnapshot(value == 1)
             }
         case .profile:
             break
@@ -2892,6 +3342,7 @@ final class SlockController {
             } else if let accepted = peerStore.ptt.receiveInvitation(invitation) {
                 sendPTT(.pttAccept, id: accepted, to: sender)
             }
+            cancelStaleMicrophonePermissionInvitation()
         case .pttAccept:
             guard let invitation = message.payload.uint64(at: 0), message.payload.count == 8,
                   peerStore.ptt.receiveAcceptance(invitation) else { return }
@@ -2935,7 +3386,7 @@ final class SlockController {
         changed()
     }
 
-    private func handleLocalKey(_ down: Bool) {
+    private func handleLocalKey(_ down: Bool, timestamp: UInt64? = nil) {
         guard !down || capsInterceptor.isActive else { return }
         guard localKeyDown != down else { return }
         localKeyDown = down
@@ -2945,7 +3396,9 @@ final class SlockController {
         // changed its own Caps Lock LED before the remapped event arrived.
         if capsInterceptor.isActive { led.set(remoteKeyDown) }
         if let peer = peerStore.peerPublicKey {
-            send(kind: .keyState, payload: Data([down ? UInt8(1) : UInt8(0)]), to: peer)
+            let payload = timestamp.map { KeyLightEvent(down: down, timestamp: $0).payload }
+                ?? Data([down ? UInt8(1) : UInt8(0)])
+            send(kind: .keyState, payload: payload, to: peer)
         }
         if down {
             if peerStore.pttEnabled, peerOnline, transportState == .connected, !remoteTalking {
@@ -2958,16 +3411,82 @@ final class SlockController {
         changed()
     }
 
-    private func updateRemoteKey(_ down: Bool) {
-        guard capsInterceptor.isActive else {
-            remoteKeyDown = false
-            lastRemoteKeySeen = nil
-            return
-        }
+    private func applyRemoteKey(_ down: Bool) {
+        guard capsInterceptor.isActive else { return }
         remoteKeyDown = down
-        lastRemoteKeySeen = down ? ProcessInfo.processInfo.systemUptime : nil
         led.set(down)
     }
+
+    private func cancelLightPlayback() {
+        lightGeneration = UUID()
+        lightTimer?.cancel()
+        lightTimer = nil
+        lightTimeline.reset()
+    }
+
+    private func clearRemoteKey() {
+        cancelLightPlayback()
+        remoteKeyDown = false
+        lastRemoteKeySeen = nil
+        if capsInterceptor.isActive { led.set(false) }
+    }
+
+    private func receiveRemoteKeySnapshot(_ down: Bool) {
+        guard capsInterceptor.isActive else { return }
+        lastRemoteKeySeen = now()
+        // HELLOs and one-byte held-key refreshes carry no transition timing.
+        // A matching snapshot renews the lease without skipping buffered edges.
+        if let latest = lightTimeline.latest, latest.down == down { return }
+        cancelLightPlayback()
+        applyRemoteKey(down)
+    }
+
+    private func receiveRemoteKeyEvent(_ event: KeyLightEvent) {
+        guard capsInterceptor.isActive else { return }
+        let receivedAt = now()
+        lastRemoteKeySeen = receivedAt
+        guard lightTimeline.append(event, receivedAt: receivedAt) else {
+            clearRemoteKey()
+            return
+        }
+        scheduleLightPlayback()
+    }
+
+    private func scheduleLightPlayback() {
+        lightTimer?.cancel()
+        lightTimer = nil
+        lightGeneration = UUID()
+        guard let deadline = lightTimeline.nextDeadline else { return }
+        let generation = lightGeneration
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: .main)
+        timer.schedule(deadline: .now() + max(0, deadline - now()), leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in
+            guard let self, self.lightGeneration == generation else { return }
+            self.playDueLightEvent()
+        }
+        lightTimer = timer
+        timer.resume()
+    }
+
+    private func playDueLightEvent() {
+        let time = now()
+        guard capsInterceptor.isActive, let lastRemoteKeySeen,
+              time - lastRemoteKeySeen <= SlockConfig.remoteKeyTimeout else {
+            clearRemoteKey()
+            changed()
+            return
+        }
+        if let event = lightTimeline.takeDue(at: time) {
+            applyRemoteKey(event.down)
+            changed()
+        }
+        scheduleLightPlayback()
+    }
+
+    #if CAPSLINK_TESTING
+    func advanceLightPlayback() { playDueLightEvent() }
+    func advanceMaintenance() { tick() }
+    #endif
 
     private func startLocalTalk() {
         guard !localTalking,
@@ -3063,7 +3582,7 @@ final class SlockController {
             remoteTalkID = talkID
             remoteTalking = true
             remoteTalkEnding = false
-            lastRemoteTalkSeen = ProcessInfo.processInfo.systemUptime
+            lastRemoteTalkSeen = now()
             playback.beginTalk()
         } catch {
             lastError = "Could not start PTT playback: \(error.localizedDescription)"
@@ -3076,7 +3595,7 @@ final class SlockController {
               talkID == remoteTalkID,
               payload.count > 8 else { return }
         markPeerSeen()
-        lastRemoteTalkSeen = ProcessInfo.processInfo.systemUptime
+        lastRemoteTalkSeen = now()
         audioPlayback?.receiveBatch(Data(payload.dropFirst(8)))
     }
 
@@ -3112,7 +3631,7 @@ final class SlockController {
 
     private func retryOutgoingPairRequest(force: Bool = false) {
         guard transportState == .connected, let target = outgoingPairPublicKey else { return }
-        let now = ProcessInfo.processInfo.systemUptime
+        let now = now()
         guard force || (now - lastPairRequestSent) >= 10 else { return }
         lastPairRequestSent = now
         send(kind: .pairRequest, payload: PeerProfile.payload(peerStore.ownNickname), to: target)
@@ -3122,7 +3641,7 @@ final class SlockController {
         guard transportState == .connected,
               outgoingPTTInvite,
               let peer = peerStore.peerPublicKey else { return }
-        let now = ProcessInfo.processInfo.systemUptime
+        let now = now()
         guard force || (now - lastPTTInviteSent) >= 10 else { return }
         lastPTTInviteSent = now
         if let invitation = peerStore.ptt.outgoing { sendPTT(.pttInvite, id: invitation, to: peer) }
@@ -3130,7 +3649,7 @@ final class SlockController {
 
     private func sendHello(force: Bool = false) {
         guard transportState == .connected, let peer = peerStore.peerPublicKey else { return }
-        let now = ProcessInfo.processInfo.systemUptime
+        let now = now()
         guard force || (now - lastHelloSent) >= SlockConfig.helloInterval else { return }
         lastHelloSent = now
         send(kind: .hello, payload: helloPayload(for: peer), to: peer)
@@ -3144,9 +3663,15 @@ final class SlockController {
         return payload
     }
 
+    private func sendCaptureState() {
+        guard let peer = peerStore.peerPublicKey else { return }
+        send(kind: .captureState, payload: Data([capsInterceptor.isActive ? UInt8(1) : UInt8(0)]), to: peer)
+    }
+
     private func applyPTTRevocation(_ id: UInt64) {
         let before = peerStore.ptt.active
         peerStore.ptt.receiveRevocation(id)
+        cancelStaleMicrophonePermissionInvitation()
         if before != peerStore.ptt.active {
             consentGeneration = UUID()
             stopLocalTalk()
@@ -3176,7 +3701,7 @@ final class SlockController {
     }
 
     private func tick() {
-        let now = ProcessInfo.processInfo.systemUptime
+        let now = now()
         sendHello()
         retryOutgoingPairRequest()
         retryOutgoingPTTInvite()
@@ -3185,9 +3710,9 @@ final class SlockController {
             send(kind: .keyState, payload: Data([UInt8(1)]), to: peer)
         }
 
-        if remoteKeyDown, let last = lastRemoteKeySeen,
+        if let last = lastRemoteKeySeen,
            (now - last) > SlockConfig.remoteKeyTimeout {
-            updateRemoteKey(false)
+            clearRemoteKey()
         }
 
         if remoteTalking, let last = lastRemoteTalkSeen,
@@ -3202,7 +3727,8 @@ final class SlockController {
             peerOnline = false
         }
         if wasOnline && !peerOnline {
-            updateRemoteKey(false)
+            peerPaused = false
+            clearRemoteKey()
             stopRemoteTalk(immediate: true)
             stopLocalTalk()
         }
@@ -3210,15 +3736,15 @@ final class SlockController {
     }
 
     private func markPeerSeen() {
-        lastPeerSeen = ProcessInfo.processInfo.systemUptime
+        lastPeerSeen = now()
         peerOnline = true
     }
 
     private func clearPeer() {
-        microphonePermissionPending = false
+        cancelMicrophonePermissionRequest()
         stopLocalTalk()
         stopRemoteTalk(immediate: true)
-        updateRemoteKey(false)
+        clearRemoteKey()
         peerStore.peerPublicKey = nil
         incomingPairPublicKey = nil
         outgoingPairPublicKey = nil
@@ -3232,6 +3758,7 @@ final class SlockController {
         lastPTTInviteSent = -.infinity
         lastPeerSeen = nil
         peerOnline = false
+        peerPaused = false
         changed()
     }
 
@@ -3251,6 +3778,7 @@ final class SlockController {
     private func changed() {
         if logsStatus {
             let status = "transport=\(transportState.text) paired=\(peerPublicKey != nil) online=\(peerOnline) "
+                + "peerPaused=\(peerPaused) "
                 + "capture=\(capsInterceptor.isActive) led=\(led.mode.rawValue) "
                 + "presses=\(localPressCount) sentKeys=\(sentKeyMessages) receivedKeys=\(receivedKeyMessages)"
             if status != lastLoggedLinkStatus {
@@ -3269,14 +3797,18 @@ enum FireflyIcon {
         case idle
         case outgoing
         case notification
+        case paused
     }
 
     static let idle = makeImage(tail: .idle)
     static let outgoing = makeImage(tail: .outgoing)
     static let notification = makeImage(tail: .notification)
+    static let paused = makeImage(tail: .paused)
 
-    static func tailState(localActive: Bool, attention: Bool, permissionsRequired: Bool = false) -> TailState {
+    static func tailState(localActive: Bool, attention: Bool, peerPaused: Bool = false,
+                          permissionsRequired: Bool = false) -> TailState {
         if permissionsRequired { return .notification }
+        if peerPaused { return .paused }
         if localActive { return .outgoing }
         if attention { return .notification }
         return .idle
@@ -3287,14 +3819,14 @@ enum FireflyIcon {
         case .idle: return idle
         case .outgoing: return outgoing
         case .notification: return notification
+        case .paused: return paused
         }
     }
 
     private static func makeImage(tail: TailState) -> NSImage {
         // Vector artwork stays crisp at both Retina and standard scale. Idle
-        // artwork is a template; outgoing and notification states keep an
-        // adaptive body with a colored tail.
-        let isColored = tail == .outgoing || tail == .notification
+        // artwork is a template; colored tails keep an adaptive body.
+        let isColored = tail != .idle
         let image = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
             NSGraphicsContext.saveGraphicsState()
             let transform = NSAffineTransform()
@@ -3329,6 +3861,9 @@ enum FireflyIcon {
             case .notification:
                 NSColor.systemRed.setFill()
                 NSBezierPath(ovalIn: NSRect(x: 37, y: 98, width: 46, height: 46)).fill()
+            case .paused:
+                NSColor.systemBlue.setFill()
+                NSBezierPath(ovalIn: NSRect(x: 37, y: 98, width: 46, height: 46)).fill()
             case .idle:
                 let tail = NSBezierPath(ovalIn: NSRect(x: 41, y: 102, width: 38, height: 38))
                 tail.lineWidth = 8
@@ -3338,7 +3873,8 @@ enum FireflyIcon {
             return true
         }
         image.isTemplate = !isColored
-        image.accessibilityDescription = "Dit, the slock firefly"
+        image.accessibilityDescription = tail == .paused
+            ? "Dit, the slock firefly — peer paused" : "Dit, the slock firefly"
         return image
     }
 }
@@ -3403,7 +3939,7 @@ final class PermissionSetupWindow: NSWindowController, NSWindowDelegate {
     private let titleLabel = NSTextField(labelWithString: "Give slock access to your keyboard")
     private let introduction = NSTextField(wrappingLabelWithString: "")
     private let progress = NSTextField(wrappingLabelWithString:
-        "Enable the required permissions below. macOS may open a dialog; the Enable buttons also take you to Settings.")
+        "Enable the required permissions above. macOS may open a dialog; the Enable buttons also take you to Settings.")
     private let closeButton = NSButton(title: "Later", target: nil, action: nil)
     private let lightsOnlyButton = NSButton(title: "Use lights only", target: nil, action: nil)
     private var permissionButtons: [KeyboardPermission: NSButton] = [:]
@@ -3557,7 +4093,7 @@ final class PermissionSetupWindow: NSWindowController, NSWindowDelegate {
             }
         }
         progress.stringValue = state.isReady ? readyMessage()
-            : "Enable the required permissions below. macOS may open a dialog; the Enable buttons also take you to Settings."
+            : "Enable the required permissions above. macOS may open a dialog; the Enable buttons also take you to Settings."
         closeButton.title = state.isReady ? "Done" : "Later"
         if let stack = contentStack {
             window?.contentView?.layoutSubtreeIfNeeded()
@@ -3621,6 +4157,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var instanceLock: SingleInstanceLock?
     private var optionOnlyItems: [NSMenuItem] = []
     private var menuModifierTimer: Timer?
+    private let updateChecker = UpdateChecker()
+    private let updater = AppUpdater()
+    private var updateTimer: Timer?
+    private var updateMenuItem: NSMenuItem?
     private let permissionSetup = KeyboardPermissionSetup()
     private var permissionWindow: PermissionSetupWindow?
     private var permissionsRequiredItem: NSMenuItem?
@@ -3641,6 +4181,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
+        updateChecker.onChange = { [weak self] in self?.refreshUpdateMenuItem() }
+        updater.onChange = { [weak self] in self?.refreshUpdateMenuItem() }
+        updater.onError = { [weak self] error in
+            self?.showAlert(title: "Could not update slock", message: error.localizedDescription)
+        }
+        updater.onReadyToRelaunch = { NSApp.terminate(nil) }
+        updateChecker.checkIfNeeded()
+        let updateTimer = Timer(timeInterval: UpdateChecker.retryInterval, repeats: true) { [weak self] _ in
+            self?.updateChecker.checkIfNeeded()
+        }
+        self.updateTimer = updateTimer
+        RunLoop.main.add(updateTimer, forMode: .common)
         updateStatusItem()
         enableLaunchAtLoginByDefault()
         updateStatusItem()
@@ -3653,6 +4205,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         menuModifierTimer?.invalidate()
+        updateTimer?.invalidate()
+        updater.cancel()
         permissionWindow?.close()
         controller?.shutdown()
     }
@@ -3662,12 +4216,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func permissionState() -> KeyboardPermissionState {
-        permissionSetup.microphoneRequired = controller.requiresMicrophonePermission
-        return permissionSetup.state
+        let state = controller.permissionState(grants: permissionSetup.state)
+        permissionSetup.microphoneRequired = state.microphoneRequired
+        return state
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         rebuildMenu()
+        updateChecker.checkIfNeeded()
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -3708,18 +4264,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let tail = FireflyIcon.tailState(
             localActive: controller.localKeyDown || controller.localTalking,
             attention: needsAttention,
+            peerPaused: controller.peerPaused,
             permissionsRequired: !permissions.isReady
         )
         button.image = FireflyIcon.image(tail: tail)
         button.title = ""
-        button.toolTip = "slock — \(permissions.isReady ? controller.statusText : PermissionMenu.title)"
+        button.toolTip = "slock - \(permissions.isReady ? controller.statusText : PermissionMenu.title)"
     }
 
     private func rebuildMenu() {
         menu.removeAllItems()
         optionOnlyItems.removeAll()
         permissionsRequiredItem = nil
-        addDisabled("slock — \(controller.statusText)")
+        addDisabled("slock - \(controller.statusText)")
         optionOnlyItems.append(addDisabled("This Mac: \(controller.identity.shortID)"))
         menu.addItem(.separator())
 
@@ -3743,8 +4300,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             recent.addItem(item)
         }
         if controller.peerPublicKey != nil {
-            addDisabled("Paired with \(controller.peerName(controller.peerPublicKey!))")
-            add("Unpair…", #selector(unpair))
+            add("Unpair", #selector(unpair))
         }
 
         if let incoming = controller.incomingPairPublicKey {
@@ -3763,7 +4319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 add("Accept PTT Invitation", #selector(acceptPTT(_:))).representedObject = NSNumber(value: invitation)
                 add("Reject PTT Invitation", #selector(rejectPTT(_:))).representedObject = NSNumber(value: invitation)
             } else if controller.outgoingPTTInvite {
-                addDisabled("PTT invitation sent")
+                addDisabled("PTT Invitation Sent")
             } else {
                 add("Invite Peer to Enable PTT", #selector(invitePTT))
             }
@@ -3790,8 +4346,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             add("Clear Error", #selector(clearError))
         }
         menu.addItem(.separator())
+        updateMenuItem = add("Update slock", #selector(updateSlock))
+        refreshUpdateMenuItem()
         add("Quit slock", #selector(quit))
         updateOptionOnlyItems()
+    }
+
+    private func refreshUpdateMenuItem() {
+        guard let item = updateMenuItem else { return }
+        item.title = updater.status ?? "Update slock"
+        item.isHidden = updateChecker.availableUpdate == nil && updater.status == nil
+        item.action = updater.status == nil ? #selector(updateSlock) : nil
+        item.isEnabled = updater.status == nil && updateChecker.availableUpdate != nil
+        item.toolTip = updateChecker.availableUpdate.map { "Download \($0.tag), replace slock, and restart." }
+    }
+
+    @objc private func updateSlock() {
+        guard let update = updateChecker.availableUpdate else { return }
+        updater.install(update)
     }
 
     @discardableResult
@@ -3899,15 +4471,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func unpair() {
-        let alert = NSAlert()
-        alert.messageText = "Unpair \(controller.peerShortID ?? "this peer")?"
-        alert.informativeText = "Caps Lock mirroring and PTT will stop on both Macs."
-        alert.addButton(withTitle: "Unpair")
-        alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn {
-            controller.unpair()
-        }
+        controller.unpair()
     }
 
     @objc private func invitePTT() {
@@ -3963,9 +4527,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = permissionState()
         if permissionWindow == nil {
             permissionWindow = PermissionSetupWindow(setup: permissionSetup, onReady: { [weak self] in
-                if let self, self.permissionSetup.state.microphone {
-                    self.controller.microphonePermissionRecovered()
-                }
                 self?.controller.retryCapture()
                 self?.controller.retryLED()
             }, readyMessage: { [weak self] in
@@ -4088,6 +4649,7 @@ private func installProcessCleanupHandlers() {
 @main
 enum SlockApp {
     static func main() {
+        if UpdateInstaller.runHelperIfRequested() { return }
         installProcessCleanupHandlers()
         let app = NSApplication.shared
         let delegate = AppDelegate()

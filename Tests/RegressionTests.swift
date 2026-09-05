@@ -83,6 +83,16 @@ private final class FakeLEDOutput: CapsLEDOutput {
 }
 
 private final class TestMac {
+    final class Clock {
+        var usesSystemTime = false
+        private var fixedTime: TimeInterval = 100
+        var time: TimeInterval {
+            get { usesSystemTime ? ProcessInfo.processInfo.systemUptime : fixedTime }
+            set { fixedTime = newValue }
+        }
+        var lightWrites: [(time: TimeInterval, down: Bool)] = []
+    }
+    let clock = Clock()
     let defaults = MemoryPreferences()
     let hid = FakeHID()
     let relay = FakeRelay()
@@ -96,16 +106,23 @@ private final class TestMac {
         peerStore = PeerStore(defaults: defaults)
         peerStore.peerPublicKey = peer
         let interceptor = CapsInterceptor(testDefaults: defaults, process: hid.run)
-        let capture = capture, playback = playback
+        let capture = capture, playback = playback, clock = clock
         controller = SlockController(identity: identity, peerStore: peerStore, capsInterceptor: interceptor,
-            led: CapsLED(directWriter: { _ in true }), transport: relay,
+            led: CapsLED(directWriter: { down in
+                clock.lightWrites.append((clock.time, down))
+                return true
+            }), transport: relay,
             makeCapture: { capture }, makePlayback: { playback }, checkAudio: {},
-            requestMicrophone: requestMicrophone)
+            requestMicrophone: requestMicrophone, now: { clock.time })
         interceptor.start()
     }
 
     deinit { controller.shutdown() }
-    func key(_ down: Bool) { controller.capsInterceptor.onKeyState?(down) }
+    func key(_ down: Bool, timestamp: UInt64? = nil) { controller.capsInterceptor.onKeyState?(down, timestamp) }
+    func advance(to time: TimeInterval) {
+        clock.time = time
+        controller.advanceLightPlayback()
+    }
 }
 
 private func exchange(_ a: TestMac, _ b: TestMac) throws {
@@ -115,6 +132,22 @@ private func exchange(_ a: TestMac, _ b: TestMac) throws {
         if !b.relay.packets.isEmpty { a.relay.onMessage?("", b.relay.packets.removeFirst()) }
     }
     throw Failure(message: "Controllers did not finish exchanging messages")
+}
+
+// A peer that only understands legacy HELLOs lets us inject authenticated
+// status packets and verify that old peers keep their key/PTT snapshots.
+private func exchange(_ mac: TestMac, _ peer: SecureWire) throws -> [OpenedMessage] {
+    var messages: [OpenedMessage] = []
+    for _ in 0..<100 {
+        if mac.relay.packets.isEmpty { return messages }
+        guard let message = peer.open(mac.relay.packets.removeFirst()) else { continue }
+        messages.append(message)
+        if message.needsHelloReply {
+            mac.relay.onMessage?("", try peer.seal(kind: .hello, payload: Data(repeating: 0, count: 9),
+                                                  to: mac.controller.identity.publicKey))
+        }
+    }
+    throw Failure(message: "Legacy peer handshake did not settle")
 }
 
 @main
@@ -298,6 +331,43 @@ enum RegressionTests {
             mac.peerStore.ptt.incoming = 42
             grant?(true)
             try check(!mac.controller.pttEnabled && mac.peerStore.ptt.incoming == 42, "stale permission granted consent")
+            try check(!mac.controller.requiresMicrophonePermission,
+                      "stale acceptance retained its microphone requirement")
+        }
+        test("remote withdrawal and replacement cancel only their pending microphone acceptance") {
+            for replacing in [false, true] {
+                var grants: [(Bool) -> Void] = []
+                let a = TestMac(alice, peer: bob.publicKey)
+                let b = TestMac(bob, peer: alice.publicKey, requestMicrophone: { grants.append($0) })
+                a.relay.start(); b.relay.start(); try exchange(a, b)
+                a.controller.invitePTT { _ in }
+                try exchange(a, b)
+                b.controller.acceptPTTInvite(expected: b.peerStore.ptt.incoming!) { _ in }
+                try check(b.controller.requiresMicrophonePermission && grants.count == 1,
+                          "local acceptance did not await microphone access")
+                if replacing { a.controller.invitePTT { _ in } }
+                else { a.controller.disablePTT() }
+                try exchange(a, b)
+                try check(!b.controller.requiresMicrophonePermission,
+                          "withdrawn or replaced invitation retained its microphone requirement")
+                if replacing {
+                    let currentInvitation = b.peerStore.ptt.incoming!
+                    b.controller.acceptPTTInvite(expected: currentInvitation) { _ in }
+                    try check(grants.count == 2, "replacement acceptance did not request permission")
+                    grants[0](false)
+                    try check(b.controller.requiresMicrophonePermission
+                              && b.peerStore.ptt.incoming == currentInvitation && b.controller.lastError == nil,
+                              "stale completion canceled or rejected the newer local acceptance")
+                    grants[1](true)
+                    try check(b.controller.pttEnabled && b.peerStore.ptt.active == currentInvitation,
+                              "newer acceptance could not finish after the stale callback")
+                } else {
+                    grants[0](false)
+                    try check(!b.controller.requiresMicrophonePermission && !b.controller.pttEnabled
+                              && b.controller.lastError == nil,
+                              "late denial revived a withdrawn microphone request")
+                }
+            }
         }
         test("a lost PTT rejection is retried without prompting the recipient again") {
             let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
@@ -366,8 +436,41 @@ enum RegressionTests {
             try check(!mac.controller.requiresMicrophonePermission, "lights only required microphone access")
             mac.peerStore.ptt = PTTConsent(active: 41)
             try check(mac.controller.requiresMicrophonePermission, "saved active PTT omitted microphone access")
+            let ready = mac.controller.permissionState(grants:
+                KeyboardPermissionState(accessibility: true, inputMonitoring: true, microphone: true))
+            try check(ready.isReady && ready.microphoneRequired,
+                      "observing a microphone grant removed an active PTT requirement")
             mac.controller.disablePTT()
             try check(!mac.controller.requiresMicrophonePermission, "disabled agreement still required microphone access")
+        }
+        test("ordinary permission refresh recovers a denied microphone without reopening the guide") {
+            let mac = TestMac(alice, peer: bob.publicKey, requestMicrophone: { $0(false) })
+            mac.controller.invitePTT { _ in }
+            var grants = KeyboardPermissionState(accessibility: true, inputMonitoring: true)
+            let blocked = mac.controller.permissionState(grants: grants)
+            try check(!blocked.isReady && blocked.microphoneRequired && mac.controller.lastError != nil,
+                      "denied access did not expose its requirement")
+            drainMainQueue()
+            var notifications = 0
+            mac.controller.onStateChange = { [weak controller = mac.controller] in
+                notifications += 1
+                _ = controller?.permissionState(grants: grants)
+            }
+            grants.microphone = true
+            let recovered = mac.controller.permissionState(grants: grants)
+            try check(recovered.isReady && !recovered.microphoneRequired && mac.controller.lastError == nil,
+                      "ordinary status refresh hid the permission item but retained a stale microphone error")
+            let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+            PermissionMenu.update(item, state: recovered)
+            try check(item.isHidden && !mac.controller.pttEnabled && !mac.controller.outgoingPTTInvite,
+                      "grant recovery retained the warning or silently enabled PTT")
+            drainMainQueue()
+            drainMainQueue()
+            try check(notifications == 1, "permission recovery recursively emitted status changes")
+            grants.microphone = false
+            let lightsOnly = mac.controller.permissionState(grants: grants)
+            try check(lightsOnly.isReady && !lightsOnly.microphoneRequired,
+                      "a recovered failed PTT attempt made lights only depend on microphone access")
         }
         test("two controllers pair only after approval and relay held keys") {
             let a = TestMac(alice), b = TestMac(bob)
@@ -388,6 +491,238 @@ enum RegressionTests {
             try check(b.controller.diagnostics().contains("Key messages queued: 2"), "queued key counter missing")
             try check(a.controller.diagnostics().contains("Key messages received: 2"), "received key counter missing")
             try check(a.controller.diagnostics().contains("Last peer key state: up"), "last received key state missing")
+        }
+        test("pause and resume immediately update the paired peer's tail and status") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            try check(!a.controller.peerPaused && !b.controller.peerPaused, "active peer reported paused")
+            b.controller.setCaptureEnabled(false); try exchange(a, b)
+            try check(a.controller.peerOnline && a.controller.peerPaused, "pause was not shared immediately")
+            try check(!b.controller.peerPaused, "local pause was mistaken for peer pause")
+            try check(a.controller.statusText == "Paired • Paused", "pause explanation missing")
+            a.key(true); try exchange(a, b)
+            try check(!b.controller.remoteKeyDown, "paused peer received a light signal")
+            try check(FireflyIcon.tailState(localActive: a.controller.localKeyDown, attention: false,
+                                           peerPaused: a.controller.peerPaused) == .paused,
+                      "press hid the paused peer")
+            a.key(false)
+            b.controller.setCaptureEnabled(true); try exchange(a, b)
+            try check(!a.controller.peerPaused, "resume was not shared immediately")
+            a.key(true); try exchange(a, b)
+            try check(b.controller.remoteKeyDown, "resumed peer stopped receiving")
+        }
+        test("an already paused peer is reported after reconnecting or accepting a new pairing") {
+            for alreadyPaired in [false, true] {
+                let a = TestMac(alice, peer: alreadyPaired ? bob.publicKey : nil)
+                let b = TestMac(bob, peer: alreadyPaired ? alice.publicKey : nil)
+                b.controller.setCaptureEnabled(false)
+                a.relay.start(); b.relay.start()
+                if !alreadyPaired {
+                    try a.controller.pair(using: bob.pairingCode)
+                    try exchange(a, b)
+                    try check(!a.controller.peerPaused, "unaccepted pairing changed pause status")
+                    b.controller.acceptIncomingPair(expected: alice.publicKey)
+                }
+                try exchange(a, b)
+                try check(a.controller.peerPaused && !b.controller.peerPaused, "initial pause status missing")
+            }
+        }
+        test("a peer pause cancels pending and held lights even when its release packet is lost") {
+            for alreadyLit in [false, true] {
+                let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+                a.relay.start(); b.relay.start(); try exchange(a, b)
+                b.key(true, timestamp: 1_000_000_000); try exchange(a, b)
+                if alreadyLit {
+                    a.advance(to: 101)
+                    try check(a.controller.led.isOn, "initial held light missing")
+                }
+                b.controller.setCaptureEnabled(false)
+                try check(b.relay.packets.count == 2, "pause did not send release followed by capture state")
+                b.relay.packets.removeFirst()
+                try exchange(a, b)
+                try check(a.controller.peerPaused && !a.controller.remoteKeyDown && !a.controller.led.isOn,
+                          "peer pause left a held light on")
+                a.advance(to: 102)
+                try check(!a.controller.led.isOn && a.controller.diagnostics().contains("Pending light transitions: 0"),
+                          "peer pause replayed a buffered pulse")
+            }
+        }
+        test("HELLO refreshes recover lost pause and resume updates") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            for enabled in [false, true] {
+                b.controller.setCaptureEnabled(enabled)
+                b.relay.packets.removeAll()
+                try check(a.controller.peerPaused == enabled, "status changed before receiving the update")
+                a.clock.time += SlockConfig.helloInterval
+                a.controller.advanceMaintenance(); try exchange(a, b)
+                try check(a.controller.peerPaused == !enabled, "HELLO did not repair the lost update")
+            }
+        }
+        test("peer pause is cleared on disconnect, expiry, unpair and a fresh legacy session") {
+            for action in 0..<4 {
+                let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+                a.relay.start(); b.relay.start(); try exchange(a, b)
+                b.controller.setCaptureEnabled(false); try exchange(a, b)
+                try check(a.controller.peerPaused, "missing initial pause")
+                switch action {
+                case 0:
+                    a.relay.stop()
+                    try check(!a.controller.peerPaused, "disconnect kept stale pause")
+                    a.relay.start(); try exchange(a, b)
+                    try check(a.controller.peerPaused, "reconnect did not refresh pause")
+                    a.relay.stop()
+                case 1:
+                    a.clock.time += SlockConfig.onlineTimeout + 1
+                    a.controller.advanceMaintenance()
+                case 2:
+                    a.controller.unpair()
+                default:
+                    let legacy = SecureWire(identity: bob)
+                    a.clock.time += 2
+                    a.relay.onMessage?("", try legacy.seal(kind: .hello, payload: Data(), to: alice.publicKey))
+                    let messages = try exchange(a, legacy)
+                    try check(messages.contains { $0.kind == .hello && $0.sessionConfirmed && $0.payload.count == 9 },
+                              "legacy HELLO snapshot format changed")
+                }
+                try check(!a.controller.peerPaused, "stale pause survived action \(action)")
+            }
+        }
+        test("failed capture stop does not tell the peer it is paused") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            b.hid.failWrites = true
+            b.controller.setCaptureEnabled(false); try exchange(a, b)
+            try check(b.controller.capsInterceptor.isActive && !a.controller.peerPaused,
+                      "failed pause was advertised as successful")
+            b.hid.failWrites = false
+        }
+        test("only valid fresh status from the paired peer can change its pause indicator") {
+            let a = TestMac(alice, peer: bob.publicKey), b = SecureWire(identity: bob)
+            a.relay.start(); _ = try exchange(a, b)
+            let paused = try b.seal(kind: .captureState, payload: Data([0]), to: alice.publicKey)
+            a.relay.onMessage?("", paused)
+            try check(a.controller.peerPaused, "authenticated pause missing")
+            for payload in [Data(), Data([2]), Data([0, 1])] {
+                a.relay.onMessage?("", try b.seal(kind: .captureState, payload: payload, to: alice.publicKey))
+                try check(a.controller.peerPaused, "malformed state changed pause")
+            }
+            a.relay.onMessage?("", try b.seal(kind: .captureState, payload: Data([1]), to: alice.publicKey))
+            a.relay.onMessage?("", paused)
+            try check(!a.controller.peerPaused, "replayed pause replaced resume")
+            let stranger = SecureWire(identity: try IdentityStore(directory: root.appendingPathComponent("stranger")))
+            a.relay.onMessage?("", try stranger.seal(kind: .hello, payload: Data(), to: alice.publicKey))
+            _ = try exchange(a, stranger)
+            a.relay.onMessage?("", try stranger.seal(kind: .captureState, payload: Data([0]), to: alice.publicKey))
+            try check(!a.controller.peerPaused, "unpaired sender changed pause status")
+        }
+        test("timestamped controllers preserve short ON and OFF lengths despite delivery jitter") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            b.key(true, timestamp: 10_000_000_000); try exchange(a, b)
+            try check(!a.controller.led.isOn, "press skipped the rhythm buffer")
+            a.clock.time = 100.7
+            b.key(false, timestamp: 10_100_000_000); try exchange(a, b)
+            a.clock.time = 100.71
+            b.key(true, timestamp: 10_300_000_000); try exchange(a, b)
+            b.key(false, timestamp: 10_350_000_000); try exchange(a, b)
+            a.advance(to: 101)
+            try check(a.controller.led.isOn && !b.controller.led.isOn, "wrong keyboard or missing first flash")
+            a.advance(to: 101.099)
+            try check(a.controller.led.isOn, "100 ms flash ended early")
+            a.advance(to: 101.1)
+            try check(!a.controller.led.isOn, "100 ms flash followed the 700 ms packet gap")
+            a.advance(to: 101.299)
+            try check(!a.controller.led.isOn, "200 ms OFF gap was compressed")
+            a.advance(to: 101.3)
+            try check(a.controller.led.isOn, "second flash missed its deadline")
+            a.advance(to: 101.35)
+            try check(!a.controller.led.isOn, "50 ms flash did not end")
+            try check(b.controller.diagnostics().contains("Key messages queued: 4"), "timing added network messages")
+            try check(a.controller.diagnostics().contains("Pending light transitions: 0"), "playback queue did not drain")
+        }
+        test("held-key refreshes and HELLOs do not jump buffered edges") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            b.key(true, timestamp: 1_000_000_000); try exchange(a, b)
+            b.controller.advanceMaintenance(); try exchange(a, b)
+            try check(!a.controller.led.isOn, "held refresh bypassed the buffer")
+            a.advance(to: 101)
+            try check(a.controller.led.isOn, "refresh erased the pending press")
+            // Long holds remain lit through the original one-byte refresh cadence.
+            a.clock.time = 102
+            b.controller.advanceMaintenance(); try exchange(a, b)
+            a.clock.time = 103
+            a.controller.advanceMaintenance()
+            try check(a.controller.led.isOn, "fresh long hold expired")
+            b.key(false, timestamp: 5_000_000_000); try exchange(a, b)
+            b.relay.start(); try exchange(a, b)
+            try check(a.controller.led.isOn, "HELLO jumped the buffered release")
+            a.advance(to: 104)
+            try check(!a.controller.led.isOn, "long hold did not release")
+        }
+        test("disconnect, pause, unpair, shutdown and expiry cancel pending light playback") {
+            for action in 0..<5 {
+                let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+                a.relay.start(); b.relay.start(); try exchange(a, b)
+                b.key(true, timestamp: 1_000_000_000); try exchange(a, b)
+                switch action {
+                case 0: a.relay.onStateChange?(.error("offline"))
+                case 1: a.controller.setCaptureEnabled(false)
+                case 2: a.controller.unpair()
+                case 3: a.controller.shutdown()
+                default: a.clock.time = 103; a.controller.advanceMaintenance()
+                }
+                a.advance(to: 104)
+                try check(!a.controller.remoteKeyDown && !a.controller.led.isOn, "cancelled press replayed: \(action)")
+                try check(a.controller.diagnostics().contains("Pending light transitions: 0"), "cancelled queue survived: \(action)")
+            }
+        }
+        test("legacy releases still cancel a buffered press immediately") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            b.key(true, timestamp: 1_000_000_000); try exchange(a, b)
+            b.key(false); try exchange(a, b)
+            a.advance(to: 101)
+            try check(!a.controller.led.isOn && !a.controller.remoteKeyDown, "emergency release left a queued press")
+        }
+        test("light freshness is measured at receipt, not delayed playback") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            b.key(true, timestamp: 1_000_000_000); try exchange(a, b)
+            a.advance(to: 101)
+            try check(a.controller.led.isOn, "buffered press did not play")
+            a.clock.time = 102.6
+            a.controller.advanceMaintenance()
+            try check(!a.controller.led.isOn, "playback extended the stale-key lease")
+        }
+        test("a fresh peer session cannot replay the old session's buffered light") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            b.key(true, timestamp: 1_000_000_000); try exchange(a, b)
+            let restarted = TestMac(bob, peer: alice.publicKey)
+            // The handshake response throttle permits the new boot after a second.
+            a.clock.time = 101.01
+            restarted.relay.start(); try exchange(a, restarted)
+            a.advance(to: 101.01)
+            try check(!a.controller.led.isOn, "old session's press survived the fresh handshake")
+            try check(a.controller.diagnostics().contains("Pending light transitions: 0"), "old session kept its queue")
+        }
+        test("the real playback timer delivers buffered edges without a maintenance tick") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.clock.usesSystemTime = true; b.clock.usesSystemTime = true
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            a.clock.lightWrites.removeAll()
+            let started = a.clock.time
+            b.key(true, timestamp: 1_000_000_000)
+            b.key(false, timestamp: 1_060_000_000)
+            try exchange(a, b)
+            let limit = Date().addingTimeInterval(3)
+            while a.clock.lightWrites.count < 2, Date() < limit { drainMainQueue() }
+            try check(a.clock.lightWrites.map(\.down) == [true, false], "timer failed to emit the pulse")
+            let writes = a.clock.lightWrites
+            try check(writes[0].time - started >= 0.999, "timer skipped the playback buffer")
+            try check(writes[1].time - writes[0].time >= 0.059, "timer compressed the 60 ms pulse")
         }
         test("simultaneous PTT holds choose one speaker and transfer only after playback drains") {
             let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
@@ -755,24 +1090,37 @@ enum RegressionTests {
                       "cached denial survived retry after permission was granted")
         }
         test("Dit's tail gives outgoing activity priority over notifications") {
-            try check(FireflyIcon.tailState(localActive: false, attention: false) == .idle,
+            try check(FireflyIcon.tailState(localActive: false, attention: false, peerPaused: false) == .idle,
                       "idle tail state")
-            try check(FireflyIcon.tailState(localActive: false, attention: true) == .notification,
+            try check(FireflyIcon.tailState(localActive: false, attention: true, peerPaused: false) == .notification,
                       "notification tail state")
-            try check(FireflyIcon.tailState(localActive: true, attention: true) == .outgoing,
+            try check(FireflyIcon.tailState(localActive: true, attention: true, peerPaused: false) == .outgoing,
                       "outgoing key did not get tail priority")
         }
         test("Dit's red permission tail takes priority over outgoing activity") {
             for localActive in [false, true] {
                 for attention in [false, true] {
-                    try check(FireflyIcon.tailState(localActive: localActive, attention: attention,
-                                                   permissionsRequired: true) == .notification,
-                              "missing permissions failed to select the red tail")
+                    for peerPaused in [false, true] {
+                        try check(FireflyIcon.tailState(localActive: localActive, attention: attention,
+                                                       peerPaused: peerPaused, permissionsRequired: true) == .notification,
+                                  "missing permissions failed to select the red tail")
+                    }
                 }
             }
             try check(FireflyIcon.tailState(localActive: true, attention: false,
                                            permissionsRequired: false) == .outgoing,
                       "satisfied permissions prevented the outgoing tail")
+        }
+        test("Dit's blue tail keeps a paused peer visible during activity and notifications") {
+            for localActive in [false, true] {
+                for attention in [false, true] {
+                    try check(FireflyIcon.tailState(localActive: localActive, attention: attention, peerPaused: true) == .paused,
+                              "paused tail lost priority")
+                }
+            }
+            try check(!FireflyIcon.image(tail: .paused).isTemplate, "blue tail was made monochrome")
+            try check(FireflyIcon.image(tail: .paused).accessibilityDescription?.contains("peer paused") == true,
+                      "pause indication is only conveyed by color")
         }
         test("a second stop never overwrites mappings changed after capture stopped") {
             let prefs = MemoryPreferences(), hid = FakeHID()
@@ -867,18 +1215,20 @@ enum RegressionTests {
         test("queued key presses cannot survive a tap release or capture restart") {
             let delivery = CapturedKeyDelivery()
             var states: [Bool] = []
-            delivery.handler = { states.append($0) }
-            delivery.enqueue(true)
+            var timestamps: [UInt64?] = []
+            delivery.handler = { states.append($0); timestamps.append($1) }
+            delivery.enqueue(true, timestamp: 10)
             delivery.release()
             drainMainQueue()
             try check(states == [false], "old press relatched after tap disable")
-            delivery.enqueue(true)
+            delivery.enqueue(true, timestamp: 20)
             delivery.reset()
-            delivery.handler = { states.append($0) }
+            delivery.handler = { states.append($0); timestamps.append($1) }
             drainMainQueue()
             try check(states == [false], "old press reached the new capture session")
-            delivery.enqueue(true); delivery.enqueue(false); drainMainQueue()
+            delivery.enqueue(true, timestamp: 100); delivery.enqueue(false, timestamp: 250); drainMainQueue()
             try check(states == [false, true, false], "valid key transitions lost their ordering")
+            try check(timestamps == [nil, 100, 250], "queue delivery replaced event timestamps")
         }
         test("identity persists with private permissions and corrupt keys are not replaced") {
             let location = root.appendingPathComponent("alice")

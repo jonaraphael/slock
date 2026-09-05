@@ -6,6 +6,10 @@ build_dir=$(mktemp -d "$PWD/.build/package.XXXXXX")
 trap 'rm -rf "$build_dir"' EXIT
 app="$build_dir/slock.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+./scripts/swiftc.command -swift-version 5 -module-cache-path "$PWD/.build/modules" \
+  scripts/generate-app-icon.swift -o "$build_dir/generate-app-icon"
+"$build_dir/generate-app-icon" docs/images/firefly.svg "$build_dir/AppIcon.iconset"
+/usr/bin/iconutil -c icns "$build_dir/AppIcon.iconset" -o "$app/Contents/Resources/AppIcon.icns"
 read -r -a architectures <<< "${CAPSLINK_ARCHS:-arm64 x86_64}"
 slices=()
 for architecture in "${architectures[@]}"; do

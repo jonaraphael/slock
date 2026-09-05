@@ -25,12 +25,12 @@ A small macOS menu-bar app. No account required. Built for Apple Silicon and Int
 1. Download and unzip **slock.app.zip** on each Mac.
 2. Move **slock.app** to **Applications**, then open it. Keep it there so permissions
    and the login item use a stable path.
-3. Follow **Permissions Required**, which opens automatically when required keyboard
-   permissions are missing. Enable slock in both **Accessibility** and **Input
-   Monitoring** under System Settings → Privacy & Security. The guide explains
-   each permission and requests them in order. If macOS does not show a dialog,
-   use the guide’s **Enable** buttons to open the corresponding settings.
-4. If slock is missing from either list, click **+** and select the app you
+3. Follow **Permissions Required**, which opens automatically when required access
+   is missing. Enable the permissions marked **Required** in the guide. It explains
+   Accessibility and Input Monitoring and requests them in order. If macOS does
+   not show a dialog, use the guide’s **Enable** buttons to open System Settings →
+   Privacy & Security. A permission shown as **Enabled** needs no further action.
+4. If a required permission’s list is missing slock, click **+** and select the app you
    installed. **Show App in Finder** reveals the running copy. If an old entry is
    already enabled, remove it and add this copy again. Quit and reopen slock if
    macOS asks.
@@ -73,7 +73,7 @@ needed. macOS may still require you to add the app manually or reopen it.
 5. Wait for both Macs to show a connection, then hold Caps Lock on either Mac.
    The other Mac’s light should stay on for the duration of the hold.
 
-Choose **Unpair…** to disconnect the pairing. Upgrade both Macs together:
+Choose **Unpair** to disconnect immediately. Upgrade both Macs together:
 version 0.2 uses protocol 2 and cannot communicate with version 0.1.
 
 The **Pairing…** window also lets you name your Mac. Self-assigned nicknames are
@@ -106,23 +106,50 @@ Enabled** to disable voice for both peers. Audio uses end-to-end encrypted Opus.
 | **Pause Slock / Resume Slock** | Restores normal Caps Lock behavior, or gives slock control of the key. |
 | **Permissions Required** | Appears in red only while the current mode lacks access; opens the setup guide for keyboard permissions and, for PTT, Microphone. |
 | **Launch at Login** | Starts slock when you sign in. Enabled on first launch when macOS allows it. |
-| **Unpair…** | Removes the peer and stops key mirroring and voice. |
+| **Update slock** | Appears when a newer stable release tag is available. Downloads the update, replaces the app in its current location, and restarts slock. |
+| **Unpair** | Immediately removes the peer and stops key mirroring and voice. |
 | **Quit slock** | Stops capture, restores the previous keyboard mapping, and exits. |
+
+The status line shows **slock - Paired • Becky** using your peer’s name, with
+matching labels for offline, paused, and other states.
 
 Hold **Option** while the menu is open to reveal **This Mac**, **Test Caps Lock
 Light**, and **Diagnostics…**. Release Option to hide them again.
 
-Dit’s tail turns red whenever a required permission is missing, taking priority
-over other activity. Otherwise it glows yellow-green while you hold your key, confirming the outgoing
-light signal without lighting your own keyboard. An incoming press leaves Dit’s
-tail hollow because your keyboard light carries that signal. While you are not
-sending, red means a pairing request or PTT invitation needs attention. The
-menu-bar mark adapts to light and dark backgrounds automatically.
+slock checks GitHub for updates at launch and hourly while running. Checks happen
+in the background; a temporary network failure retries after five minutes. The
+update option stays hidden when the installed version is current or ahead of the
+latest release. The download's SHA-256 checksum, app identity, version, and code
+signature are verified before slock quits. If replacement or relaunch fails, the
+installer restores the previous app. Updating requires write access to the app's
+folder. Pairings and preferences are retained; macOS may require renewed keyboard
+permissions after an update.
+
+Dit’s tail turns **red whenever a required permission is missing**, taking priority
+over activity and peer status. Once permissions are satisfied, it turns **blue
+when your paired peer’s capture is paused or inactive**,
+so you know they cannot receive your light signals. Blue stays visible while you
+press your key and clears when they resume. Both Macs need this update to share
+pause status; disconnected peers still appear as offline in the menu.
+
+Otherwise, Dit’s tail glows yellow-green while you hold your key, confirming the
+outgoing light signal without lighting your own keyboard. An incoming press
+leaves Dit’s tail hollow because your keyboard light carries that signal. While
+you are not sending, red means a pairing request or PTT invitation needs
+attention. The menu-bar mark adapts to light and dark backgrounds automatically.
 
 While capture is **active**, Caps Lock must not capitalize text, display the
 macOS Caps Lock cursor indicator, or latch the local light on. Your local light
 follows your **partner’s** held key, except during the brief light test.
 Disabling capture restores the Caps Lock state that preceded it.
+
+Light playback prioritizes your rhythm: it buffers about one second, then keeps
+short flashes and short dark gaps at their captured lengths. Holds and pauses of
+one second or longer absorb timing adjustments. This adds eight bytes per key
+transition, with no extra messages or faster heartbeats. Upgrade both Macs for
+the timing improvement in both directions; older peers still work with immediate
+light updates. PTT starts and stops immediately. Network stalls beyond the buffer
+or a busy Mac can still stretch a flash or gap.
 
 slock preserves existing keyboard mappings and restores them when capture stops
 or the app quits. A recovery journal allows the next launch to restore mappings
@@ -207,6 +234,10 @@ dist/slock.app.zip
 
 There is no Xcode project or third-party package dependency. Compilation does not
 need internet access. Generated artifacts are ignored by Git.
+
+The build renders Dit's [vector artwork](docs/images/firefly.svg) into a macOS app
+icon at standard and Retina sizes and bundles it before signing, so the unzipped
+app shows Dit in Finder.
 
 To build one architecture or run the regression suite:
 
