@@ -366,6 +366,23 @@ The receiver buffers six packets, about 120 ms, before starting playback. That t
 
 PTT is half-duplex. If both peers press simultaneously, the lexicographically smaller public key wins the floor. The losing side stops capture and receives, so both clients make the same decision without another coordination round trip.
 
+`DoNotDisturbMonitor` reads the local macOS Focus assertions at startup, before
+starting capture/playback, on system DND notification hints, and during the
+one-second maintenance tick. Any active Focus pauses local microphone capture and
+playback, including queued playback and capture callbacks. Light events, presence,
+and PTT consent remain unchanged. Leaving Focus permits new talks; a key held
+through the pause must be released before it can transmit again.
+
+Detection reads `~/Library/DoNotDisturb/DB/Assertions.json`; it never writes Focus
+settings or shares Focus status with the peer. Only `storeAssertionRecords` counts
+as active; invalidation history does not. The database schema and DND notification
+names are undocumented macOS details, so OS updates require a manual smoke check.
+An unreadable or malformed snapshot pauses voice with an explicit menu reason
+until status can be read again. This also avoids depending on Focus Status sharing
+authorization or a communication-notifications provisioning profile in the
+ad-hoc-signed app. Ongoing talks stop when the changed snapshot is observed,
+normally within the next one-second tick.
+
 ## Single-file class map
 
 Everything below lives in `slock.swift`:
@@ -383,6 +400,7 @@ OpusEncoder             Int16 PCM → native Opus
 OpusDecoder             native Opus → Float32 PCM
 AudioCapture            microphone, resampling, framing, batching
 AudioPlayback           jitter prebuffer and AVAudioPlayerNode
+DoNotDisturbMonitor      local Focus status and audio pause
 SlockController      pairing/key/PTT/presence state machine
 AppDelegate             NSStatusItem menu and launch-at-login UI
 SingleInstanceLock     exclusive ownership of the mapping recovery journal

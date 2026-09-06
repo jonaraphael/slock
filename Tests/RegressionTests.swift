@@ -68,11 +68,12 @@ private final class FakePlayback: VoicePlayback {
     var onError: ((String) -> Void)?
     var onDrain: (() -> Void)?
     var batches: [Data] = []
-    func beginTalk() { onDrain = nil }
+    var running = false
+    func beginTalk() { onDrain = nil; running = true }
     func receiveBatch(_ batch: Data) { batches.append(batch) }
     func endTalk(completion: @escaping () -> Void) { onDrain = completion }
-    func stopImmediately() { onDrain = nil }
-    func finish() { let callback = onDrain; onDrain = nil; callback?() }
+    func stopImmediately() { onDrain = nil; running = false }
+    func finish() { let callback = onDrain; onDrain = nil; running = false; callback?() }
 }
 
 private final class FakeLEDOutput: CapsLEDOutput {
@@ -101,26 +102,38 @@ private final class TestMac {
     let playback = FakePlayback()
     let controller: SlockController
     let peerStore: PeerStore
+    final class Focus {
+        var assertions = Data(#"{"data":[{}]}"#.utf8)
+    }
+    let focus = Focus()
 
     init(_ identity: IdentityStore, peer: Data? = nil, defaults: MemoryPreferences = MemoryPreferences(),
+         doNotDisturbActive: Bool = false,
          requestMicrophone: @escaping (@escaping (Bool) -> Void) -> Void = { $0(true) }) {
         self.defaults = defaults
         if let peer { defaults.set(peer, forKey: "CapsLink.peerPublicKey") }
         peerStore = PeerStore(defaults: defaults)
         let interceptor = CapsInterceptor(testDefaults: defaults, process: hid.run)
         let capture = capture, playback = playback, clock = clock
+        let focus = focus
+        if doNotDisturbActive { focus.assertions = Data(#"{"data":[{"storeAssertionRecords":[{}]}]}"#.utf8) }
         controller = SlockController(identity: identity, peerStore: peerStore, capsInterceptor: interceptor,
             led: CapsLED(directWriter: { down in
                 clock.lightWrites.append((clock.time, down))
                 return true
             }), transport: relay,
             makeCapture: { capture }, makePlayback: { playback }, checkAudio: {},
-            requestMicrophone: requestMicrophone, now: { clock.time })
+            requestMicrophone: requestMicrophone,
+            doNotDisturb: DoNotDisturbMonitor(readAssertions: { focus.assertions }), now: { clock.time })
         interceptor.start()
     }
 
     deinit { controller.shutdown() }
     func key(_ down: Bool, timestamp: UInt64? = nil) { controller.capsInterceptor.onKeyState?(down, timestamp) }
+    func setFocus(_ active: Bool) {
+        focus.assertions = Data((active ? #"{"data":[{"storeAssertionRecords":[{}]}]}"# : #"{"data":[{}]}"#).utf8)
+        controller.advanceMaintenance()
+    }
     func advance(to time: TimeInterval) {
         clock.time = time
         controller.advanceLightPlayback()
@@ -1033,6 +1046,141 @@ enum RegressionTests {
             let writes = a.clock.lightWrites
             try check(writes[0].time - started < 0.5, "first edge added unnecessary delay")
             try check(writes[1].time - writes[0].time >= 0.059, "timer compressed the 60 ms pulse")
+        }
+        test("Focus snapshots distinguish active assertions, invalidation history and unavailable status") {
+            let snapshots: [(String, DoNotDisturbMonitor.Status)] = [
+                (#"{"data":[{}]}"#, .inactive),
+                (#"{"data":[{"storeAssertionRecords":[]}]}"#, .inactive),
+                (#"{"data":[{"storeInvalidationRecords":[{"invalidationAssertion":{}}]}]}"#, .inactive),
+                (#"{"data":[{"storeAssertionRecords":[{"assertionDetails":{"assertionDetailsModeIdentifier":"com.apple.donotdisturb.mode.default"}}]}]}"#, .active),
+                (#"{"data":[{}, {"storeAssertionRecords":[{"assertionDetails":{"assertionDetailsModeIdentifier":"custom-focus"}}]}]}"#, .active),
+                (#"{"data":[{"storeAssertionRecords":false}]}"#, .unknown),
+                (#"{"data":[{"storeAssertionRecords":[null]}]}"#, .unknown),
+                (#"{"data":[]}"#, .unknown),
+                (#"{}"#, .unknown),
+                ("truncated", .unknown)
+            ]
+            for (json, expected) in snapshots {
+                try check(DoNotDisturbMonitor.parse(Data(json.utf8)) == expected, "incorrect Focus state: \(json)")
+            }
+        }
+        test("Focus monitoring detects startup, transitions and read failures without repeated changes") {
+            var data = Data(#"{"data":[{"storeAssertionRecords":[{}]}]}"#.utf8)
+            var unreadable = false
+            let monitor = DoNotDisturbMonitor(readAssertions: {
+                if unreadable { throw Failure(message: "Unavailable") }
+                return data
+            })
+            try check(monitor.status == .active, "startup missed active Focus")
+            var changes = 0
+            monitor.onChange = { changes += 1 }
+            monitor.refresh()
+            try check(changes == 0, "unchanged snapshot emitted a change")
+            unreadable = true; monitor.refresh()
+            try check(monitor.status == .unknown && changes == 1, "read failure was mistaken for inactive Focus")
+            unreadable = false; monitor.refresh()
+            try check(monitor.status == .active && changes == 2, "read recovery failed")
+            data = Data(#"{"data":[{}]}"#.utf8); monitor.refresh()
+            try check(monitor.status == .inactive && changes == 3, "Focus did not clear")
+        }
+        test("Do Not Disturb at startup blocks voice in both directions while lights and consent remain active") {
+            let a = TestMac(alice, peer: bob.publicKey, doNotDisturbActive: true)
+            let b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            a.peerStore.ptt.active = 42; b.peerStore.ptt.active = 42
+            a.key(true); try exchange(a, b)
+            try check(!a.capture.running && !b.playback.running, "Focus allowed microphone capture")
+            try check(b.controller.led.isOn && !b.controller.peerUnavailable, "Focus paused the light link")
+            a.key(false); try exchange(a, b)
+            b.key(true); b.capture.onBatch?(Data([1, 2, 3])); try exchange(a, b)
+            try check(!a.playback.running && a.playback.batches.isEmpty, "Focus allowed incoming audio")
+            try check(a.controller.led.isOn && !a.controller.peerUnavailable, "incoming light was paused")
+            try check(a.controller.pttEnabled && b.controller.pttEnabled, "Focus revoked PTT consent")
+            try check(a.controller.audioPauseReason == "Do Not Disturb / Focus", "menu pause explanation missing")
+            a.setFocus(false)
+            b.capture.onBatch?(Data([4])); try exchange(a, b)
+            try check(a.playback.batches.isEmpty, "unpausing resumed an interrupted talk")
+            b.key(false); drainMainQueue(); try exchange(a, b)
+            b.key(true); b.capture.onBatch?(Data([5])); try exchange(a, b)
+            try check(a.playback.running && a.playback.batches == [Data([5])], "next incoming talk did not resume")
+        }
+        test("Do Not Disturb interrupts playback and draining without cancelling timed light edges") {
+            for draining in [false, true] {
+                let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+                a.relay.start(); b.relay.start(); try exchange(a, b)
+                a.peerStore.ptt.active = 42; b.peerStore.ptt.active = 42
+                b.key(true, timestamp: 1_000_000_000)
+                b.capture.onBatch?(Data([1])); try exchange(a, b)
+                if !a.controller.led.isOn { a.advance(to: 101) }
+                try check(a.playback.running && a.controller.led.isOn, "test did not start playback and light")
+                if draining {
+                    b.key(false, timestamp: 1_500_000_000); drainMainQueue(); try exchange(a, b)
+                    try check(a.playback.onDrain != nil, "test did not enter draining state")
+                }
+                let oldDrain = a.playback.onDrain
+                a.setFocus(true)
+                try check(!a.playback.running && !a.controller.remoteTalking, "Focus left playback running")
+                try check(a.controller.led.isOn && a.controller.capsInterceptor.isActive, "Focus cleared the light")
+                b.capture.onBatch?(Data([2])); try exchange(a, b)
+                try check(a.playback.batches == [Data([1])], "Focus accepted late audio")
+                a.key(true); try exchange(a, b)
+                a.setFocus(false); oldDrain?()
+                try check(!a.capture.running && !a.playback.running, "old drain restarted audio after Focus")
+                if draining {
+                    a.advance(to: a.clock.time + 0.5)
+                    try check(!a.controller.led.isOn, "Focus discarded the pending light release")
+                }
+            }
+        }
+        test("Do Not Disturb stops capture, discards late batches and requires a fresh hold") {
+            for pendingStop in [false, true] {
+                let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+                a.relay.start(); b.relay.start(); try exchange(a, b)
+                a.peerStore.ptt.active = 42; b.peerStore.ptt.active = 42
+                a.key(true); try exchange(a, b)
+                let oldBatch = a.capture.onBatch
+                if pendingStop { a.key(false); a.key(true) }
+                a.setFocus(true)
+                oldBatch?(Data([1])); try exchange(a, b)
+                try check(!a.capture.running && !a.controller.localTalking, "Focus left the microphone running")
+                try check(b.playback.batches.isEmpty && b.playback.onDrain != nil, "Focus failed to send TALK_STOP or leaked audio")
+                try check(b.controller.led.isOn, "Focus released the held light")
+                a.setFocus(false)
+                oldBatch?(Data([2])); drainMainQueue(); try exchange(a, b)
+                try check(!a.capture.running && b.playback.batches.isEmpty, "unpausing revived a held key or old batch")
+                a.key(false); a.key(true); try exchange(a, b)
+                try check(a.capture.running, "fresh hold did not resume capture")
+                a.capture.onBatch?(Data([3])); try exchange(a, b)
+                try check(b.playback.batches == [Data([3])], "fresh talk did not deliver audio")
+            }
+        }
+        test("unavailable Focus status pauses only audio and recovers on the next hold") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            a.peerStore.ptt.active = 42; b.peerStore.ptt.active = 42
+            a.key(true); try exchange(a, b)
+            a.focus.assertions = Data("truncated".utf8)
+            a.controller.advanceMaintenance()
+            try check(a.controller.audioPausedForDoNotDisturb && !a.capture.running, "unknown Focus allowed audio")
+            try check(a.controller.audioPauseReason == "Focus Status Unavailable", "unknown state has no explanation")
+            try check(a.controller.diagnostics().contains("Do Not Disturb / Focus: unknown"), "unknown state missing from diagnostics")
+            a.setFocus(false); drainMainQueue(); try exchange(a, b)
+            try check(!a.capture.running && b.controller.led.isOn, "read recovery restarted the held mic or cleared the light")
+            a.key(false); a.key(true)
+            try check(a.capture.running, "capture did not recover after Focus became readable")
+        }
+        test("a newly active Focus is checked before either side starts voice between maintenance ticks") {
+            for receiving in [false, true] {
+                let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+                a.relay.start(); b.relay.start(); try exchange(a, b)
+                a.peerStore.ptt.active = 42; b.peerStore.ptt.active = 42
+                a.focus.assertions = Data(#"{"data":[{"storeAssertionRecords":[{}]}]}"#.utf8)
+                if receiving { b.key(true) } else { a.key(true) }
+                try exchange(a, b)
+                try check(a.controller.audioPausedForDoNotDisturb && !a.capture.running && !a.playback.running,
+                          "voice started before the next Focus poll")
+                try check(receiving ? a.controller.led.isOn : b.controller.led.isOn, "voice gate swallowed the light")
+            }
         }
         test("simultaneous PTT holds choose one speaker and transfer only after playback drains") {
             let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)

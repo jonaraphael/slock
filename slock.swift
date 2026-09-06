@@ -2775,6 +2775,69 @@ final class AudioPlayback: VoicePlayback {
     }
 }
 
+// MARK: - Do Not Disturb
+
+final class DoNotDisturbMonitor {
+    enum Status: String {
+        case inactive, active, unknown
+    }
+
+    private(set) var status: Status = .unknown
+    var onChange: (() -> Void)?
+    private let readAssertions: () throws -> Data
+    private var observers: [NSObjectProtocol] = []
+
+    init(readAssertions: @escaping () throws -> Data = {
+        try Data(contentsOf: FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/DoNotDisturb/DB/Assertions.json"))
+    }) {
+        self.readAssertions = readAssertions
+        refresh()
+    }
+
+    // macOS 13+ records active Focus modes here, including scheduled DND.
+    // This is an undocumented system format: an unreadable or unfamiliar
+    // snapshot is unknown, never evidence that it is safe to play audio.
+    static func parse(_ data: Data) -> Status {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let stores = root["data"] as? [[String: Any]], !stores.isEmpty else { return .unknown }
+        var active = false
+        for store in stores {
+            // macOS omits storeAssertionRecords when no Focus is active.
+            guard let value = store["storeAssertionRecords"] else { continue }
+            guard let records = value as? [[String: Any]] else { return .unknown }
+            active = active || !records.isEmpty
+        }
+        return active ? .active : .inactive
+    }
+
+    func refresh() {
+        let next = (try? readAssertions()).map(Self.parse) ?? .unknown
+        guard next != status else { return }
+        status = next
+        onChange?()
+    }
+
+    func start() {
+        guard observers.isEmpty else { return }
+        // Notifications are hints; read the current snapshot so a late event
+        // cannot overwrite newer state. The controller also polls every second.
+        for name in ["_NSDoNotDisturbEnabledNotification", "_NSDoNotDisturbDisabledNotification"] {
+            observers.append(DistributedNotificationCenter.default().addObserver(
+                forName: Notification.Name(name), object: nil, queue: .main
+            ) { [weak self] _ in self?.refresh() })
+        }
+        refresh()
+    }
+
+    func stop() {
+        for observer in observers { DistributedNotificationCenter.default().removeObserver(observer) }
+        observers.removeAll()
+    }
+
+    deinit { stop() }
+}
+
 // MARK: - Application state machine
 
 final class SlockController {
@@ -2798,6 +2861,7 @@ final class SlockController {
     private let makePlayback: () throws -> VoicePlayback
     private let checkAudio: () throws -> Void
     private let requestMicrophone: (@escaping (Bool) -> Void) -> Void
+    private let doNotDisturb: DoNotDisturbMonitor
     private let logsStatus: Bool
     private let now: () -> TimeInterval
     private var timer: Timer?
@@ -2854,6 +2918,7 @@ final class SlockController {
     private var remoteTalkID: UInt64?
     private var remoteTalkEnding = false
     private var restartTalkAfterStop = false
+    private var localTalkRequiresNewPress = false
 
     convenience init() throws {
         let identity = try IdentityStore()
@@ -2872,6 +2937,7 @@ final class SlockController {
          makePlayback: @escaping () throws -> VoicePlayback = { try AudioPlayback() },
          checkAudio: @escaping () throws -> Void = { _ = try OpusEncoder(); _ = try OpusDecoder() },
          requestMicrophone: @escaping (@escaping (Bool) -> Void) -> Void = SlockController.ensureMicrophonePermission,
+         doNotDisturb: DoNotDisturbMonitor = DoNotDisturbMonitor(),
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.identity = identity
         self.peerStore = peerStore
@@ -2882,9 +2948,11 @@ final class SlockController {
         self.makePlayback = makePlayback
         self.checkAudio = checkAudio
         self.requestMicrophone = requestMicrophone
+        self.doNotDisturb = doNotDisturb
         self.now = now
         logsStatus = startServices
         wire = SecureWire(identity: identity)
+        doNotDisturb.onChange = { [weak self] in self?.doNotDisturbChanged() }
 
         transport.onStateChange = { [weak self] state in
             guard let self else { return }
@@ -2929,6 +2997,7 @@ final class SlockController {
         }
 
         guard startServices else { return }
+        doNotDisturb.start()
         transport.start()
         if UserDefaults.standard.object(forKey: "CapsLink.captureEnabled") == nil
             || UserDefaults.standard.bool(forKey: "CapsLink.captureEnabled") {
@@ -2943,6 +3012,22 @@ final class SlockController {
     var peerPublicKey: Data? { peerStore.peerPublicKey }
     var peerShortID: String? { peerStore.peerPublicKey.map(shortIdentifier(for:)) }
     var pttEnabled: Bool { peerStore.pttEnabled }
+    var audioPausedForDoNotDisturb: Bool { doNotDisturb.status != .inactive }
+    var audioPauseReason: String {
+        doNotDisturb.status == .active ? "Do Not Disturb / Focus" : "Focus Status Unavailable"
+    }
+
+    private func doNotDisturbChanged() {
+        if audioPausedForDoNotDisturb {
+            localTalkRequiresNewPress = localKeyDown
+            restartTalkAfterStop = false
+            stopLocalTalk(discardPendingAudio: true)
+            stopRemoteTalk(immediate: true)
+        }
+        // Clearing Focus allows the next hold; it must not reopen the mic for
+        // a key held during the pause or replay the interrupted remote talk.
+        changed()
+    }
 
     var peerUnavailable: Bool {
         guard let peer = peerPublicKey else { return false }
@@ -3242,6 +3327,8 @@ final class SlockController {
     func shutdown() {
         timer?.invalidate()
         timer = nil
+        doNotDisturb.stop()
+        doNotDisturb.onChange = nil
         if let peer = peerStore.peerPublicKey {
             if localKeyDown {
                 localKeyDown = false
@@ -3287,6 +3374,8 @@ final class SlockController {
             "Peer online: \(peerOnline)",
             "Peer paused: \(peerPaused)",
             "PTT enabled: \(pttEnabled)",
+            "Do Not Disturb / Focus: \(doNotDisturb.status.rawValue)",
+            "Audio paused for Do Not Disturb / Focus: \(audioPausedForDoNotDisturb)",
             "Microphone permission: \(microphonePermission)",
             "Voice state: local key \(localKeyDown ? "down" : "up"), transmitting \(localTalking), receiving \(remoteTalking), draining \(remoteTalkEnding)",
             "Voice totals (this launch): talk starts received \(receivedTalkStarts), audio batches queued \(sentAudioBatches), received \(receivedAudioBatches), accepted \(acceptedAudioBatches)",
@@ -3514,11 +3603,14 @@ final class SlockController {
             send(kind: .keyState, payload: payload, to: peer)
         }
         if down {
-            if peerStore.pttEnabled, peerOnline, transportState == .connected, !remoteTalking {
+            doNotDisturb.refresh()
+            if audioPausedForDoNotDisturb { localTalkRequiresNewPress = true }
+            if !audioPausedForDoNotDisturb, peerStore.pttEnabled, peerOnline, transportState == .connected, !remoteTalking {
                 if localTalkID != nil, !localTalking { restartTalkAfterStop = true }
                 else { startLocalTalk() }
             }
         } else {
+            localTalkRequiresNewPress = false
             stopLocalTalk()
         }
         changed()
@@ -3603,7 +3695,9 @@ final class SlockController {
     #endif
 
     private func startLocalTalk() {
+        doNotDisturb.refresh()
         guard !localTalking,
+              !audioPausedForDoNotDisturb, !localTalkRequiresNewPress,
               localTalkID == nil,
               !remoteTalking,
               localKeyDown,
@@ -3631,6 +3725,7 @@ final class SlockController {
             send(kind: .talkStart, payload: startPayload, to: peer)
             try capture.start { [weak self] batch in
                 guard let self, self.localTalkID == talkID,
+                      !self.audioPausedForDoNotDisturb,
                       self.peerStore.peerPublicKey == peer,
                       self.peerStore.ptt.active == agreement else { return }
                 var payload = Data()
@@ -3650,12 +3745,23 @@ final class SlockController {
         }
     }
 
-    private func stopLocalTalk() {
-        guard localTalking, let talkID = localTalkID else { return }
+    private func stopLocalTalk(discardPendingAudio: Bool = false) {
+        guard let talkID = localTalkID, localTalking || discardPendingAudio else { return }
         let peer = peerStore.peerPublicKey
         restartTalkAfterStop = false
+        // Focus must also invalidate a release's queued final batch and restart.
+        // Ordinary key releases still flush the final syllable before TALK_STOP.
+        if discardPendingAudio { localTalkID = nil }
         audioCapture?.stop()
         localTalking = false
+        if discardPendingAudio {
+            if let peer {
+                var payload = Data()
+                payload.appendUInt64(talkID)
+                send(kind: .talkStop, payload: payload, to: peer)
+            }
+            return
+        }
         DispatchQueue.main.async { [weak self] in
             guard let self, self.localTalkID == talkID else { return }
             if let peer, self.peerStore.peerPublicKey == peer {
@@ -3674,7 +3780,9 @@ final class SlockController {
 
     private func handleRemoteTalkStart(_ payload: Data) {
         receivedTalkStarts += 1
-        guard peerStore.pttEnabled, capsInterceptor.isActive, transportState == .connected,
+        doNotDisturb.refresh()
+        guard !audioPausedForDoNotDisturb,
+              peerStore.pttEnabled, capsInterceptor.isActive, transportState == .connected,
               payload.count == 8, let talkID = payload.uint64(at: 0), talkID != 0,
               let peer = peerStore.peerPublicKey else { return }
         guard remoteTalkID != talkID else { return }
@@ -3706,7 +3814,8 @@ final class SlockController {
 
     private func handleRemoteAudio(_ payload: Data) {
         receivedAudioBatches += 1
-        guard peerStore.pttEnabled, capsInterceptor.isActive, transportState == .connected,
+        guard !audioPausedForDoNotDisturb,
+              peerStore.pttEnabled, capsInterceptor.isActive, transportState == .connected,
               remoteTalking, !remoteTalkEnding,
               let talkID = payload.uint64(at: 0),
               talkID == remoteTalkID,
@@ -3824,6 +3933,7 @@ final class SlockController {
     }
 
     private func tick() {
+        doNotDisturb.refresh()
         let now = now()
         sendHello()
         retryOutgoingPairRequest()
@@ -3901,6 +4011,7 @@ final class SlockController {
     private func changed() {
         if logsStatus {
             let voiceStatus = "peer=\(peerShortID ?? "none") ptt=\(pttEnabled) "
+                + "focus=\(doNotDisturb.status.rawValue) "
                 + "transmitting=\(localTalking) receiving=\(remoteTalking) draining=\(remoteTalkEnding) "
                 + "audioError=\(lastAudioError ?? "none")"
             // Log only voice transitions, not every packet or microphone buffer.
@@ -4531,6 +4642,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let item = add("PTT Enabled", #selector(disablePTT))
                 item.state = .on
                 item.toolTip = "Select to disable push-to-talk for both peers."
+                if controller.audioPausedForDoNotDisturb {
+                    addDisabled("Audio Paused • \(controller.audioPauseReason)")
+                }
             } else if let invitation = controller.peerStore.ptt.incoming {
                 add("Accept PTT Invitation", #selector(acceptPTT(_:))).representedObject = NSNumber(value: invitation)
                 add("Reject PTT Invitation", #selector(rejectPTT(_:))).representedObject = NSNumber(value: invitation)

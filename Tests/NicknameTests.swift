@@ -34,7 +34,8 @@ private final class NickMac {
         store.ownNickname = name
         let interceptor = CapsInterceptor(testDefaults: preferences, process: { _, _ in (0, "()", "") })
         controller = SlockController(identity: identity, peerStore: store, capsInterceptor: interceptor,
-            led: CapsLED(directWriter: { _ in true }), transport: relay)
+            led: CapsLED(directWriter: { _ in true }), transport: relay,
+            doNotDisturb: DoNotDisturbMonitor(readAssertions: { Data(#"{"data":[{}]}"#.utf8) }))
         relay.start()
     }
     deinit { controller.shutdown() }

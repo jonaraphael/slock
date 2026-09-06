@@ -89,6 +89,12 @@ talks at a time; if you press together, the apps pick one sender consistently.
 Excellent practice for saying “over.” Voice is end-to-end encrypted Opus and
 runs independently of light timing.
 
+**Do Not Disturb and other Focus modes pause voice on your Mac**, including an
+ongoing talk. Light signals keep working, and both people’s PTT consent stays
+enabled. Once Focus is off, release Caps Lock and hold it again to talk; interrupted
+audio is discarded. The menu shows **Audio Paused** while Focus is active. If
+macOS’s Focus status cannot be read, voice stays paused and the menu explains why.
+
 ## Getting to know Dit
 
 | What you see | What it means |
