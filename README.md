@@ -100,7 +100,7 @@ macOS’s Focus status cannot be read, voice stays paused and the menu explains 
 | What you see | What it means |
 | --- | --- |
 | **Yellow-green tail** | You’re holding the key or transmitting. Hello, person. |
-| **Slowly fading green tail** | Pairing was accepted. Ready for the first light signal in either direction. |
+| **Slowly pulsing green tail** | Pairing was accepted. Ready for the first light signal in either direction. |
 | **Blue tail** | Your paired Mac is unavailable: offline, paused, or still connecting. |
 | **Red tail** | A required permission is missing, or a pairing/PTT request needs attention. |
 | **Hollow tail** | No outgoing activity. An incoming signal appears on your keyboard’s light. |
@@ -290,6 +290,7 @@ Maintainers can find the tagging and publishing steps in
 | [slock.swift](slock.swift) | Application, keyboard capture, pairing, relay, and audio. |
 | [build.command](build.command) | Builds, packages, and signs the app. |
 | [test.command](test.command) | Runs the [regression suite](Tests/RegressionTests.swift) and friends. |
+| [docs/releases/](docs/releases/) | Changelog and upgrade notes for each release. |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Design, protocol, state machines, and manual test plan. |
 | [VALIDATION.md](VALIDATION.md) | Verified results and remaining hardware checks. |
 | [SECURITY.md](SECURITY.md) | Privacy, security limits, and private vulnerability reporting. |
