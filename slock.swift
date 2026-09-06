@@ -18,7 +18,7 @@ enum SlockConfig {
     static let appName = "slock"
     // Keep identity keys and the single-instance lock in their existing location.
     static let storageName = "CapsLink"
-    static let appVersion = "0.2.8"
+    static let appVersion = "0.2.9"
     static let protocolVersion: UInt8 = 2
     static let brokerURL = URL(string: "wss://test.mosquitto.org:8081/mqtt")!
     static let topicPrefix = "capslink/v2/inbox/"
@@ -142,21 +142,26 @@ func appError(_ domain: String, _ message: String, code: Int = 1) -> NSError {
 
 // MARK: - Release updates
 
-// Metadata only. Installing an ad-hoc signed download cannot authenticate its
-// publisher. Downloads are left to the browser and macOS's normal launch checks.
+// Metadata and signed update downloads are bounded while streaming. Metadata
+// never redirects; update assets allow only GitHub's HTTPS asset hosts.
 final class ReleaseRequest: NSObject, URLSessionDataDelegate {
     static let maximumBytes = 128 * 1024
     private var bytes = Data()
     private var exceededLimit = false
     private var completion: UpdateChecker.Completion?
     private var session: URLSession?
+    private var maximumBytes = ReleaseRequest.maximumBytes
+    private var redirectHosts: Set<String> = []
 
     static func fetch(_ request: URLRequest, configuration: URLSessionConfiguration = .ephemeral,
+                      maximumBytes: Int = ReleaseRequest.maximumBytes, redirectHosts: Set<String> = [],
                       completion: @escaping UpdateChecker.Completion) {
         let fetch = ReleaseRequest()
         fetch.completion = completion
+        fetch.maximumBytes = maximumBytes
+        fetch.redirectHosts = redirectHosts
         configuration.timeoutIntervalForRequest = 15
-        configuration.timeoutIntervalForResource = 30
+        configuration.timeoutIntervalForResource = redirectHosts.isEmpty ? 30 : 120
         configuration.httpShouldSetCookies = false
         configuration.urlCache = nil
         let session = URLSession(configuration: configuration, delegate: fetch, delegateQueue: nil)
@@ -167,18 +172,20 @@ final class ReleaseRequest: NSObject, URLSessionDataDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask,
                     willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
                     completionHandler: @escaping (URLRequest?) -> Void) {
-        completionHandler(nil)
+        let url = request.url
+        completionHandler(url?.scheme == "https" && url?.user == nil && url?.password == nil
+            && (url?.port == nil || url?.port == 443) && redirectHosts.contains(url?.host ?? "") ? request : nil)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
                     didReceive response: URLResponse,
                     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        exceededLimit = response.expectedContentLength > Int64(Self.maximumBytes)
+        exceededLimit = response.expectedContentLength > Int64(maximumBytes)
         completionHandler(exceededLimit ? .cancel : .allow)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        guard !exceededLimit, data.count <= Self.maximumBytes - bytes.count else {
+        guard !exceededLimit, data.count <= maximumBytes - bytes.count else {
             exceededLimit = true
             dataTask.cancel()
             return
@@ -223,9 +230,9 @@ struct ReleaseVersion: Comparable {
 struct SlockUpdate: Equatable {
     let tag: String
 
-    var releaseURL: URL? {
+    var packageURL: URL? {
         guard tag.hasPrefix("v"), ReleaseVersion(tag) != nil else { return nil }
-        return URL(string: "https://github.com/jonaraphael/slock/releases/tag/\(tag)")
+        return URL(string: "https://github.com/jonaraphael/slock/releases/download/\(tag)/slock-update.json")
     }
 
     static func available(in data: Data, currentVersion: String) throws -> SlockUpdate? {
@@ -260,6 +267,7 @@ final class UpdateChecker {
     private let now: () -> Date
     private var nextCheck = Date.distantPast
     private var checking = false
+    private var requestedChecks: [(Result<SlockUpdate?, Error>) -> Void] = []
 
     init(currentVersion: String = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
              ?? SlockConfig.appVersion,
@@ -274,6 +282,17 @@ final class UpdateChecker {
 
     func checkIfNeeded() {
         guard !checking, now() >= nextCheck else { return }
+        check()
+    }
+
+    // Explicit update actions bypass the hourly cache. A failure never falls
+    // back to installing an older cached tag.
+    func checkNow(_ completion: @escaping (Result<SlockUpdate?, Error>) -> Void) {
+        requestedChecks.append(completion)
+        if !checking { check() }
+    }
+
+    private func check() {
         checking = true
         var request = URLRequest(url: Self.latestReleaseURL, cachePolicy: .reloadIgnoringLocalCacheData,
                                  timeoutInterval: 15)
@@ -285,6 +304,13 @@ final class UpdateChecker {
                 guard let self else { return }
                 self.checking = false
                 self.nextCheck = self.now().addingTimeInterval(Self.retryInterval)
+                var result: Result<SlockUpdate?, Error> = .failure(
+                    error ?? appError("slock.Update", "Could not check for updates. Please try again."))
+                defer {
+                    let callbacks = self.requestedChecks
+                    self.requestedChecks.removeAll()
+                    callbacks.forEach { $0(result) }
+                }
                 // Keep a known update through temporary network/rate-limit failures.
                 guard error == nil, let http = response as? HTTPURLResponse else { return }
                 let update: SlockUpdate?
@@ -297,6 +323,7 @@ final class UpdateChecker {
                     return
                 }
                 self.nextCheck = self.now().addingTimeInterval(Self.checkInterval)
+                result = .success(update)
                 guard update != self.availableUpdate else { return }
                 self.availableUpdate = update
                 self.onChange?()
@@ -4455,6 +4482,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var optionOnlyItems: [NSMenuItem] = []
     private var menuModifierTimer: Timer?
     private let updateChecker = UpdateChecker()
+    private let appUpdater = AppUpdater()
     private var updateTimer: Timer?
     private var updateMenuItem: NSMenuItem?
     private let permissionSetup = KeyboardPermissionSetup()
@@ -4481,6 +4509,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         updateChecker.onChange = { [weak self] in self?.refreshUpdateMenuItem() }
+        appUpdater.onChange = { [weak self] in self?.refreshUpdateMenuItem() }
+        appUpdater.onError = { [weak self] error in
+            self?.showAlert(title: "Could not update slock", message: error.localizedDescription)
+        }
+        appUpdater.onUpToDate = { [weak self] in
+            self?.showAlert(title: "slock is up to date", message: "You're running the latest stable release.")
+        }
+        appUpdater.onReadyToRelaunch = { NSApp.terminate(nil) }
         updateChecker.checkIfNeeded()
         let updateTimer = Timer(timeInterval: UpdateChecker.retryInterval, repeats: true) { [weak self] _ in
             self?.updateChecker.checkIfNeeded()
@@ -4498,6 +4534,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        appUpdater.cancel()
         menuModifierTimer?.invalidate()
         pairingPulseTimer?.invalidate()
         updateTimer?.invalidate()
@@ -4684,17 +4721,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refreshUpdateMenuItem() {
         guard let item = updateMenuItem else { return }
-        item.title = "Download Update…"
-        item.isHidden = updateChecker.availableUpdate == nil
-        item.isEnabled = updateChecker.availableUpdate?.releaseURL != nil
-        item.toolTip = "Open the new release on GitHub to review and download it."
+        item.title = appUpdater.status ?? (updateChecker.availableUpdate == nil ? "Check for Updates…" : "Update slock…")
+        item.isEnabled = appUpdater.status == nil
+        item.toolTip = "Download the latest release, verify it, replace slock, and relaunch."
     }
 
     @objc private func updateSlock() {
-        guard let url = updateChecker.availableUpdate?.releaseURL else { return }
-        if !NSWorkspace.shared.open(url) {
-            showAlert(title: "Could not open the release", message: "Open the slock releases page on GitHub to download the update.")
-        }
+        appUpdater.checkAndInstall(using: updateChecker)
     }
 
     @discardableResult
@@ -4976,6 +5009,7 @@ private func installProcessCleanupHandlers() {
 @main
 enum SlockApp {
     static func main() {
+        if UpdateInstaller.runHelperIfRequested() { return }
         installProcessCleanupHandlers()
         let app = NSApplication.shared
         let delegate = AppDelegate()

@@ -120,12 +120,60 @@ private final class FakeReleaseServer {
             server.respond(status: 404)
             try expectUpdate(checker.availableUpdate == nil, "removed release still offered")
         }
-        test("release links stay on GitHub and reject path, query and fragment injection") {
+        test("clicking update bypasses cached metadata and selects the newest release") {
+            let server = FakeReleaseServer()
+            let checker = UpdateChecker(currentVersion: "0.2.6", fetch: server.fetch)
+            checker.checkIfNeeded()
+            server.respond(try release("v0.2.7"))
+            var chosen: SlockUpdate?
+            checker.checkNow { chosen = try? $0.get() }
+            try expectUpdate(server.requests.count == 2, "click reused the hourly cache")
+            server.respond(try release("v0.2.9"))
+            try expectUpdate(chosen?.tag == "v0.2.9", "click chose an outdated release")
+        }
+        test("an explicit failed check cannot install a cached update and can retry immediately") {
+            let server = FakeReleaseServer()
+            let checker = UpdateChecker(currentVersion: "0.2.6", fetch: server.fetch)
+            checker.checkIfNeeded()
+            server.respond(try release("v0.2.7"))
+            var failed = false
+            checker.checkNow { if case .failure = $0 { failed = true } }
+            server.respond(status: 403)
+            try expectUpdate(failed && checker.availableUpdate?.tag == "v0.2.7", "failure installed cached metadata")
+            var completed = 0
+            checker.checkNow { _ in completed += 1 }
+            checker.checkNow { _ in completed += 1 }
+            try expectUpdate(server.requests.count == 3, "explicit checks did not coalesce or retry")
+            server.respond(try release("v0.2.9"))
+            try expectUpdate(completed == 2, "coalesced callbacks were lost")
+        }
+        test("the update action handles up-to-date, failure, and cancellation without installing") {
+            let server = FakeReleaseServer()
+            let checker = UpdateChecker(currentVersion: "0.2.9", fetch: server.fetch)
+            let updater = AppUpdater()
+            var current = 0, errors = 0, restarts = 0
+            updater.onUpToDate = { current += 1 }
+            updater.onError = { _ in errors += 1 }
+            updater.onReadyToRelaunch = { restarts += 1 }
+            updater.checkAndInstall(using: checker)
+            updater.checkAndInstall(using: checker)
+            try expectUpdate(server.requests.count == 1 && updater.status != nil, "overlapping installs")
+            server.respond(try release("v0.2.9"))
+            try expectUpdate(current == 1 && updater.status == nil, "up-to-date did not reset UI")
+            updater.checkAndInstall(using: checker)
+            server.respond(status: 500)
+            try expectUpdate(errors == 1 && updater.status == nil, "failure did not reset UI")
+            updater.checkAndInstall(using: checker)
+            updater.cancel()
+            server.respond(try release("v0.3.0"))
+            try expectUpdate(restarts == 0 && errors == 1, "cancelled update continued")
+        }
+        test("signed update URLs stay on GitHub and reject path, query and fragment injection") {
             for tag in ["v1.2.3/../../elsewhere", "v1.2.3?download=evil", "v1.2.3#evil", "1.2.3", "https://example.com", "v1.2.3\n"] {
-                try expectUpdate(SlockUpdate(tag: tag).releaseURL == nil, tag)
+                try expectUpdate(SlockUpdate(tag: tag).packageURL == nil, tag)
             }
-            try expectUpdate(SlockUpdate(tag: "v1.2.3").releaseURL?.absoluteString ==
-                "https://github.com/jonaraphael/slock/releases/tag/v1.2.3", "wrong release URL")
+            try expectUpdate(SlockUpdate(tag: "v1.2.3").packageURL?.absoluteString ==
+                "https://github.com/jonaraphael/slock/releases/download/v1.2.3/slock-update.json", "wrong package URL")
         }
         test("oversized release metadata is rejected") {
             try expectUpdateError {

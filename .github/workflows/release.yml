@@ -81,7 +81,7 @@ jobs:
           cd dist
           shasum -a 256 slock.app.zip > SHA256SUMS
 
-      - name: Publish GitHub release
+      - name: Prepare GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -102,6 +102,11 @@ jobs:
           # Only drafts reach this upload, so a failed upload cannot break the
           # current download. A rerun can finish an interrupted draft release.
           gh release upload "$RELEASE_TAG" dist/slock.app.zip dist/SHA256SUMS --clobber
+          if [[ -f scripts/sign-update.command ]]; then
+            echo "Draft ready. Complete local signing and publication with ./scripts/publish-release.command $RELEASE_TAG"
+            gh release view "$RELEASE_TAG" --json url --jq .url
+            exit 0
+          fi
           # REST lookup by tag excludes drafts; the CLI also searches drafts.
           release_id=$(gh release view "$RELEASE_TAG" --json databaseId --jq .databaseId)
           gh api --method PATCH "repos/$GH_REPO/releases/$release_id" \

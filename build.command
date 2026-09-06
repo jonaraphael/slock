@@ -7,6 +7,7 @@ trap 'rm -rf "$build_dir"' EXIT
 # Compile both architectures from the same bytes even if the working tree is
 # edited during a local build (the regression runner uses the same approach).
 cp slock.swift "$build_dir/slock.swift"
+cp UpdateInstaller.swift "$build_dir/UpdateInstaller.swift"
 app="$build_dir/slock.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 ./scripts/swiftc.command -swift-version 5 -module-cache-path "$PWD/.build/modules" \
@@ -19,7 +20,7 @@ for architecture in "${architectures[@]}"; do
   case "$architecture" in arm64|x86_64) ;; *) echo "Unsupported architecture: $architecture" >&2; exit 1 ;; esac
   ./scripts/swiftc.command -parse-as-library -swift-version 5 -O \
     -target "$architecture-apple-macos13.0" -module-cache-path "$PWD/.build/modules" \
-    "$@" "$build_dir/slock.swift" -o "$build_dir/slock-$architecture"
+    "$@" "$build_dir/slock.swift" "$build_dir/UpdateInstaller.swift" -o "$build_dir/slock-$architecture"
   slices+=("$build_dir/slock-$architecture")
 done
 xcrun lipo -create "${slices[@]}" -output "$app/Contents/MacOS/slock"

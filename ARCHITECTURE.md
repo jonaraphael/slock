@@ -28,13 +28,36 @@ A pure peer-to-peer client still needs NAT traversal, signaling, and often TURN.
 
 The client has:
 
-- one Swift source file;
+- two Swift source files (the app and native updater);
 - no package manager;
 - no embedded browser;
 - no database;
 - no server account or API key;
 - no third-party runtime library;
 - AppKit, IOKit, CryptoKit, AVFoundation, AudioToolbox, and ServiceManagement only.
+
+## Application updates
+
+GitHub's latest stable release API is checked at launch and hourly for menu
+discovery. The update action always rechecks it, bypassing the hourly cache;
+network failures never fall back to installing a cached release. **Check for
+Updates…** remains available when no newer release is known.
+
+`UpdateInstaller.swift` downloads a bounded `slock-update.json` from the selected
+release. HTTPS redirects are restricted to GitHub's asset hosts. The package's
+Ed25519 signature is verified against `SlockUpdatePublicKey` embedded in the
+installed app before decoding the payload. Its version must match the selected
+release and exceed the installed version. Exactly six regular app files are
+allowed, with fixed paths; there is no ZIP extraction, symbolic link, or
+downloaded installer script. Staging reconstructs the signed app in a private
+directory beside the installed app and checks its code signature.
+
+A copy of the running executable acts as the temporary installer. It waits for
+normal termination to restore keyboard state and stop audio, checks the staged
+app again, replaces the app at its existing path, and relaunches it. A failed
+replacement or relaunch restores the old app. The updater never elevates
+privileges or accesses Keychain; an unwritable install location produces an error.
+Pairing identity and preferences are not touched.
 
 ## Data flow
 

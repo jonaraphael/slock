@@ -1,5 +1,19 @@
 # Validation — 2026-09-04
 
+## Native updater restoration — 2026-09-06
+
+- **157 automated tests passed**, including signed-package tampering, fixed file
+  paths, staging permissions, replacement, rollback, and fresh update checks.
+  The installer suite was rerun after fixing macOS temporary-directory aliases.
+- The real release executable's helper was exercised against a throwaway app:
+  it waited for the old process to exit, replaced the app at its original path,
+  removed staging, and relaunched the new copy. The running slock was untouched.
+- The universal native build passed bundle signature, architecture, metadata,
+  and ZIP checks. The signed package was independently decoded, reconstructed,
+  and code-signature verified before release.
+- No additional runtime framework, Keychain access, or privilege elevation is
+  used. The earlier hardware and permission caveats below still apply.
+
 Environment: Intel macOS 14.8.9 (23J631), Apple Swift 6.0.3, macOS 15.2 SDK,
 with a macOS 13 deployment target.
 

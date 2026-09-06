@@ -22,7 +22,7 @@ jobs:
           persist-credentials: false
       - name: Check scripts and bundle metadata
         run: |
-          bash -n build.command test.command scripts/swiftc.command
+          bash -n build.command test.command scripts/*.command
           /usr/bin/plutil -lint Resources/Info.plist
           git diff --check
       - name: Run regression and security tests

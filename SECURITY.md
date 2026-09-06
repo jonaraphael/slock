@@ -53,14 +53,20 @@ older binaries are not automatically patched.
    Production deployment requires an operated service with per-user credentials,
    inbox authorization and abuse limits. A shared password embedded in the
    distributable app cannot provide that isolation.
-2. **Distribution:** Builds are ad-hoc signed and not notarized. The custom
-   self-installer was removed because an ad-hoc signature and a checksum stored
-   beside the ZIP cannot establish publisher identity. “Download Update…” opens
-   a fixed GitHub release page in the browser. Source/release-account compromise
-   remains part of the download trust boundary. Broad distribution should use
+2. **Distribution:** Builds are ad-hoc signed and not notarized. Since v0.2.9,
+   the native updater requires an Ed25519 signature from a dedicated update key
+   embedded in the installed app. A release-hosted checksum or ad-hoc code
+   signature alone is not accepted as publisher identity. The signed package
+   contains only six regular files with fixed paths; no archives or downloaded
+   installer scripts are extracted or executed. Staging is private and bundle
+   integrity is checked before replacement. The updater requires a writable app
+   location and never requests administrator or Keychain access.
+   The private signing key stays in a private maintainer file on the signing Mac;
+   GitHub receives only signed public artifacts. Initial downloads and
+   source/signing-account compromise remain trust boundaries. Broad distribution should use
    [Developer ID signing and notarization](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution).
-   Any future self-installer must authenticate the publisher independently before
-   accepting executable code, and securely handle archive extraction and replacement.
+   Versions 0.2.6–0.2.8 only open GitHub for manual downloads and need one manual
+   replacement to receive this updater.
 3. **Validation:** Automated tests use fake keyboard/relay/microphone devices and
    synthetic audio. Two physical Macs, actual permissions, sleep/wake and keyboard
    compatibility still require the manual matrix in [ARCHITECTURE.md](ARCHITECTURE.md).

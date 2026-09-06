@@ -37,7 +37,7 @@ The firefly is **Dit**. Dit has one light and considerable enthusiasm.
 - **It’s private by construction.** Every message is end-to-end encrypted between
   your two Macs. There are no accounts, no server that knows who you are, and no
   analytics. The relay only sees ciphertext and routing.
-- **It’s tiny and open.** One Swift file, no third-party libraries, no Xcode
+- **It’s tiny and open.** Two Swift files, no third-party libraries, no Xcode
   project required. Read the whole thing over a coffee, then build it yourself.
 
 > **An honest note before you download.** slock is an experiment with rough
@@ -116,7 +116,7 @@ A few useful things in the menu:
 | **Recent** | Revisit a past pairing. Reconnecting sends a fresh request. |
 | **Unpair** | Disconnect immediately and stop lights and voice. |
 | **Launch at Login** | Start slock when you sign in. Turned on at first launch when macOS allows it; switch it off here. |
-| **Download Update…** | Appears only when a newer stable release exists. Opens the GitHub release page. |
+| **Check for Updates… / Update slock…** | Checks the latest release, downloads and verifies it, then replaces and relaunches slock in place. |
 | **Quit slock** | Restore the previous keyboard mapping and let Dit clock out. |
 
 When either Mac unpairs, the other returns to **Unpaired** too. If the message is
@@ -137,7 +137,8 @@ Caps Lock Light**, **Diagnostics…**, and the installed version.
   sizes, but not content.
 - **What stays on your Mac.** Your identity key in a private folder, your recent
   pairings, and your settings. Nothing is sent to the author. The only other
-  network call is a version check against GitHub at launch and hourly.
+  network traffic outside the relay is a version check against GitHub at launch
+  and hourly, plus the update download when you choose to install one.
 - **What it never does.** No accounts, no telemetry, no ads, no contacts access,
   no clipboard reading. The microphone is used only during a consented, held
   push-to-talk transmission.
@@ -188,11 +189,18 @@ then your local nickname, then the last six characters of its code. Unpairing
 keeps this history but clears active voice consent. Switching to another Mac asks
 before disconnecting your current peer.
 
-slock checks GitHub for updates at launch and hourly. **Download Update…** appears
-only for a newer stable release. Download its ZIP, quit slock, replace the app in
-Applications, and reopen it. Pairings and preferences stay; macOS may ask you to
-renew permissions. Upgrade both Macs together: version 0.2 uses protocol 2 and
-cannot communicate with version 0.1.
+slock checks GitHub for updates at launch and hourly. **Check for Updates…** is
+always available and becomes **Update slock…** when a newer release is known.
+Either action checks the latest release again, downloads and verifies its signed
+update, then replaces slock and relaunches it in the same location. No extra
+updater, administrator access, or Keychain permission is required. Keep slock in
+a writable Applications folder. Pairings and preferences stay; macOS may still
+ask you to renew keyboard permissions after an update.
+
+Versions **0.2.6–0.2.8** only open a release page. Download the latest ZIP once,
+quit slock, replace the app in Applications, and reopen it to receive the restored
+updater. Upgrade both Macs together: version 0.2 uses protocol 2 and cannot
+communicate with version 0.1.
 
 </details>
 
@@ -288,6 +296,7 @@ Maintainers can find the tagging and publishing steps in
 | File | Purpose |
 | --- | --- |
 | [slock.swift](slock.swift) | Application, keyboard capture, pairing, relay, and audio. |
+| [UpdateInstaller.swift](UpdateInstaller.swift) | Signed update verification, replacement, and relaunch. |
 | [build.command](build.command) | Builds, packages, and signs the app. |
 | [test.command](test.command) | Runs the [regression suite](Tests/RegressionTests.swift) and friends. |
 | [docs/releases/](docs/releases/) | Changelog and upgrade notes for each release. |
