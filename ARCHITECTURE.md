@@ -212,6 +212,14 @@ confirmed session is unavailable. Blue includes local key activity and pending
 attention; missing required local permissions take priority with red. Unpaired
 Macs do not show the blue tail.
 
+After either side accepts a new pairing, Dit's tail fades between hollow and
+green on a four-second cycle until the first light signal is sent to an available
+peer or displayed locally. This unused state persists across relaunches and is
+cleared by unpairing; repeated requests do not rearm an already paired recipient.
+Permissions, availability, outgoing activity, and pending attention take priority.
+Only the ready state runs an animation timer, using cached vector frames; Reduce
+Motion shows a steady green tail instead.
+
 A physical transition carries its original `CGEvent` timestamp, captured before
 deferred controller work: one state byte followed by an eight-byte big-endian
 nanosecond timestamp. Only timestamp differences matter; the two clocks need no

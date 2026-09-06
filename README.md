@@ -93,9 +93,12 @@ skips the light signal’s one-second buffer.
 | What you see | What it means |
 | --- | --- |
 | **Yellow-green tail** | You’re holding the key or transmitting. Hello, person. |
+| **Slowly fading green tail** | Pairing was accepted. Ready for the first light signal in either direction. |
 | **Blue tail** | Your paired Mac is unavailable: offline, paused, or still connecting. |
 | **Red tail** | A required permission is missing, or a pairing/PTT request needs attention. |
 | **Hollow tail** | No outgoing activity. An incoming signal appears on your keyboard’s light. |
+
+With Reduce Motion enabled, the accepted-pairing tail stays steady green.
 
 A few useful things in the menu:
 

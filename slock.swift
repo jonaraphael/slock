@@ -576,7 +576,17 @@ final class PeerStore {
     var peerPublicKey: Data? {
         didSet {
             defaults.set(peerPublicKey, forKey: peerKey)
-            if peerPublicKey != oldValue { ptt = PTTConsent() }
+            if peerPublicKey != oldValue {
+                ptt = PTTConsent()
+                pairingAwaitingFirstUse = false
+            }
+        }
+    }
+
+    var pairingAwaitingFirstUse = false {
+        didSet {
+            guard pairingAwaitingFirstUse != oldValue else { return }
+            defaults.set(pairingAwaitingFirstUse, forKey: "slock.pairingAwaitingFirstUse")
         }
     }
 
@@ -603,6 +613,8 @@ final class PeerStore {
             revoked: defaults.string(forKey: "CapsLink.pttRevocation").flatMap(UInt64.init)
         )
         if peerPublicKey == nil { ptt = PTTConsent() }
+        pairingAwaitingFirstUse = peerPublicKey != nil
+            && (defaults.object(forKey: "slock.pairingAwaitingFirstUse") as? Bool ?? false)
         if let data = defaults.data(forKey: "slock.recentPeers"),
            let saved = try? JSONDecoder().decode([RecentPeer].self, from: data) {
             var seen = Set<Data>()
@@ -3024,6 +3036,7 @@ final class SlockController {
             peerStore.peerPublicKey = incoming
             peerStore.establish(incoming, ownNickname: incomingNickname,
                                 localNickname: localNickname ?? incomingLocalNickname)
+            peerStore.pairingAwaitingFirstUse = true
             peerStore.ptt.disable()
             send(kind: .pairAccept, payload: PeerProfile.payload(peerStore.ownNickname), to: incoming)
             markPeerSeen()
@@ -3387,6 +3400,7 @@ final class SlockController {
             peerStore.peerPublicKey = sender
             peerStore.establish(sender, ownNickname: PeerProfile.read(message.payload) ?? outgoingRemoteNickname,
                                 localNickname: outgoingLocalNickname)
+            peerStore.pairingAwaitingFirstUse = true
             peerStore.ptt.disable()
             incomingPairPublicKey = nil
             outgoingPairPublicKey = nil
@@ -3507,6 +3521,7 @@ final class SlockController {
 
     private func applyRemoteKey(_ down: Bool) {
         guard capsInterceptor.isActive else { return }
+        if down { peerStore.pairingAwaitingFirstUse = false }
         remoteKeyDown = down
         led.set(down)
     }
@@ -3792,6 +3807,10 @@ final class SlockController {
                 payload: packet
             )
             if kind == .keyState { sentKeyMessages += 1 }
+            // A HELLO can also deliver a light held before acceptance/reconnect.
+            if kind == .keyState || kind == .hello, payload.first == 1, !peerUnavailable {
+                peerStore.pairingAwaitingFirstUse = false
+            }
             if kind == .audio { sentAudioBatches += 1 }
         } catch {
             lastError = error.localizedDescription
@@ -3913,19 +3932,25 @@ enum FireflyIcon {
         case outgoing
         case notification
         case unavailable
+        case pairingReady
     }
 
     static let idle = makeImage(tail: .idle)
     static let outgoing = makeImage(tail: .outgoing)
     static let notification = makeImage(tail: .notification)
     static let unavailable = makeImage(tail: .unavailable)
+    static let pairingPulseDuration: TimeInterval = 4
+    private static let pairingFrames = (0...60).map {
+        makeImage(tail: .pairingReady, glow: CGFloat($0) / 60)
+    }
 
     static func tailState(localActive: Bool, attention: Bool, peerUnavailable: Bool = false,
-                          permissionsRequired: Bool = false) -> TailState {
+                          permissionsRequired: Bool = false, pairingAwaitingFirstUse: Bool = false) -> TailState {
         if permissionsRequired { return .notification }
         if peerUnavailable { return .unavailable }
         if localActive { return .outgoing }
         if attention { return .notification }
+        if pairingAwaitingFirstUse { return .pairingReady }
         return .idle
     }
 
@@ -3935,10 +3960,17 @@ enum FireflyIcon {
         case .outgoing: return outgoing
         case .notification: return notification
         case .unavailable: return unavailable
+        case .pairingReady: return pairingFrames[60]
         }
     }
 
-    private static func makeImage(tail: TailState) -> NSImage {
+    static func pairingImage(elapsed: TimeInterval) -> NSImage {
+        let phase = max(0, elapsed).truncatingRemainder(dividingBy: pairingPulseDuration) / pairingPulseDuration
+        let glow = (1 - cos(phase * 2 * .pi)) / 2
+        return pairingFrames[Int((glow * 60).rounded())]
+    }
+
+    private static func makeImage(tail: TailState, glow: CGFloat = 1) -> NSImage {
         // Vector artwork stays crisp at both Retina and standard scale. Idle
         // artwork is a template; colored tails keep an adaptive body.
         let isColored = tail != .idle
@@ -3979,6 +4011,13 @@ enum FireflyIcon {
             case .unavailable:
                 NSColor.systemBlue.setFill()
                 NSBezierPath(ovalIn: NSRect(x: 37, y: 98, width: 46, height: 46)).fill()
+            case .pairingReady:
+                bodyColor.withAlphaComponent(1 - glow).setStroke()
+                let outline = NSBezierPath(ovalIn: NSRect(x: 41, y: 102, width: 38, height: 38))
+                outline.lineWidth = 8
+                outline.stroke()
+                NSColor.systemGreen.withAlphaComponent(glow).setFill()
+                NSBezierPath(ovalIn: NSRect(x: 37, y: 98, width: 46, height: 46)).fill()
             case .idle:
                 let tail = NSBezierPath(ovalIn: NSRect(x: 41, y: 102, width: 38, height: 38))
                 tail.lineWidth = 8
@@ -3988,8 +4027,11 @@ enum FireflyIcon {
             return true
         }
         image.isTemplate = !isColored
-        image.accessibilityDescription = tail == .unavailable
-            ? "Dit, the slock firefly — peer unavailable" : "Dit, the slock firefly"
+        switch tail {
+        case .unavailable: image.accessibilityDescription = "Dit, the slock firefly — peer unavailable"
+        case .pairingReady: image.accessibilityDescription = "Dit, the slock firefly — pairing accepted, ready for your first signal"
+        default: image.accessibilityDescription = "Dit, the slock firefly"
+        }
         return image
     }
 }
@@ -4302,6 +4344,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let permissionSetup = KeyboardPermissionSetup()
     private var permissionWindow: PermissionSetupWindow?
     private var permissionsRequiredItem: NSMenuItem?
+    private var pairingPulseTimer: Timer?
+    private var pairingPulseStartedAt: TimeInterval?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -4339,6 +4383,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         menuModifierTimer?.invalidate()
+        pairingPulseTimer?.invalidate()
         updateTimer?.invalidate()
         permissionWindow?.close()
         controller?.shutdown()
@@ -4404,11 +4449,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             localActive: controller.localKeyDown || controller.localTalking,
             attention: needsAttention,
             peerUnavailable: controller.peerUnavailable,
-            permissionsRequired: !permissions.isReady
+            permissionsRequired: !permissions.isReady,
+            pairingAwaitingFirstUse: controller.peerStore.pairingAwaitingFirstUse
         )
-        button.image = FireflyIcon.image(tail: tail)
+        updateTail(tail)
         button.title = ""
         button.toolTip = "slock - \(permissions.isReady ? controller.statusText : PermissionMenu.title)"
+    }
+
+    private func updateTail(_ tail: FireflyIcon.TailState) {
+        guard tail == .pairingReady, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            pairingPulseTimer?.invalidate()
+            pairingPulseTimer = nil
+            pairingPulseStartedAt = nil
+            statusItem.button?.image = FireflyIcon.image(tail: tail)
+            return
+        }
+        if pairingPulseTimer == nil {
+            pairingPulseStartedAt = ProcessInfo.processInfo.systemUptime
+            let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+                self?.drawPairingPulse()
+            }
+            timer.tolerance = 0.01
+            pairingPulseTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
+        }
+        drawPairingPulse()
+    }
+
+    private func drawPairingPulse() {
+        guard let startedAt = pairingPulseStartedAt else { return }
+        statusItem.button?.image = FireflyIcon.pairingImage(
+            elapsed: ProcessInfo.processInfo.systemUptime - startedAt)
     }
 
     private func rebuildMenu() {

@@ -480,19 +480,92 @@ enum RegressionTests {
             try b.controller.pair(using: alice.pairingCode)
             try exchange(a, b)
             try check(a.controller.incomingPairPublicKey == bob.publicKey && a.controller.peerPublicKey == nil, "pairing skipped approval")
+            try check(!a.peerStore.pairingAwaitingFirstUse && !b.peerStore.pairingAwaitingFirstUse,
+                      "pending pairing signaled acceptance")
             a.controller.acceptIncomingPair(expected: alice.publicKey)
             try check(a.controller.peerPublicKey == nil, "stale pair action paired a different identity")
             a.controller.acceptIncomingPair(expected: bob.publicKey)
             try exchange(a, b)
             try check(a.controller.peerPublicKey == bob.publicKey && b.controller.peerPublicKey == alice.publicKey, "pairing did not persist on both Macs")
+            try check(a.peerStore.pairingAwaitingFirstUse && b.peerStore.pairingAwaitingFirstUse,
+                      "acceptance did not arm the ready tail on both Macs, or idle HELLO consumed it")
+            try check(PeerStore(defaults: a.defaults).pairingAwaitingFirstUse
+                      && PeerStore(defaults: b.defaults).pairingAwaitingFirstUse,
+                      "unused pairing did not survive relaunch")
             b.key(true); try exchange(a, b)
             try check(a.controller.remoteKeyDown && a.controller.led.isOn && !b.controller.led.isOn, "held key lit the wrong keyboard")
+            try check(!a.peerStore.pairingAwaitingFirstUse && !b.peerStore.pairingAwaitingFirstUse,
+                      "first sent/received signal did not consume the ready tail on both Macs")
+            try check(!PeerStore(defaults: a.defaults).pairingAwaitingFirstUse
+                      && !PeerStore(defaults: b.defaults).pairingAwaitingFirstUse,
+                      "used pairing became unused after relaunch")
             b.key(false); try exchange(a, b)
             try check(!a.controller.remoteKeyDown && !a.controller.led.isOn, "release did not clear the light")
             try check(b.controller.diagnostics().contains("Local Caps presses: 1"), "local capture counter missing")
             try check(b.controller.diagnostics().contains("Key messages queued: 2"), "queued key counter missing")
             try check(a.controller.diagnostics().contains("Key messages received: 2"), "received key counter missing")
             try check(a.controller.diagnostics().contains("Last peer key state: up"), "last received key state missing")
+        }
+        test("a light already held at acceptance consumes readiness on both Macs") {
+            for initiatorHolds in [false, true] {
+                let a = TestMac(alice), b = TestMac(bob)
+                a.relay.start(); b.relay.start()
+                try a.controller.pair(using: bob.pairingCode); try exchange(a, b)
+                (initiatorHolds ? a : b).key(true)
+                b.controller.acceptIncomingPair(expected: alice.publicKey); try exchange(a, b)
+                try check((initiatorHolds ? b : a).controller.remoteKeyDown,
+                          "held light was not delivered with the acceptance HELLO")
+                try check(!a.peerStore.pairingAwaitingFirstUse && !b.peerStore.pairingAwaitingFirstUse,
+                          "held-key HELLO did not consume readiness on both Macs")
+            }
+        }
+        test("unused pairing survives offline and paused presses, then clears on a delivered timed signal") {
+            let a = TestMac(alice), b = TestMac(bob)
+            a.relay.start(); b.relay.start()
+            try a.controller.pair(using: bob.pairingCode); try exchange(a, b)
+            b.controller.acceptIncomingPair(expected: alice.publicKey); try exchange(a, b)
+            a.relay.stop()
+            a.key(true); a.key(false)
+            try check(a.peerStore.pairingAwaitingFirstUse, "offline key consumed unused pairing")
+            a.relay.start(); try exchange(a, b)
+            b.controller.setCaptureEnabled(false); try exchange(a, b)
+            a.key(true); try exchange(a, b)
+            a.key(false); try exchange(a, b)
+            try check(a.peerStore.pairingAwaitingFirstUse && b.peerStore.pairingAwaitingFirstUse,
+                      "paused peer consumed an unused pairing")
+            b.controller.setCaptureEnabled(true); try exchange(a, b)
+            a.key(true, timestamp: 1_000_000_000); try exchange(a, b)
+            b.advance(to: b.clock.time + 1)
+            try check(!a.peerStore.pairingAwaitingFirstUse && !b.peerStore.pairingAwaitingFirstUse,
+                      "timed light signal did not consume the unused pairing")
+        }
+        test("pairing retries do not rearm a used recipient, but a new accepted pairing does") {
+            let a = TestMac(alice), b = TestMac(bob)
+            a.relay.start(); b.relay.start()
+            try a.controller.pair(using: bob.pairingCode); try exchange(a, b)
+            b.controller.acceptIncomingPair(expected: alice.publicKey)
+            b.relay.packets.removeAll() // Lose acceptance so the request will be retried.
+            b.key(true); b.key(false)
+            try check(!b.peerStore.pairingAwaitingFirstUse, "recipient did not use the pairing")
+            a.clock.time += 11
+            a.controller.advanceMaintenance(); try exchange(a, b)
+            try check(!b.peerStore.pairingAwaitingFirstUse, "retried request rearmed the ready tail")
+            a.controller.unpair(); try exchange(a, b)
+            try check(!a.peerStore.pairingAwaitingFirstUse && !b.peerStore.pairingAwaitingFirstUse,
+                      "unpair retained the ready tail")
+            try a.controller.pair(using: bob.pairingCode); try exchange(a, b)
+            b.controller.acceptIncomingPair(expected: alice.publicKey); try exchange(a, b)
+            try check(a.peerStore.pairingAwaitingFirstUse && b.peerStore.pairingAwaitingFirstUse,
+                      "new accepted pairing did not rearm the ready tail")
+        }
+        test("existing saved pairings stay idle and removing or replacing an unused peer clears readiness") {
+            let mac = TestMac(alice, peer: bob.publicKey)
+            try check(!mac.peerStore.pairingAwaitingFirstUse, "existing pairing acquired a new acceptance indication")
+            mac.peerStore.pairingAwaitingFirstUse = true
+            mac.controller.unpair()
+            try check(!PeerStore(defaults: mac.defaults).pairingAwaitingFirstUse, "unpair kept readiness in preferences")
+            mac.peerStore.peerPublicKey = bob.publicKey
+            try check(!mac.peerStore.pairingAwaitingFirstUse, "different selection inherited readiness")
         }
         test("remote unpair restores unpaired state and stops lights and voice in either direction") {
             for transmitting in [false, true] {
@@ -1320,6 +1393,26 @@ enum RegressionTests {
                       "notification tail state")
             try check(FireflyIcon.tailState(localActive: true, attention: true, peerUnavailable: false) == .outgoing,
                       "outgoing key did not get tail priority")
+        }
+        test("Dit's unused pairing tail yields to activity, attention, availability and permissions") {
+            for localActive in [false, true] {
+                for attention in [false, true] {
+                    for unavailable in [false, true] {
+                        for permissions in [false, true] {
+                            let expected: FireflyIcon.TailState = permissions ? .notification
+                                : unavailable ? .unavailable : localActive ? .outgoing
+                                : attention ? .notification : .pairingReady
+                            try check(FireflyIcon.tailState(localActive: localActive, attention: attention,
+                                                           peerUnavailable: unavailable, permissionsRequired: permissions,
+                                                           pairingAwaitingFirstUse: true) == expected,
+                                      "unused pairing hid a higher-priority indication")
+                        }
+                    }
+                }
+            }
+            try check(!FireflyIcon.image(tail: .pairingReady).isTemplate, "ready tail was made monochrome")
+            try check(FireflyIcon.pairingImage(elapsed: 0).accessibilityDescription?.contains("pairing accepted") == true,
+                      "acceptance indication is only conveyed by color or motion")
         }
         test("Dit's red permission tail takes priority over outgoing activity") {
             for localActive in [false, true] {
