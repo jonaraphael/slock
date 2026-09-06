@@ -97,6 +97,37 @@ private final class FakeReleaseServer {
             server.respond(try release("v0.2.4"))
             try expectUpdate(checker.availableUpdate == nil && changes == 2, "withdrawn update kept")
         }
+        test("a confirmed current version refreshes the menu and a later update restores the action") {
+            let server = FakeReleaseServer()
+            var now = Date()
+            let checker = UpdateChecker(currentVersion: "0.3.0", now: { now }, fetch: server.fetch)
+            var changes = 0
+            checker.onChange = { changes += 1 }
+            try expectUpdate(!checker.isUpToDate, "unchecked version marked current")
+            for (data, status) in [(Data("bad JSON".utf8), 200), (try release("v0.3.0", draft: true), 200),
+                                   (try release("v0.3.0", prerelease: true), 200), (try release("invalid"), 200),
+                                   (try release("v0.2.9"), 200), (Data(), 404), (Data(), 403)] {
+                checker.checkNow { _ in }
+                server.respond(data, status: status)
+                try expectUpdate(!checker.isUpToDate && changes == 0, "unconfirmed result hid the action")
+            }
+            checker.checkNow { _ in }
+            server.respond(try release("v0.3.0"))
+            try expectUpdate(checker.isUpToDate && checker.availableUpdate == nil && changes == 1,
+                             "first matching result did not refresh the menu")
+            checker.checkNow { _ in }
+            server.respond(try release("v0.3.0"))
+            try expectUpdate(changes == 1, "unchanged match notified again")
+            now.addTimeInterval(UpdateChecker.checkInterval)
+            checker.checkIfNeeded()
+            server.respond(error: URLError(.notConnectedToInternet))
+            try expectUpdate(checker.isUpToDate && changes == 1, "temporary failure erased confirmed state")
+            now.addTimeInterval(UpdateChecker.retryInterval)
+            checker.checkIfNeeded()
+            server.respond(try release("v0.3.1"))
+            try expectUpdate(!checker.isUpToDate && checker.availableUpdate?.tag == "v0.3.1" && changes == 2,
+                             "background check did not restore the update action")
+        }
         test("offline, malformed and rate-limited checks preserve an update and recover") {
             let server = FakeReleaseServer()
             var now = Date()

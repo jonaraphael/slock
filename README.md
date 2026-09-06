@@ -116,7 +116,7 @@ A few useful things in the menu:
 | **Recent** | Revisit a past pairing. Reconnecting sends a fresh request. |
 | **Unpair** | Disconnect immediately and stop lights and voice. |
 | **Launch at Login** | Start slock when you sign in. Turned on at first launch when macOS allows it; switch it off here. |
-| **Check for Updates… / Update slock…** | Checks the latest release, downloads and verifies it, then replaces and relaunches slock in place. |
+| **Check for Updates… / Update slock…** | Hidden when the installed version matches GitHub's latest release. Otherwise checks, downloads, verifies, and installs the latest update. |
 | **Quit slock** | Restore the previous keyboard mapping and let Dit clock out. |
 
 When either Mac unpairs, the other returns to **Unpaired** too. If the message is
@@ -196,8 +196,9 @@ then your local nickname, then the last six characters of its code. Unpairing
 keeps this history but clears active voice consent. Switching to another Mac asks
 before disconnecting your current peer.
 
-slock checks GitHub for updates at launch and hourly. **Check for Updates…** is
-always available and becomes **Update slock…** when a newer release is known.
+slock checks GitHub for updates at launch and hourly. **Check for Updates…**
+disappears when GitHub confirms the installed version is current, and
+**Update slock…** appears when a newer release is known.
 Either action checks the latest release again, downloads and verifies its signed
 update, then replaces slock and relaunches it in the same location. No extra
 updater, administrator access, or Keychain permission is required. Keep slock in

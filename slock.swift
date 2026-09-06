@@ -18,7 +18,7 @@ enum SlockConfig {
     static let appName = "slock"
     // Keep identity keys and the single-instance lock in their existing location.
     static let storageName = "CapsLink"
-    static let appVersion = "0.3.0"
+    static let appVersion = "0.3.1"
     static let protocolVersion: UInt8 = 2
     static let brokerURL = URL(string: "wss://test.mosquitto.org:8081/mqtt")!
     static let topicPrefix = "capslink/v2/inbox/"
@@ -235,7 +235,17 @@ struct SlockUpdate: Equatable {
         return URL(string: "https://github.com/jonaraphael/slock/releases/download/\(tag)/slock-update.json")
     }
 
+    func isNewer(than currentVersion: String) -> Bool {
+        guard let remote = ReleaseVersion(tag), let local = ReleaseVersion(currentVersion) else { return false }
+        return remote > local
+    }
+
     static func available(in data: Data, currentVersion: String) throws -> SlockUpdate? {
+        guard let latest = try latest(in: data), latest.isNewer(than: currentVersion) else { return nil }
+        return latest
+    }
+
+    static func latest(in data: Data) throws -> SlockUpdate? {
         struct Release: Decodable {
             let tag_name: String
             let draft: Bool
@@ -246,8 +256,7 @@ struct SlockUpdate: Equatable {
         }
         let release = try JSONDecoder().decode(Release.self, from: data)
         guard !release.draft, !release.prerelease, release.tag_name.hasPrefix("v"),
-              let remote = ReleaseVersion(release.tag_name),
-              let local = ReleaseVersion(currentVersion), remote > local else { return nil }
+              ReleaseVersion(release.tag_name) != nil else { return nil }
         return SlockUpdate(tag: release.tag_name)
     }
 }
@@ -261,6 +270,7 @@ final class UpdateChecker {
     static let latestReleaseURL = URL(string: "https://api.github.com/repos/jonaraphael/slock/releases/latest")!
 
     private(set) var availableUpdate: SlockUpdate?
+    private(set) var isUpToDate = false
     var onChange: (() -> Void)?
     private let currentVersion: String
     private let fetch: Fetch
@@ -313,19 +323,22 @@ final class UpdateChecker {
                 }
                 // Keep a known update through temporary network/rate-limit failures.
                 guard error == nil, let http = response as? HTTPURLResponse else { return }
-                let update: SlockUpdate?
+                let latest: SlockUpdate?
                 if http.statusCode == 404 {
-                    update = nil
+                    latest = nil
                 } else if http.statusCode == 200, let data {
-                    do { update = try SlockUpdate.available(in: data, currentVersion: self.currentVersion) }
+                    do { latest = try SlockUpdate.latest(in: data) }
                     catch { return }
                 } else {
                     return
                 }
+                let update = latest.flatMap { $0.isNewer(than: self.currentVersion) ? $0 : nil }
+                let isUpToDate = latest.map { ReleaseVersion($0.tag) == ReleaseVersion(self.currentVersion) } ?? false
                 self.nextCheck = self.now().addingTimeInterval(Self.checkInterval)
                 result = .success(update)
-                guard update != self.availableUpdate else { return }
+                guard update != self.availableUpdate || isUpToDate != self.isUpToDate else { return }
                 self.availableUpdate = update
+                self.isUpToDate = isUpToDate
                 self.onChange?()
             }
         }
@@ -4722,6 +4735,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshUpdateMenuItem() {
         guard let item = updateMenuItem else { return }
         item.title = appUpdater.status ?? (updateChecker.availableUpdate == nil ? "Check for Updates…" : "Update slock…")
+        item.isHidden = updateChecker.isUpToDate && appUpdater.status == nil
         item.isEnabled = appUpdater.status == nil
         item.toolTip = "Download the latest release, verify it, replace slock, and relaunch."
     }
