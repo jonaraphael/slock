@@ -888,34 +888,66 @@ enum RegressionTests {
             let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
             a.relay.start(); b.relay.start(); try exchange(a, b)
             b.key(true, timestamp: 10_000_000_000); try exchange(a, b)
-            try check(!a.controller.led.isOn, "press skipped the rhythm buffer")
-            a.clock.time = 100.7
+            try check(a.controller.led.isOn && !b.controller.led.isOn, "first press was not immediate or lit the wrong keyboard")
+            a.clock.time = 100.05
             b.key(false, timestamp: 10_100_000_000); try exchange(a, b)
-            a.clock.time = 100.71
+            a.clock.time = 100.06
             b.key(true, timestamp: 10_300_000_000); try exchange(a, b)
             b.key(false, timestamp: 10_350_000_000); try exchange(a, b)
-            a.advance(to: 101)
-            try check(a.controller.led.isOn && !b.controller.led.isOn, "wrong keyboard or missing first flash")
-            a.advance(to: 101.099)
+            a.advance(to: 100.099)
             try check(a.controller.led.isOn, "100 ms flash ended early")
-            a.advance(to: 101.1)
-            try check(!a.controller.led.isOn, "100 ms flash followed the 700 ms packet gap")
-            a.advance(to: 101.299)
+            a.advance(to: 100.1)
+            try check(!a.controller.led.isOn, "100 ms flash followed the packet gap")
+            a.advance(to: 100.299)
             try check(!a.controller.led.isOn, "200 ms OFF gap was compressed")
-            a.advance(to: 101.3)
+            a.advance(to: 100.3)
             try check(a.controller.led.isOn, "second flash missed its deadline")
-            a.advance(to: 101.35)
+            a.advance(to: 100.35)
             try check(!a.controller.led.isOn, "50 ms flash did not end")
             try check(b.controller.diagnostics().contains("Key messages queued: 4"), "timing added network messages")
             try check(a.controller.diagnostics().contains("Pending light transitions: 0"), "playback queue did not drain")
         }
-        test("held-key refreshes and HELLOs do not jump buffered edges") {
+        test("long holds and gaps apply on receipt and establish the next short interval") {
+            let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
+            a.relay.start(); b.relay.start(); try exchange(a, b)
+            b.key(true, timestamp: 0); try exchange(a, b)
+            a.clock.time = 101.2
+            b.key(false, timestamp: 1_100_000_000); try exchange(a, b)
+            try check(!a.controller.led.isOn, "release after a long hold was delayed")
+            a.clock.time = 101.21
+            b.key(true, timestamp: 1_150_000_000); try exchange(a, b)
+            a.advance(to: 101.249)
+            try check(!a.controller.led.isOn, "new 50 ms dark interval was compressed")
+            a.advance(to: 101.25)
+            try check(a.controller.led.isOn, "new dark interval did not use the immediate release as its anchor")
+            a.clock.time = 101.26
+            b.key(false, timestamp: 1_200_000_000); try exchange(a, b)
+            a.advance(to: 101.3)
+            try check(!a.controller.led.isOn, "short pulse did not finish")
+            a.clock.time = 102.4
+            b.key(true, timestamp: 2_200_000_001); try exchange(a, b)
+            try check(a.controller.led.isOn, "press after a long gap was delayed")
+            a.clock.time = 102.41
+            b.key(false, timestamp: 2_250_000_001); try exchange(a, b)
+            a.advance(to: 102.449)
+            try check(a.controller.led.isOn, "new 50 ms lit interval was compressed")
+            a.advance(to: 102.45)
+            try check(!a.controller.led.isOn, "new pulse did not use the immediate press as its anchor")
+            try check(a.controller.diagnostics().contains("Pending light transitions: 0"), "playback did not drain")
+        }
+        test("held-key refreshes and HELLOs preserve queued short intervals and immediate long releases") {
             let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
             a.relay.start(); b.relay.start(); try exchange(a, b)
             b.key(true, timestamp: 1_000_000_000); try exchange(a, b)
+            a.clock.time = 100.02
+            b.key(false, timestamp: 1_100_000_000); try exchange(a, b)
+            b.key(true, timestamp: 1_300_000_000); try exchange(a, b)
             b.controller.advanceMaintenance(); try exchange(a, b)
-            try check(!a.controller.led.isOn, "held refresh bypassed the buffer")
-            a.advance(to: 101)
+            a.advance(to: 100.1)
+            try check(!a.controller.led.isOn, "held refresh erased the queued OFF gap")
+            b.relay.start(); try exchange(a, b)
+            try check(!a.controller.led.isOn, "HELLO jumped the queued OFF gap")
+            a.advance(to: 100.3)
             try check(a.controller.led.isOn, "refresh erased the pending press")
             // Long holds remain lit through the original one-byte refresh cadence.
             a.clock.time = 102
@@ -925,7 +957,7 @@ enum RegressionTests {
             try check(a.controller.led.isOn, "fresh long hold expired")
             b.key(false, timestamp: 5_000_000_000); try exchange(a, b)
             b.relay.start(); try exchange(a, b)
-            try check(a.controller.led.isOn, "HELLO jumped the buffered release")
+            try check(!a.controller.led.isOn, "long release was not immediate")
             a.advance(to: 104)
             try check(!a.controller.led.isOn, "long hold did not release")
         }
@@ -934,6 +966,8 @@ enum RegressionTests {
                 let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
                 a.relay.start(); b.relay.start(); try exchange(a, b)
                 b.key(true, timestamp: 1_000_000_000); try exchange(a, b)
+                b.key(false, timestamp: 1_100_000_000); try exchange(a, b)
+                b.key(true, timestamp: 1_300_000_000); try exchange(a, b)
                 switch action {
                 case 0: a.relay.onStateChange?(.error("offline"))
                 case 1: a.controller.setCaptureEnabled(false)
@@ -950,6 +984,8 @@ enum RegressionTests {
             let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
             a.relay.start(); b.relay.start(); try exchange(a, b)
             b.key(true, timestamp: 1_000_000_000); try exchange(a, b)
+            b.key(false, timestamp: 1_100_000_000); try exchange(a, b)
+            b.key(true, timestamp: 1_300_000_000); try exchange(a, b)
             b.key(false); try exchange(a, b)
             a.advance(to: 101)
             try check(!a.controller.led.isOn && !a.controller.remoteKeyDown, "emergency release left a queued press")
@@ -958,8 +994,11 @@ enum RegressionTests {
             let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
             a.relay.start(); b.relay.start(); try exchange(a, b)
             b.key(true, timestamp: 1_000_000_000); try exchange(a, b)
-            a.advance(to: 101)
-            try check(a.controller.led.isOn, "buffered press did not play")
+            b.key(false, timestamp: 1_750_000_000); try exchange(a, b)
+            b.key(true, timestamp: 2_500_000_000); try exchange(a, b)
+            a.advance(to: 100.75)
+            a.advance(to: 101.5)
+            try check(a.controller.led.isOn, "queued press did not play")
             a.clock.time = 102.6
             a.controller.advanceMaintenance()
             try check(!a.controller.led.isOn, "playback extended the stale-key lease")
@@ -968,6 +1007,8 @@ enum RegressionTests {
             let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
             a.relay.start(); b.relay.start(); try exchange(a, b)
             b.key(true, timestamp: 1_000_000_000); try exchange(a, b)
+            b.key(false, timestamp: 1_750_000_000); try exchange(a, b)
+            b.key(true, timestamp: 2_500_000_000); try exchange(a, b)
             let restarted = TestMac(bob, peer: alice.publicKey)
             // The handshake response throttle permits the new boot after a second.
             a.clock.time = 101.01
@@ -976,7 +1017,7 @@ enum RegressionTests {
             try check(!a.controller.led.isOn, "old session's press survived the fresh handshake")
             try check(a.controller.diagnostics().contains("Pending light transitions: 0"), "old session kept its queue")
         }
-        test("the real playback timer delivers buffered edges without a maintenance tick") {
+        test("the first edge is immediate and the real timer preserves a short pulse without a maintenance tick") {
             let a = TestMac(alice, peer: bob.publicKey), b = TestMac(bob, peer: alice.publicKey)
             a.clock.usesSystemTime = true; b.clock.usesSystemTime = true
             a.relay.start(); b.relay.start(); try exchange(a, b)
@@ -985,11 +1026,12 @@ enum RegressionTests {
             b.key(true, timestamp: 1_000_000_000)
             b.key(false, timestamp: 1_060_000_000)
             try exchange(a, b)
+            try check(a.clock.lightWrites.map(\.down) == [true], "first edge waited for a timer or release played early")
             let limit = Date().addingTimeInterval(3)
             while a.clock.lightWrites.count < 2, Date() < limit { drainMainQueue() }
             try check(a.clock.lightWrites.map(\.down) == [true, false], "timer failed to emit the pulse")
             let writes = a.clock.lightWrites
-            try check(writes[0].time - started >= 0.999, "timer skipped the playback buffer")
+            try check(writes[0].time - started < 0.5, "first edge added unnecessary delay")
             try check(writes[1].time - writes[0].time >= 0.059, "timer compressed the 60 ms pulse")
         }
         test("simultaneous PTT holds choose one speaker and transfer only after playback drains") {

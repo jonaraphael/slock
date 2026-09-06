@@ -223,14 +223,21 @@ Motion shows a steady green tail instead.
 A physical transition carries its original `CGEvent` timestamp, captured before
 deferred controller work: one state byte followed by an eight-byte big-endian
 nanosecond timestamp. Only timestamp differences matter; the two clocks need no
-synchronization. The receiver starts playback with a one-second buffer and
-preserves each source interval below one second, including dark gaps. Intervals
-of one second or more refill the buffer, with a minimum playback duration of one
-second, so longer holds and pauses absorb drift. A one-shot dispatch timer with
-one-millisecond leeway drives each edge, independently of the maintenance tick.
-Late timer wakeups shift the remaining queue instead of compressing queued pulses.
-Delays beyond the buffer and hardware/OS scheduling stalls can still stretch an
-interval that has already started; the light is not a hard real-time output.
+synchronization. The receiver applies the first edge immediately and preserves
+source intervals up to and including one second, including dark gaps, from the
+preceding edge's actual playback time. A source interval strictly longer than one
+second applies at the earliest opportunity: on receipt, or after preceding queued
+short intervals finish. It adds no minimum hold or gap and establishes a fresh
+anchor for the following rhythm. Sending each edge already happens immediately.
+
+Edges due on receipt play in the receive callback. A one-shot dispatch timer with
+one-millisecond leeway drives future edges, independently of the maintenance tick.
+Late timer wakeups recompute deadlines from actual playback, preserving queued
+short intervals while letting long intervals absorb drift. A late packet or
+hardware/OS scheduling stall can still stretch an interval already in progress;
+its edge plays as soon as possible and subsequent short intervals use that actual
+playback time. There is no fixed jitter buffer; exact durations require packets
+to arrive before their playback deadlines. The light is not a hard real-time output.
 
 This adds eight bytes per physical transition and no packets. Older protocol-2
 receivers read the leading state byte immediately; new receivers accept legacy
@@ -238,7 +245,7 @@ one-byte key states immediately. Upgrade both Macs to preserve rhythm in both
 directions. Held-key refreshes stay one byte and HELLO stays unchanged. Matching
 snapshots renew freshness without jumping ahead of buffered edges; a conflicting
 snapshot clears the queue and resynchronizes immediately. PTT still follows the
-local key immediately and does not use the LED playback buffer.
+local key immediately and does not use the LED playback schedule.
 
 The replay queue is capped at 256 edges and 2.5 seconds of scheduled lead.
 Discontinuous timestamps, repeated transition states, or excess backlog clear

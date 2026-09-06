@@ -67,10 +67,11 @@ willing accomplice.
 5. **Blink.** Wait for the connection, then hold Caps Lock. Your person gets a
    light. You have successfully sent one very small hello.
 
-Light signals have about a **one-second delay** so that short blinks and gaps
-survive the trip. Hold **Option** in the menu and choose **Test Caps Lock Light**
-to check whether your keyboard’s LED cooperates. Some keyboards are more willing
-participants than others.
+Light signals start as soon as they arrive. Short blinks and gaps retain their
+timing when packets arrive in time; a hold or gap longer than one second resets
+playback to the earliest opportunity. Hold **Option** in the menu and choose
+**Test Caps Lock Light** to check whether your keyboard’s LED cooperates. Some
+keyboards are more willing participants than others.
 
 While slock is active, Caps Lock stops capitalizing text. Your keyboard light
 follows the *other person’s* key; Dit’s tail shows your own outgoing activity.
@@ -86,7 +87,7 @@ follows the *other person’s* key; Dit’s tail shows your own outgoing activit
 Both people must agree, and either can turn it off for both. Only one person
 talks at a time; if you press together, the apps pick one sender consistently.
 Excellent practice for saying “over.” Voice is end-to-end encrypted Opus and
-skips the light signal’s one-second buffer.
+runs independently of light timing.
 
 ## Getting to know Dit
 
@@ -242,7 +243,7 @@ tccutil reset ListenEvent com.jonaraphael.CapsLink
 The LED driver retries after keyboard access is granted. If the light changes
 independently of your peer, check for another Caps Lock utility using the same
 Caps→F18 mapping. Network stalls or a busy Mac can also stretch a blink or gap;
-the timing buffer helps, but cannot make the internet behave.
+the next hold or gap longer than one second lets playback shed accumulated delay.
 
 For a useful bug report, include both Mac models, macOS and app versions, keyboard
 types, and whether capture, the light test, and voice each work. **Copy Diagnostics**

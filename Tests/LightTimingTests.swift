@@ -43,15 +43,25 @@ enum LightTimingTests {
                 try expect(KeyLightEvent.read(payload) == nil, "malformed timing accepted")
             }
         }
-        test("bursty packet arrivals preserve ON pulses and OFF gaps") {
+        test("the first edge in either direction is due immediately") {
+            for down in [false, true] {
+                var timeline = KeyLightTimeline()
+                try expect(timeline.append(edge(down, 10), receivedAt: 100), "first edge")
+                try expect(near(timeline.nextDeadline, 100), "first edge added latency")
+                try expect(timeline.takeDue(at: 100)?.down == down, "first edge did not play immediately")
+            }
+        }
+        test("bursty packet arrivals preserve ON pulses and OFF gaps when edges arrive in time") {
             var timeline = KeyLightTimeline()
             let timestamps: [UInt64] = [10_000_000_000, 10_125_000_000, 10_375_000_000, 10_425_000_000]
-            let arrivals: [TimeInterval] = [100, 100.8, 100.81, 100.82]
-            for i in timestamps.indices {
+            let arrivals: [TimeInterval] = [100, 100.05, 100.06, 100.07]
+            let deadlines: [TimeInterval] = [100, 100.125, 100.375, 100.425]
+            try expect(timeline.append(edge(true, timestamps[0]), receivedAt: arrivals[0]), "first edge")
+            try expect(timeline.takeDue(at: deadlines[0])?.down == true, "first edge")
+            for i in 1..<timestamps.count {
                 try expect(timeline.append(edge(i % 2 == 0, timestamps[i]), receivedAt: arrivals[i]), "edge rejected")
             }
-            let deadlines: [TimeInterval] = [101, 101.125, 101.375, 101.425]
-            for i in deadlines.indices {
+            for i in 1..<deadlines.count {
                 try expect(near(timeline.nextDeadline, deadlines[i]), "deadline followed packet jitter")
                 try expect(timeline.takeDue(at: deadlines[i] - 0.001) == nil, "edge ran early")
                 try expect(timeline.takeDue(at: deadlines[i])?.down == (i % 2 == 0), "edge missing or out of order")
@@ -69,31 +79,68 @@ enum LightTimingTests {
             _ = timeline.takeDue(at: 101.5)
             try expect(near(timeline.nextDeadline, 101.7), "200 ms OFF duration changed")
         }
-        test("long ON and OFF intervals refill the buffer without carrying timing drift") {
-            var timeline = KeyLightTimeline()
-            try expect(timeline.append(edge(true, 0), receivedAt: 100), "press")
-            _ = timeline.takeDue(at: 101)
-            try expect(timeline.append(edge(false, 8_000_000_000), receivedAt: 105), "long hold release")
-            try expect(near(timeline.nextDeadline, 106), "long hold tried to preserve irrelevant exact duration")
-            _ = timeline.takeDue(at: 106)
-            try expect(timeline.append(edge(true, 20_000_000_000), receivedAt: 109), "long pause press")
-            try expect(near(timeline.nextDeadline, 110), "long pause did not refill the buffer")
-            _ = timeline.takeDue(at: 110)
-            try expect(timeline.append(edge(false, 20_050_000_000), receivedAt: 110.01), "short release")
-            try expect(near(timeline.nextDeadline, 110.05), "long pause changed the next short pulse")
+        test("long ON and OFF intervals reset immediately and anchor the following short interval") {
+            for down in [false, true] {
+                var timeline = KeyLightTimeline()
+                try expect(timeline.append(edge(down, 0), receivedAt: 100), "initial edge")
+                _ = timeline.takeDue(at: 100)
+                try expect(timeline.append(edge(!down, 8_000_000_000), receivedAt: 105), "long interval")
+                try expect(near(timeline.nextDeadline, 105), "long interval added latency")
+                try expect(timeline.takeDue(at: 105)?.down == !down, "long interval did not play")
+                try expect(timeline.append(edge(down, 8_050_000_000), receivedAt: 105.01), "short interval")
+                try expect(near(timeline.nextDeadline, 105.05), "short interval lost its new anchor")
+            }
         }
-        test("a one-second interval is flexible but never becomes a short gap") {
+        test("only intervals strictly longer than one second reset timing") {
+            for interval: UInt64 in [999_999_999, 1_000_000_000, 1_000_000_001] {
+                var timeline = KeyLightTimeline()
+                try expect(timeline.append(edge(true, 0), receivedAt: 100), "press")
+                _ = timeline.takeDue(at: 100)
+                try expect(timeline.append(edge(false, interval), receivedAt: 100.2), "release")
+                let expected = interval > 1_000_000_000 ? 100.2 : 100 + Double(interval) / 1_000_000_000
+                try expect(near(timeline.nextDeadline, expected), "incorrect reset boundary: \(interval)")
+            }
+        }
+        test("a long interval waits only for queued short intervals and resets the next rhythm") {
             var timeline = KeyLightTimeline()
             try expect(timeline.append(edge(true, 0), receivedAt: 100), "press")
-            try expect(timeline.append(edge(false, 1_000_000_000), receivedAt: 100), "release")
-            _ = timeline.takeDue(at: 101)
-            try expect(near(timeline.nextDeadline, 102), "coalesced long hold collapsed below one second")
+            _ = timeline.takeDue(at: 100)
+            try expect(timeline.append(edge(false, 900_000_000), receivedAt: 100.1), "short hold")
+            try expect(timeline.append(edge(true, 3_000_000_000), receivedAt: 100.1), "long gap")
+            try expect(timeline.append(edge(false, 3_050_000_000), receivedAt: 100.1), "short pulse")
+            try expect(timeline.takeDue(at: 100.899) == nil, "reset truncated the earlier short hold")
+            try expect(timeline.takeDue(at: 100.9)?.down == false, "short hold did not end")
+            try expect(timeline.takeDue(at: 100.9)?.down == true, "long gap missed the earliest opportunity")
+            try expect(near(timeline.nextDeadline, 100.95), "following short pulse lost its new anchor")
+        }
+        test("timer lateness is absorbed at the next long interval instead of shifting its anchor") {
+            var timeline = KeyLightTimeline()
+            try expect(timeline.append(edge(true, 0), receivedAt: 100), "press")
+            try expect(timeline.append(edge(false, 100_000_000), receivedAt: 100.01), "short hold")
+            try expect(timeline.append(edge(true, 2_000_000_000), receivedAt: 102), "long gap")
+            try expect(timeline.append(edge(false, 2_050_000_000), receivedAt: 102.01), "short pulse")
+            _ = timeline.takeDue(at: 102.02) // Main queue was blocked while packets queued.
+            try expect(near(timeline.nextDeadline, 102.12), "late timer crushed the short hold")
+            _ = timeline.takeDue(at: 102.12)
+            try expect(near(timeline.nextDeadline, 102.12), "reset carried unnecessary timer delay")
+            _ = timeline.takeDue(at: 102.12)
+            try expect(near(timeline.nextDeadline, 102.17), "new rhythm used an old anchor")
+        }
+        test("a future long interval absorbs all earlier timer drift") {
+            var timeline = KeyLightTimeline()
+            try expect(timeline.append(edge(true, 0), receivedAt: 100), "press")
+            try expect(timeline.append(edge(false, 2_000_000_000), receivedAt: 100), "coalesced release")
+            _ = timeline.takeDue(at: 100.5)
+            try expect(near(timeline.nextDeadline, 100.5), "long interval added delay after a late timer")
+            _ = timeline.takeDue(at: 100.5)
+            try expect(timeline.append(edge(true, 4_000_000_000), receivedAt: 102), "later long gap")
+            try expect(near(timeline.nextDeadline, 102), "long interval retained earlier drift")
         }
         test("late packets cannot shorten the following known interval") {
             var timeline = KeyLightTimeline()
             try expect(timeline.append(edge(true, 0), receivedAt: 100), "press")
-            _ = timeline.takeDue(at: 101)
-            // Delay beyond the buffer cannot undo the already visible long ON.
+            _ = timeline.takeDue(at: 100)
+            // A late packet cannot undo the already visible long ON.
             try expect(timeline.append(edge(false, 100_000_000), receivedAt: 102), "late release")
             try expect(timeline.append(edge(true, 300_000_000), receivedAt: 102), "next press")
             _ = timeline.takeDue(at: 102)
@@ -114,9 +161,10 @@ enum LightTimingTests {
             try expect(timeline.latest == nil && timeline.nextDeadline == nil, "reset retained old rhythm")
             try expect(timeline.append(edge(true, 0), receivedAt: 100), "new session")
             try expect(timeline.append(edge(false, 900_000_000), receivedAt: 100), "first interval")
-            try expect(!timeline.append(edge(true, 1_800_000_000), receivedAt: 100), "backlog exceeded the freshness window")
+            try expect(timeline.append(edge(true, 1_800_000_000), receivedAt: 100), "second interval")
+            try expect(!timeline.append(edge(false, 2_700_000_000), receivedAt: 100), "backlog exceeded the freshness window")
         }
-        test("500 mixed intervals retain subsecond timing with up to 850 ms jitter") {
+        test("500 mixed intervals play as early as receipt and short interval preservation allow") {
             var timeline = KeyLightTimeline()
             let intervals: [UInt64] = [40_000_000, 90_000_000, 250_000_000, 999_000_000,
                                       1_000_000_000, 5_000_000_000, 2_000_000, 600_000_000]
@@ -144,8 +192,17 @@ enum LightTimingTests {
                 try expect(played[i].0.timestamp == timestamps[i], "stream reordered edges")
                 let source = Double(timestamps[i] - timestamps[i - 1]) / 1_000_000_000
                 let output = played[i].1 - played[i - 1].1
-                if source < 1 { try expect(near(output, source), "short interval \(i) distorted: \(output) vs \(source)") }
-                else { try expect(output >= 1 - 0.000_000_1, "long interval collapsed into a short one") }
+                try expect(played[i].1 >= arrivals[i], "edge played before arrival")
+                if source <= 1 {
+                    try expect(output >= source - 0.000_000_1, "short interval \(i) compressed: \(output) vs \(source)")
+                    if arrivals[i] <= played[i - 1].1 + source {
+                        try expect(near(output, source), "timely short interval \(i) stretched")
+                    } else {
+                        try expect(near(played[i].1, arrivals[i]), "late packet added avoidable delay")
+                    }
+                } else {
+                    try expect(near(played[i].1, arrivals[i]), "long interval \(i) failed to reset immediately")
+                }
             }
         }
         print("\(count - failures)/\(count) light timing tests passed")

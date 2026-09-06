@@ -28,7 +28,6 @@ enum SlockConfig {
     static let helloInterval: TimeInterval = 10
     static let onlineTimeout: TimeInterval = 25
     static let remoteKeyTimeout: TimeInterval = 2.5
-    static let lightPlaybackDelay: TimeInterval = 1
     static let remoteTalkTimeout: TimeInterval = 5
 }
 
@@ -830,6 +829,8 @@ struct KeyLightEvent {
 struct KeyLightTimeline {
     private struct Pending {
         let event: KeyLightEvent
+        let receivedAt: TimeInterval
+        let preservedInterval: TimeInterval
         var deadline: TimeInterval
     }
 
@@ -841,22 +842,23 @@ struct KeyLightTimeline {
 
     mutating func reset() { self = KeyLightTimeline() }
 
-    // Preserve every subsecond interval, including OFF gaps. Refill the buffer
-    // during longer intervals, where the duration is deliberately flexible.
+    // Start immediately and preserve short ON and OFF intervals from the last
+    // playback time. A source interval over one second resets to the earliest
+    // opportunity after any already queued short intervals have finished.
     // False means corrupt/discontinuous input or an excessive replay backlog.
     mutating func append(_ event: KeyLightEvent, receivedAt now: TimeInterval) -> Bool {
-        var deadline = now + SlockConfig.lightPlaybackDelay
-        if let latest, let previousDeadline {
+        var preservedInterval: TimeInterval = 0
+        if let latest {
             guard event.timestamp > latest.timestamp, event.down != latest.down else { return false }
-            let interval = Double(event.timestamp - latest.timestamp) / 1_000_000_000
-            if interval < 1 {
-                deadline = previousDeadline + interval
-            } else {
-                deadline = max(previousDeadline + 1, deadline)
+            let interval = event.timestamp - latest.timestamp
+            if interval <= 1_000_000_000 {
+                preservedInterval = Double(interval) / 1_000_000_000
             }
         }
+        let deadline = max(now, (previousDeadline ?? now) + preservedInterval)
         guard pending.count < 256, deadline - now <= SlockConfig.remoteKeyTimeout else { return false }
-        pending.append(Pending(event: event, deadline: deadline))
+        pending.append(Pending(event: event, receivedAt: now,
+                               preservedInterval: preservedInterval, deadline: deadline))
         latest = event
         previousDeadline = deadline
         return true
@@ -865,12 +867,15 @@ struct KeyLightTimeline {
     mutating func takeDue(at now: TimeInterval) -> KeyLightEvent? {
         guard let first = pending.first, first.deadline <= now else { return nil }
         pending.removeFirst()
-        // A late timer/packet must never cause a burst of catch-up flashes.
-        // Shift remaining playback so already queued short intervals survive.
-        let lateness = now - first.deadline
-        if lateness > 0 {
-            for index in pending.indices { pending[index].deadline += lateness }
-            if let previousDeadline { self.previousDeadline = previousDeadline + lateness }
+        // Recompute from actual playback, preserving short intervals without
+        // carrying timer lateness past a long interval that can absorb it.
+        if now > first.deadline {
+            var deadline = now
+            for index in pending.indices {
+                deadline = max(pending[index].receivedAt, deadline + pending[index].preservedInterval)
+                pending[index].deadline = deadline
+            }
+            previousDeadline = deadline
         }
         return first.event
     }
@@ -3299,7 +3304,7 @@ final class SlockController {
             "Key messages received: \(receivedKeyMessages)",
             "Peer HELLOs received: \(receivedPeerHellos)",
             "Last peer key state: \(lastPeerKeyState.map { $0 ? "down" : "up" } ?? "none")",
-            "Light playback: \(lightTimeline.latest == nil ? "Immediate state sync" : "Timestamped rhythm (1 s buffer)")",
+            "Light playback: \(lightTimeline.latest == nil ? "Immediate state sync" : "Timestamped rhythm (reset after >1 s)")",
             "Pending light transitions: \(lightTimeline.pendingCount)",
             "System Caps Lock on: \(CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift))",
             "Caps error: \(capsInterceptor.lastError ?? "none")",
@@ -3558,7 +3563,7 @@ final class SlockController {
             clearRemoteKey()
             return
         }
-        scheduleLightPlayback()
+        playDueLightEvent()
     }
 
     private func scheduleLightPlayback() {
