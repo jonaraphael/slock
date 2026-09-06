@@ -1,5 +1,26 @@
 # Validation — 2026-09-04
 
+## Developer ID signing — 2026-09-06
+
+- **157 automated tests passed** before the final version-only change to v0.3.0.
+
+- The universal app was signed with Developer ID Application for team
+  `2UAJ64ZRBR`, including a secure timestamp, and passed strict signature checks.
+- Two signed builds with different code hashes satisfied the same designated
+  requirement in both directions. Tampered bundle metadata was rejected before
+  re-signing. This checks signing continuity; a real update with existing macOS
+  privacy grants still needs manual verification.
+- The native Ed25519 update package was signed, reconstructed, and verified with
+  the Developer ID signature intact. The update format and public key are unchanged.
+- Publication requires a Developer ID Application signature; missing and ad-hoc
+  identities were rejected in local checks. The signing fingerprint is saved
+  outside Git for reuse across builds.
+- The encrypted migration backup was restored and both signing keys and its
+  source snapshot were verified. No recovery password was saved with the backup.
+- Signature checks require normal macOS certificate-chain access; the agent's
+  sandbox can report a signature failure even when the same bundle passes strict
+  verification outside that sandbox. The app has not been notarized.
+
 ## Native updater restoration — 2026-09-06
 
 - **157 automated tests passed**, including signed-package tampering, fixed file
@@ -108,8 +129,8 @@ mapping remains empty.
 Version 0.2.2 makes the rotated Dit fill the menu-bar height, gives its tail
 hollow/yellow-green/red states, and forces the local Caps Lock state and LED back
 to the peer-driven state on every captured press. Version 0.2.1 added explicit
-permission recovery actions without repeating the automatic system prompt. No persistent
-code-signing identity is installed on this Mac, so ad-hoc rebuilds have cdhash
+permission recovery actions without repeating the automatic system prompt. At that time,
+no persistent code-signing identity was installed on this Mac, so ad-hoc rebuilds had cdhash
 designated requirements and can invalidate prior Accessibility entries. The
 installed builds can need a renewed user grant before their physical capture test.
 
@@ -132,4 +153,5 @@ the working installed 0.2.2 binary was retained to preserve its permission grant
 - Login-item registration and launch from `/Applications`.
 - Execution on Apple Silicon and on the other supported macOS versions.
 
-The app is ad-hoc signed and has not been notarized.
+Those earlier builds were ad-hoc signed. Public releases from v0.3.0 use
+Developer ID Application signing; notarization remains outstanding.

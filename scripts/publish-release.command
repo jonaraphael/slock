@@ -12,7 +12,8 @@ version=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' Resource
 run=$(gh run list --commit "$revision" --workflow release.yml --limit 1 --json status,conclusion \
   --jq '.[0] | .status + "/" + .conclusion')
 [[ "$run" == completed/success ]] || { echo 'Wait for successful release checks before signing.' >&2; exit 1; }
-CAPSLINK_ARCHS='arm64 x86_64' ./build.command
+SLOCK_REQUIRE_DEVELOPER_ID=1 CAPSLINK_ARCHS='arm64 x86_64' ./build.command
+./scripts/test-update-helper.command
 ./scripts/sign-update.command dist/slock.app dist/slock-update.json
 (cd dist && shasum -a 256 slock.app.zip > SHA256SUMS)
 [[ "$revision" == "$(git rev-parse HEAD)" && -z "$(git status --porcelain)" ]] || {

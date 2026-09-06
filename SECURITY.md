@@ -53,7 +53,10 @@ older binaries are not automatically patched.
    Production deployment requires an operated service with per-user credentials,
    inbox authorization and abuse limits. A shared password embedded in the
    distributable app cannot provide that isolation.
-2. **Distribution:** Builds are ad-hoc signed and not notarized. Since v0.2.9,
+2. **Distribution:** Public releases from v0.3.0 use Developer ID Application
+   signing with a persistent identity and secure timestamp. They are not
+   notarized. Local builds without a configured identity remain ad-hoc signed.
+   Since v0.2.9,
    the native updater requires an Ed25519 signature from a dedicated update key
    embedded in the installed app. A release-hosted checksum or ad-hoc code
    signature alone is not accepted as publisher identity. The signed package
@@ -61,10 +64,12 @@ older binaries are not automatically patched.
    installer scripts are extracted or executed. Staging is private and bundle
    integrity is checked before replacement. The updater requires a writable app
    location and never requests administrator or Keychain access.
-   The private signing key stays in a private maintainer file on the signing Mac;
-   GitHub receives only signed public artifacts. Initial downloads and
-   source/signing-account compromise remain trust boundaries. Broad distribution should use
-   [Developer ID signing and notarization](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution).
+   The Ed25519 private key stays in a private maintainer file, and the Developer
+   ID private key stays in Keychain. Encrypted migration backups preserve both
+   identities across signing Macs. GitHub receives only signed public artifacts.
+   Initial downloads and source/signing-account compromise remain trust
+   boundaries. Broad distribution should also use
+   [notarization](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution).
    Versions 0.2.6–0.2.8 only open GitHub for manual downloads and need one manual
    replacement to receive this updater.
 3. **Validation:** Automated tests use fake keyboard/relay/microphone devices and

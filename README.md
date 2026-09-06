@@ -150,13 +150,20 @@ Full details, including the limits of the current relay and encryption, are in
 <details>
 <summary><strong>macOS is asking questions. Understandable.</strong></summary>
 
-This prototype is ad-hoc signed and **not notarized**, so macOS may block its first
-launch. See [Apple’s instructions for opening an app from an unidentified developer](https://support.apple.com/en-us/102445).
+Releases from **0.3.0** are signed with Developer ID but are **not notarized**, so
+macOS may still block the first launch. See
+[Apple’s instructions for opening an app blocked by macOS](https://support.apple.com/en-us/102445).
 
 Keep slock in Applications so permissions and the login item use a stable path.
 The app needs **Accessibility** and **Input Monitoring** for keyboard capture.
 It requests each keyboard permission automatically once; the setup guide returns
 whenever a required grant is missing, including after an update.
+
+Older releases used ad-hoc signatures that changed the app's identity with each
+build. Version **0.3.0** switches to a persistent Developer ID identity, so
+later consistently signed releases should retain existing privacy approvals.
+This first switch may require one final approval on each Mac. The updater's
+separate download signature continues to verify update packages.
 
 - A permission marked **Enabled** needs no further action. Capture waits until
   both keyboard permissions are granted.
@@ -194,8 +201,9 @@ always available and becomes **Update slock…** when a newer release is known.
 Either action checks the latest release again, downloads and verifies its signed
 update, then replaces slock and relaunches it in the same location. No extra
 updater, administrator access, or Keychain permission is required. Keep slock in
-a writable Applications folder. Pairings and preferences stay; macOS may still
-ask you to renew keyboard permissions after an update.
+a writable Applications folder. Pairings and preferences stay. Moving from an
+older ad-hoc release to **0.3.0** may require one final keyboard permission
+approval; later releases use the same Developer ID identity.
 
 Versions **0.2.6–0.2.8** only open a release page. Download the latest ZIP once,
 quit slock, replace the app in Applications, and reopen it to receive the restored
@@ -277,14 +285,25 @@ cd slock
 ```
 
 The build renders Dit’s [vector artwork](docs/images/firefly.svg) into an app
-icon and produces a universal, ad-hoc signed app plus a distributable ZIP in
-`dist/`. There is no Xcode project and no third-party dependency; compilation
-needs no internet access.
+icon and produces a universal app plus a distributable ZIP in `dist/`. Signing
+defaults to ad-hoc. There is no Xcode project and no third-party dependency;
+the default build needs no internet access.
 
 ```sh
 CAPSLINK_ARCHS=arm64 ./build.command  # one architecture only (or x86_64)
 ./test.command                        # regression, security, and timing suites
 ```
+
+To keep a stable macOS identity across builds, save a code-signing certificate
+fingerprint from `security find-identity -v -p codesigning` in the Git-ignored
+`.release-signing/codesign-identity` file, or set `SLOCK_CODESIGN_IDENTITY` for
+one build. Use an Apple Development identity
+for local development and a Developer ID Application identity for releases.
+Certificate signing requests an online secure timestamp and fails if signing
+fails; it never retries with an ad-hoc signature. Publication requires a
+Developer ID Application signature. See
+[release signing](docs/RELEASING.md#macos-code-signing-and-privacy-permissions)
+for setup and migration details.
 
 The tests use temporary identities, fake keyboard commands, and synthetic audio.
 They never capture your keyboard, use your microphone, or contact the relay.
